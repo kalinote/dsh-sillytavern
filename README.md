@@ -1,0 +1,66 @@
+# dsh-sillytavern
+
+“酒馆模式”是 DeepSeek Harness 的外部 Bundle + Agent 预设组合。它让 DSH 原生会话导入并使用 SillyTavern Character Card V3，而不是在 DSH 内重做一套 SillyTavern。
+
+## 功能
+
+- 从输入框左下角“+”导入 V3 PNG、APNG 或 JSON；角色卡内携带的世界书会作为独立世界书资源一并导入；
+- V3 `ccv3` CRC/Base64/UTF-8/JSON 分层校验，V2-only 明确拒绝；对生态中常见但不规范的缺失 `group_only_greetings`/世界书 `extensions` 安全补空并给出警告；
+- 角色卡、用户设定/变量、首条问候、独立的结构化 Character Book V3 世界书管理和 system-role post-history 注入；角色卡可绑定一套默认世界书，Session 在首次真实用户消息时以其初始化自身的世界书引用，之后可独立修改该引用。世界书支持常驻/关键词/向量标记策略、Secondary Logic、概率、原生 JavaScript 正则、多级递归、Order、0–7 Position、`@depth`、Outlet 与递归控制，并在宏及 WORLD_INFO Regex 展开后按本轮模型真实 tokenizer 与上下文窗口比例（默认 25%）预算；卡内 `token_budget` 可进一步收紧该预算，最近一次激活条目、预算与运行时警告可在管理页查看；纯向量相似度激活仍需要未来接入 embedding retriever；
+- EJS 风格提示词模板与 `{{char}}`、`{{user}}`、`{{getvar::name}}`；
+- 生成前自动召回 + 主模型按需只读查询的长期记忆：主 Agent 只负责剧情生成，只暴露 `st_memory_query` 和 `st_memory_graph_query`；每个成功回合完成后，Host 在后台异步启动独立维护 Agent，统一新增、纠错、去重并补充事件关系，再由 Host 原子提交结构化 patch；
+- 工作区角色库、独立世界书库、角色编辑、模板、记忆和脚本管理 UI；管理页使用全屏弹窗；
+- 角色、变量、Prompt、Memory、增量事件 API 与 opaque-origin iframe 前端渲染；助手正文使用 DSH 原生 GFM Markdown，并兼容传统独占行 `<font color>`；状态栏等自定义标签只按角色卡或其他 Regex 来源实际定义的规则渲染，插件不猜测未命中标签的含义；
+- 将 `extensions.regex_scripts` 作为完整的 `findRegex → replaceString` 规则导入；支持 Global → Preset → Scoped 顺序、用户/助手/Slash/世界书/Reasoning placement、原始/显示/Prompt/Edit 阶段、depth、Trim Out、NONE/RAW/ESCAPED 宏替换以及 `/narrator`、`/regex`、`/regex-state`、`/regex-toggle`；导入规则默认启用，编辑执行材料后自动停用；
+- 所有插件数据均在工作区的 `.dsh/sillytavern/` 持久化；会话绑定、记忆与全局资源在该工作区内隔离，支持跨 Store 刷新、dead-owner lock 恢复与 dispose 提交屏障。
+
+当前不支持 V1/V2、群聊、自动创建新会话和向量语义检索。
+
+## 安装
+
+要求 DSH `0.1.2-alpha.1`（同时保留对 `0.1.1-rc.2` Session 摘要结构的兼容回退）、Node `^22.19 || >=24`。
+
+```powershell
+# 在本项目目录执行；这只修改用户 profile，不修改 Harness checkout。
+dsh plugin --profile web add .
+```
+
+Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的用户预设根目录；无需用户点击或手工复制。DSH 会在用户选择该预设并创建会话时按正常流程挂载验证。相同的手工安装会被安全接管，后续未修改的托管预设随 Bundle 更新；若同名预设已被用户修改或由系统根提供，插件拒绝覆盖并以明确错误停止启动。
+
+重启当前 DSH Web 进程，在新会话中选择“酒馆模式”。不要启动第二个 Web server；Client bundle 由现有 DSH Web URL 提供。
+
+## 使用
+
+1. 用户在左侧自行新建或打开会话；
+2. 使用 DSH 原生 Agent 预设菜单选择“酒馆模式”；最近一次选择的工作区角色会在首次真实用户消息前作为候选角色；第一条真实用户消息才提交角色与默认世界书的 Session 引用；
+3. 会话开始前，角色卡的 `first_mes` 会显示在输入框上方；仅在酒馆模式空白会话中，Logo、开场内容与原生编辑框共同占据完整动态视口，开场内容弹性使用扣除 Logo/编辑区后的主要剩余高度，且不显示额外的“开场预览”徽标；Markdown 使用 DSH 原生渲染器，HTML 围栏/文档在 opaque-origin iframe 中按原样运行，插件不删除远程资源、脚本、内联事件、meta、iframe 或 CSS，也不注入 CSP；开场 iframe 提供 `setChatMessages` 的 message 0 swipe 切换和 `triggerSlash('/echo ...')` 兼容 API，可跳转并按当前会话持久化 `alternate_greetings`；选择本身不调用模型，用户仍在原生输入框中发送第一条回复；Host 会在原生用户消息进入日志前写入一个持久的 `st-opening` 展示节点，Client 通过官方 additive command-view Slot 将最终开场显示在对话顶部，原生用户消息只写入一次；模型每轮均从系统上下文读取同一已选开场，不增加模型调用；
+4. 输入框工具行左侧会出现带酒杯线框图标的系统风格角色卡菜单；没有绑定时显示“选择角色卡”，窄窗口会自动折叠文字以减少工具行换行；
+5. 未开始对话的会话可从下拉中选择工作区角色；首条真实用户消息后角色与世界书引用冻结，不能再换角色。所选角色也会成为以后新酒馆会话的默认角色；
+6. 若角色尚未导入，点击输入框左下角“+”，选择 `st-import` →“导入 V3 角色卡”，再选择 PNG/APNG/JSON；
+7. 从角色卡菜单底部的“管理酒馆模式”进入全屏管理页，管理角色设定、persona、世界书、记忆、脚本和模板。记忆页可录入剧情时间状态与时间轴范围、从大到小的地点路径、在场人物、召回策略和可选事件组 ID，并按事件聚合展示直接前置/后续关系及来源；同一事件涉及多个地点时每个地点单独一行，并使用不同 key。世界书是独立全局资源：编辑器下拉框选择要编辑的书，默认选中当前 Session 引用的书；另一个下拉框仅选择当前 Session 引用的书，两者互不等同。当前每张角色卡和每个 Session 均暂限一套世界书，未来可扩展为多书引用。世界书页以结构化条目编辑器管理激活策略、关键字、概率、Order 与 Position，并原样保留未展示的扩展字段；脚本的“启用”只控制对话匹配策略，管理页不会自动执行，只有点击“运行预览”后才会临时挂载 iframe，再次点击“停止预览”即卸载；
+8. 酒馆会话处于前台时，Client 仅对该会话临时接管 assistant/user/steering 及过程展示 renderer：显示阶段 Regex 在按次创建、可由组件卸载取消且没有代码内容过滤或执行时限的 Worker 中运行；Host 在用户入日志前执行原始 User Input 规则，在模型流持久化前执行原始 AI/Reasoning 规则，并通过一次受控的公共 LLM 重派发把 promptOnly 历史投影给模型而不改写持久日志。匹配结果精确替换对应 text/reasoning block，HTML 在 opaque-origin iframe 中交互运行。共享 Regex 引擎已实现 `isEdit`/`runOnEdit` 语义；当前 DSH 尚无原生持久消息编辑事件，因此会话 UI 暂无可接入的编辑阶段触发器。DSH 原生 `turnProcess` 折叠在酒馆对话中显示为“剧情推进”，仍由原生状态控制思考过程、工具调用和多层工具调用；系统提示词行仅从酒馆对话视图隐藏，不影响实际模型提示词。最终剧情正文、图片、Regex/HTML 渲染结果和状态栏保持可见。
+
+## 数据
+
+全部插件数据按工作区隔离，保存在 `<workspace>/.dsh/sillytavern/`；不再使用 `${DSH_HOME}/data/dsh-sillytavern/`，也不存在跨工作区共享的插件数据。角色库、原始导入文件、独立世界书、模板、选择状态、Regex 与全局变量、会话绑定、记忆及后台维护队列均属于当前工作区。
+
+在同一工作区内，角色卡内容及其 Scoped 脚本、世界书内容、模板定义、Global/Preset Regex 与全局变量是共享资源；角色卡/世界书引用、persona、会话变量、模板选择、prompt injections、开场 swipe 和记忆表格按 Session 隔离。因此两个 Session 可使用同一角色卡但绑定不同世界书并维护不同用户设定、变量、模板选择、prompt injections 和记忆。管理器“脚本”页编辑的是共享的角色卡或工作区脚本，不会为每个 Session 复制一份；Session 私有 prompt injections 由兼容 API 写入。
+
+记忆文档使用 schema 5，主体为 `rows + eventEdges`，并以有限长度的 `appliedMaintenanceJobs` 原子记录已提交后台任务。每条记忆包含 2–10 个唯一 `keywords`，用于查询与自动召回匹配；它们必须是对应助手正文中可逐字命中的具体名称、别名、专名、编号或特征短语，不能使用“物品”“事件”“关系”“状态变化”等泛化分类词。Host 在写盘前校验数量和正文来源，失败时拒绝整次写入并说明缺失词或原因。记忆只检查文档版本号是否严格等于 5；其他版本会直接报错，不迁移、不重置、不改写，需手动删除对应记忆文件。新记忆行除 `storyTime`、`location`、`characters` 外，还保存正文来源 `sourceRefs` 和 `recallPolicy`：`always` 始终可自动召回，`after_compaction` 仅在全部来源事件都进入 DSH `compaction/summary.data.shadowedSeqs` 后成为自动召回候选，且普通候选仍须与近期对话或已 compact 的直接事件关系相关；`query_only` 只允许显式查询。重要度达到 `0.8` 的记忆除 `query_only` 外可提前进入候选，并在数量与字符预算内排在普通记忆之前。事件关系自身也须全部来源已 compact 后才可参与自动相关性和 Prompt 注入；显式查询不受这些自动门槛影响。
+
+`eventId` 将同一事件的多条记忆聚合为一个隐式事件节点；关系单独保存在 `eventEdges`，当前只支持事件到事件的 `precedes`，不在记忆行之间建边。一个事件跨多个地点时仍以多行、不同 key 保存并共享 `eventId`。每轮成功的 `turn/end` 会先强制等待 Session 最终正文持久化，再把最终助手正文、当轮真实用户正文及近期对话上下文保存为后台任务；任务按 Session FIFO、全局并发上限执行，失败重试，Host 只在维护 Agent 基于当前 memory revision 时提交 patch，并在同一写盘事务中记录任务 ID，以封闭崩溃后的重复执行窗口。启动恢复失败会明确记录，并在 Agent idle 与下一次生成前继续重试。若来源剧情先被 compact 而任务尚未完成，生成前会临时注入该任务保存的原始正文，避免上下文空窗。主 Agent 不拥有任何记忆写入、修正或去重工具。
+
+角色记录以 `defaultWorldbookId` 保存默认世界书引用；Session binding 以 `worldbookId` 和 `startedAt` 保存本会话引用与首次真实用户消息时间。首次真实用户消息只会用角色的默认世界书初始化该 Session 引用；其后可在 Session 世界书下拉框独立改选。修改世界书内容会影响所有引用该书的角色和 Session；修改角色默认世界书只影响之后开始的会话，不改写已有 Session 引用。导入角色卡时，卡内 `character_book` 只作为世界书导入源；导入完成后，运行时只读取独立世界书。若同名世界书已存在，必须选择“覆盖”（整本替换，不增量合并）或“另存为”。
+
+删除世界书会在确认框列出引用它的角色卡与 Session；确认后删除资源并清除这些引用。删除角色卡前会检查尚未删除或归档的 Session，有任何此类 Session 时禁止删除并列出它们；可删除时，确认框可勾选同步删除该卡默认绑定的世界书。脚本源不改写。角色记录 Schema 4 延续 Schema 3 的 Regex 规则模型：Character Card 的 `regex_scripts` 原子化保存为整条规则，并把 0.5.3 错误拆分出的字段迁回规则；Global/Preset 规则与 `{{globalvar::key}}` 全局变量保存在当前工作区的 `.dsh/sillytavern/regex-scripts.json`。授权 SHA-256 同时绑定类型、匹配式、替换内容、trim/placement 与阶段选项，任一修改都会自动停用。Regex 运行器遵循 SillyTavern 的 JavaScript RegExp 和替换回调语义，不限制 pattern、规则数、trim 数量，不做嵌套重复/alternation 拒绝，不过滤或清洗 replaceString，也不设置执行 deadline；`substituteRegex` NONE/RAW/ESCAPED 均执行。代码安全性由启用者自行验证。交互 HTML 和手动预览在 opaque-origin iframe 中运行；SillyTavern `#send_textarea` 写入映射到 DSH 官方 `inputActions.setDraft`，不开放父页面 DOM。
+
+## 开发与验证
+
+```powershell
+pnpm run check
+pnpm pack --pack-destination .artifacts
+```
+
+当前 Windows DSH 沙箱禁止 Node test runner 的逐文件子进程管道，因此测试使用 `--test-isolation=none`；EJS 自身仍在可终止的 resource-limited Worker + VM 中测试和运行。
+
+架构和协议见 `docs/ARCHITECTURE.md`。

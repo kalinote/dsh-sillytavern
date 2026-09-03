@@ -1,0 +1,5 @@
+# External Host bundle. The session-facing prompt/tools are mounted separately
+# by the authored `sillytavern` Agent preset through `dsh-sillytavern/agent`.
+- insert:
+    - id: dsh-sillytavern
+      name: 'dsh-sillytavern'

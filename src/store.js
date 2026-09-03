@@ -1,0 +1,1419 @@
+import { Buffer } from 'node:buffer'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { basename, join, resolve } from 'node:path'
+import { hostname } from 'node:os'
+import { setTimeout as delay } from 'node:timers/promises'
+import { parseCardBytes, validateCardV3 } from './card-v3.js'
+import { applyMemoryOperation, assertMemoryKeywordsInSource, emptyMemoryDocument, normalizeMemoryDocument, queryMemoryGraph } from './memory.js'
+import { sessionEvents } from './prompt.js'
+
+const MAX_CARD_RECORD_BYTES = 12 * 1024 * 1024
+const MAX_CARD_READ_BYTES = 13 * 1024 * 1024
+const MAX_WORLDBOOK_RECORD_BYTES = 16 * 1024 * 1024
+const LOCK_OWNER = Object.freeze({ pid: process.pid, host: hostname() })
+
+function snapshot(value) { return structuredClone(value) }
+function safeSessionId(value) {
+  const id = String(value)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id)) throw new Error('session id has an unsafe shape')
+  return id
+}
+function safeCardId(value) {
+  const id = String(value)
+  if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('card id must be a SHA-256 hex digest')
+  return id
+}
+function safeWorldbookId(value) {
+  const id = String(value)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id)) throw new Error('worldbook id has an unsafe shape')
+  return id
+}
+function extensionFor(format) { return format === 'json-v3' ? '.json' : format === 'apng-v3' ? '.apng' : '.png' }
+function normalizeRegexMetadata(script) {
+  return {
+    findRegex: String(script?.findRegex ?? ''),
+    trimStrings: Array.isArray(script?.trimStrings) ? script.trimStrings.map(value => String(value)) : [],
+    placement: Array.isArray(script?.placement) ? [...new Set(script.placement.map(Number).filter(Number.isSafeInteger))] : [],
+    markdownOnly: script?.markdownOnly === true,
+    promptOnly: script?.promptOnly === true,
+    runOnEdit: script?.runOnEdit === true,
+    substituteRegex: Number.isSafeInteger(Number(script?.substituteRegex)) ? Number(script.substituteRegex) : 0,
+    minDepth: script?.minDepth === null || script?.minDepth === undefined || !Number.isFinite(Number(script.minDepth)) ? null : Number(script.minDepth),
+    maxDepth: script?.maxDepth === null || script?.maxDepth === undefined || !Number.isFinite(Number(script.maxDepth)) ? null : Number(script.maxDepth),
+  }
+}
+function scriptApprovalMaterial(kind, source, script) {
+  if (kind !== 'regex') return `${kind === 'html' ? 'html' : 'javascript'}\0${String(source)}`
+  return `regex\0${JSON.stringify({ ...normalizeRegexMetadata(script), source: String(source) })}`
+}
+function scriptHash(kind, source, script) { return createHash('sha256').update(scriptApprovalMaterial(kind, source, script)).digest('hex') }
+function assertJsonBytes(value, maxBytes, label) {
+  const text = JSON.stringify(value)
+  if (text === undefined || Buffer.byteLength(text, 'utf8') > maxBytes) throw new Error(`${label} exceeds ${maxBytes} bytes or is not JSON`)
+}
+function assertSafeOwnedJson(value, maxBytes, label) {
+  assertJsonBytes(value, maxBytes, label)
+  const pending = [value]
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (current === null || typeof current !== 'object') continue
+    for (const [key, child] of Object.entries(current)) {
+      if (['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error(`${label} contains unsafe key ${key}`)
+      pending.push(child)
+    }
+  }
+}
+function normalizeStoredScript(script, index, forceDisable = false) {
+  const source = String(script?.source ?? '')
+  const kind = script?.kind === 'html' ? 'html' : script?.kind === 'regex' ? 'regex' : 'javascript'
+  const regex = kind === 'regex' ? normalizeRegexMetadata(script) : undefined
+  const approvedHash = String(script?.approvedHash ?? '')
+  const trusted = !forceDisable && script?.enabled === true && approvedHash === scriptHash(kind, source, regex)
+  return {
+    id: String(script?.id ?? ''),
+    name: String(script?.name ?? `Script ${index + 1}`),
+    kind,
+    enabled: trusted,
+    approvedHash: trusted ? approvedHash : null,
+    source,
+    ...(regex ?? {}),
+  }
+}
+function normalizeScriptList(scripts, forceDisable = false) {
+  const used = new Set()
+  return (Array.isArray(scripts) ? scripts : []).map((script, index) => {
+    const normalized = normalizeStoredScript(script, index, forceDisable)
+    const raw = normalized.id.trim()
+    const seed = `${normalized.kind}\0${normalized.name}\0${scriptApprovalMaterial(normalized.kind, normalized.source, normalized)}\0${index}`
+    let id = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(raw) ? raw : `script-${createHash('sha256').update(seed).digest('hex').slice(0, 16)}`
+    if (used.has(id)) id = `${id.slice(0, 112)}-${createHash('sha256').update(seed).digest('hex').slice(0, 12)}`
+    let suffix = 2
+    while (used.has(id)) { id = `${id.slice(0, 120)}-${suffix}`; suffix += 1 }
+    used.add(id)
+    return { ...normalized, id }
+  })
+}
+
+async function awaitWithSignal(promise, signal) {
+  if (signal === undefined) return promise
+  signal.throwIfAborted()
+  return new Promise((resolveValue, reject) => {
+    const aborted = () => reject(signal.reason ?? new Error('operation aborted'))
+    signal.addEventListener('abort', aborted, { once: true })
+    promise.then(resolveValue, reject).finally(() => signal.removeEventListener('abort', aborted))
+  })
+}
+
+async function readJson(path, fallback, maxBytes = 32 * 1024 * 1024) {
+  try {
+    const content = await readFile(path)
+    if (content.length > maxBytes) throw new Error(`JSON file exceeds ${maxBytes} bytes`)
+    return JSON.parse(content.toString('utf8'))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return snapshot(fallback)
+    throw error
+  }
+}
+
+async function atomicJson(path, value, beforeCommit) {
+  await mkdir(resolve(path, '..'), { recursive: true })
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+  try {
+    beforeCommit?.()
+    await rename(temporary, path)
+  } catch (error) {
+    await rm(temporary, { force: true })
+    throw error
+  }
+}
+
+async function recoverDeadOwnerLock(lockPath) {
+  let owner
+  try { owner = JSON.parse((await readFile(lockPath, 'utf8')).slice(0, 4096)) } catch { return false }
+  if (owner?.host !== LOCK_OWNER.host || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || typeof owner.token !== 'string') return false
+  try {
+    process.kill(owner.pid, 0)
+    return false
+  } catch (error) {
+    if (error?.code !== 'ESRCH') return false
+  }
+  const stale = `${lockPath}.dead-${owner.token}-${randomUUID()}`
+  try { await rename(lockPath, stale) } catch (error) {
+    if (error?.code === 'ENOENT') return true
+    return false
+  }
+  await rm(stale, { force: true })
+  return true
+}
+
+async function withFileLock(target, operation, signal) {
+  const lockPath = `${target}.lock`
+  await mkdir(resolve(lockPath, '..'), { recursive: true })
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    signal?.throwIfAborted()
+    const token = randomUUID()
+    let handle
+    try {
+      handle = await open(lockPath, 'wx')
+      await handle.writeFile(JSON.stringify({ ...LOCK_OWNER, token, createdAt: Date.now() }), 'utf8')
+      await handle.sync()
+    } catch (error) {
+      if (handle !== undefined) {
+        await handle.close().catch(() => undefined)
+        await rm(lockPath, { force: true }).catch(() => undefined)
+      }
+      if (error?.code !== 'EEXIST') throw error
+      if (await recoverDeadOwnerLock(lockPath)) continue
+      await delay(25, undefined, signal ? { signal } : undefined)
+      continue
+    }
+    try {
+      signal?.throwIfAborted()
+      return await operation()
+    } finally {
+      await handle.close()
+      let owner
+      try { owner = JSON.parse((await readFile(lockPath, 'utf8')).slice(0, 4096)) } catch { owner = undefined }
+      if (owner?.token === token) await rm(lockPath, { force: true })
+    }
+  }
+  throw new Error(`timed out acquiring file lock for ${target}`)
+}
+
+function extractScripts(card) {
+  const scripts = []
+  const seen = new Set()
+  const addGeneric = (source, name = 'Imported script', kind = 'javascript') => {
+    if (scripts.length >= 32 || typeof source !== 'string' || source.trim() === '') return
+    const normalizedKind = kind === 'html' ? 'html' : 'javascript'
+    const key = `${normalizedKind}\0${source}`
+    if (seen.has(key)) return
+    seen.add(key)
+    scripts.push({ id: createHash('sha256').update(key).digest('hex').slice(0, 16), name, kind: normalizedKind, enabled: true, approvedHash: scriptHash(normalizedKind, source), source })
+  }
+  const regexScripts = Array.isArray(card?.data?.extensions?.regex_scripts) ? card.data.extensions.regex_scripts : []
+  for (let index = 0; index < regexScripts.length && scripts.length < 32; index += 1) {
+    const rule = regexScripts[index]
+    if (rule === null || typeof rule !== 'object' || Array.isArray(rule)) continue
+    const source = String(rule.replaceString ?? '')
+    const regex = normalizeRegexMetadata(rule)
+    if (regex.findRegex.trim() === '') continue
+    const id = String(rule.id ?? createHash('sha256').update(`${regex.findRegex}\0${source}`).digest('hex').slice(0, 16))
+    const key = `regex\0${id}\0${regex.findRegex}\0${source}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    const enabled = rule.disabled !== true
+    scripts.push({
+      id,
+      name: String(rule.scriptName ?? rule.name ?? `Regex ${index + 1}`),
+      kind: 'regex',
+      enabled,
+      approvedHash: enabled ? scriptHash('regex', source, regex) : null,
+      source,
+      ...regex,
+    })
+  }
+  const visit = (value, path, depth = 0, eligible = false) => {
+    if (depth > 8 || value === null || value === undefined || scripts.length >= 32) return
+    if (typeof value === 'string') {
+      if (eligible) addGeneric(value, path.split('.').at(-1) ?? 'Imported script', /<html|<body|<!doctype/i.test(value) ? 'html' : 'javascript')
+      return
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${path}[${index}]`, depth + 1, eligible))
+      return
+    }
+    if (typeof value !== 'object') return
+    if (typeof value.source === 'string' || typeof value.code === 'string' || typeof value.script === 'string' || typeof value.html === 'string') {
+      const source = value.source ?? value.code ?? value.script ?? value.html
+      addGeneric(source, String(value.name ?? value.label ?? path.split('.').at(-1) ?? 'Imported script'), typeof value.html === 'string' ? 'html' : 'javascript')
+      return
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'regex_scripts') continue
+      const childEligible = /^(?:scripts?|javascript|html|renderer|slash)$/i.test(key)
+      visit(child, `${path}.${key}`, depth + 1, childEligible)
+    }
+  }
+  visit(card?.data?.extensions, 'extensions')
+  return scripts
+}
+
+function scriptsForRecord(record) {
+  const stored = Array.isArray(record?.scripts) ? record.scripts : []
+  const forceDisable = Number(record?.schemaVersion) < 2
+  const rawRegex = Array.isArray(record?.card?.data?.extensions?.regex_scripts) ? record.card.data.extensions.regex_scripts : []
+  const needsRegexMigration = Number(record?.schemaVersion) < 3 && rawRegex.length > 0
+  if (!needsRegexMigration) return normalizeScriptList(stored, forceDisable)
+  const extracted = extractScripts(record.card)
+  const consumed = new Set()
+  const structuralFragments = rawRegex.map(rule => {
+    const matches = []
+    if (rule === null || typeof rule !== 'object' || Array.isArray(rule)) return matches
+    for (const field of ['id', 'scriptName', 'findRegex', 'replaceString']) {
+      const source = rule[field]
+      if (typeof source !== 'string' || source.trim() === '') continue
+      const oldId = createHash('sha256').update(source).digest('hex').slice(0, 16)
+      const kind = /<html|<body|<!doctype/i.test(source) ? 'html' : 'javascript'
+      const newerId = createHash('sha256').update(`${kind}\0${source}`).digest('hex').slice(0, 16)
+      const candidate = stored.find(item => !consumed.has(item)
+        && item?.name === field
+        && String(item?.source ?? '') === source
+        && (String(item?.id ?? '') === oldId || String(item?.id ?? '') === newerId))
+      if (candidate !== undefined) { consumed.add(candidate); matches.push(candidate) }
+    }
+    return matches
+  })
+  for (const script of extracted) {
+    if (script.kind !== 'regex') continue
+    const rawIndex = rawRegex.findIndex(rule => rule && typeof rule === 'object'
+      && String(rule.id ?? '') === script.id
+      && String(rule.findRegex ?? '') === script.findRegex
+      && String(rule.replaceString ?? '') === script.source)
+    const whole = stored.find(candidate => !consumed.has(candidate)
+      && (candidate?.kind === 'regex' || typeof candidate?.findRegex === 'string')
+      && (String(candidate?.id ?? '') === script.id
+        || (String(candidate?.findRegex ?? '') === script.findRegex && String(candidate?.source ?? candidate?.replaceString ?? '') === script.source)))
+    if (whole !== undefined) {
+      consumed.add(whole)
+      const approvedHash = scriptHash('regex', script.source, script)
+      script.enabled = !forceDisable && whole.enabled === true && whole.approvedHash === approvedHash
+      script.approvedHash = script.enabled ? approvedHash : null
+      continue
+    }
+    const fragments = rawIndex < 0 ? [] : structuralFragments[rawIndex]
+    if (forceDisable || fragments.some(fragment => fragment.enabled === false)) {
+      script.enabled = false
+      script.approvedHash = null
+    }
+  }
+  const keyOf = script => script.kind === 'regex'
+    ? scriptApprovalMaterial('regex', script.source, script)
+    : `${script.kind}\0${script.source}`
+  const keys = new Set(extracted.map(keyOf))
+  for (const script of stored) {
+    if (consumed.has(script)) continue
+    const normalized = normalizeStoredScript(script, extracted.length, forceDisable)
+    const key = keyOf(normalized)
+    if (keys.has(key)) continue
+    keys.add(key)
+    extracted.push(normalized)
+  }
+  return normalizeScriptList(extracted, forceDisable)
+}
+
+function normalizeBinding(binding) {
+  if (binding === null || typeof binding !== 'object' || Array.isArray(binding) || !/^[a-f0-9]{64}$/.test(String(binding.cardId ?? ''))) return null
+  const persona = binding.userPersona !== null && typeof binding.userPersona === 'object' && !Array.isArray(binding.userPersona) ? binding.userPersona : {}
+  const variables = binding.variables !== null && typeof binding.variables === 'object' && !Array.isArray(binding.variables) ? snapshot(binding.variables) : {}
+  const scriptInjections = Array.isArray(binding.scriptInjections) ? binding.scriptInjections.flatMap((item, index) => item !== null && typeof item === 'object' && !Array.isArray(item) ? [{
+    id: String(item.id ?? `injection-${index}`),
+    text: String(item.text ?? ''),
+    order: Number.isFinite(Number(item.order)) ? Number(item.order) : index,
+  }] : []) : []
+  return {
+    revision: Number.isSafeInteger(Number(binding.revision)) && Number(binding.revision) >= 0 ? Number(binding.revision) : 0,
+    cardId: String(binding.cardId),
+    boundAt: typeof binding.boundAt === 'string' ? binding.boundAt : new Date(0).toISOString(),
+    startedAt: typeof binding.startedAt === 'string' ? binding.startedAt : null,
+    worldbookId: typeof binding.worldbookId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(binding.worldbookId) ? binding.worldbookId : null,
+    worldbookExplicit: binding.worldbookExplicit === true,
+    userPersona: { name: String(persona.name ?? 'User'), description: String(persona.description ?? '') },
+    templateIds: Array.isArray(binding.templateIds) ? binding.templateIds.map(value => String(value)) : [],
+    variables,
+    scriptInjections,
+    openingSwipeId: Number.isSafeInteger(Number(binding.openingSwipeId)) && Number(binding.openingSwipeId) >= 0 ? Number(binding.openingSwipeId) : 0,
+  }
+}
+
+function normalizeBindingsDocument(document) {
+  const sessions = Object.create(null)
+  if (document?.schemaVersion === 1 && document.sessions && typeof document.sessions === 'object' && !Array.isArray(document.sessions)) {
+    for (const [id, raw] of Object.entries(document.sessions)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id)) continue
+      const binding = normalizeBinding(raw)
+      if (binding !== null) sessions[id] = binding
+    }
+  }
+  return { schemaVersion: 1, sessions }
+}
+
+function normalizeRegexSourcesDocument(document) {
+  const normalize = scripts => normalizeScriptList(scripts).filter(script => script.kind === 'regex')
+  const variables = document?.schemaVersion === 1 && document.variables !== null && typeof document.variables === 'object' && !Array.isArray(document.variables) ? snapshot(document.variables) : {}
+  return {
+    schemaVersion: 1,
+    global: normalize(document?.schemaVersion === 1 ? document.global : []),
+    preset: normalize(document?.schemaVersion === 1 ? document.preset : []),
+    variables,
+  }
+}
+
+function defaultBinding(cardId) {
+  return {
+    revision: 0,
+    cardId,
+    boundAt: new Date().toISOString(),
+    startedAt: null,
+    worldbookId: null,
+    worldbookExplicit: false,
+    userPersona: { name: 'User', description: '' },
+    templateIds: [],
+    variables: {},
+    scriptInjections: [],
+    openingSwipeId: 0,
+  }
+}
+
+function normalizeWorldbookBook(value, forcedName) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('worldbook must be an object')
+  const book = snapshot(value)
+  const name = String(forcedName ?? book.name ?? '').trim()
+  if (name === '') throw new Error('worldbook name is required')
+  if (Buffer.byteLength(name, 'utf8') > 1024) throw new Error('worldbook name exceeds 1024 bytes')
+  book.name = name
+  if (!Array.isArray(book.entries)) book.entries = []
+  assertSafeOwnedJson(book, MAX_WORLDBOOK_RECORD_BYTES - 4096, 'worldbook')
+  return book
+}
+
+function worldbookNameKey(value) { return String(value).trim().toLocaleLowerCase() }
+
+function isAbortSignal(value) {
+  return value !== null && typeof value === 'object' && typeof value.throwIfAborted === 'function' && typeof value.addEventListener === 'function'
+}
+
+// Every durable plugin resource is rooted below the workspace that owns it.
+export class SillyTavernStore {
+  constructor(options = {}) {
+    this.fallbackWorkspace = resolve(options.fallbackWorkspace ?? process.cwd())
+    this.workspaces = new Map()
+    this.workspaceLoads = new Map()
+    this.sessions = new Map()
+    this.disposedAgents = new WeakSet()
+    this.sessionLoads = new Map()
+    this.sessionEpoch = new Map()
+    this.tails = new Map()
+    this.ready = this.workspaceState(this.fallbackWorkspace)
+  }
+
+  get cards() { return this.workspaces.get(this.fallbackWorkspace)?.cards ?? new Map() }
+  get worldbooks() { return this.workspaces.get(this.fallbackWorkspace)?.worldbooks ?? new Map() }
+  get templates() { return this.workspaces.get(this.fallbackWorkspace)?.templates ?? [] }
+  get globalRegexScripts() { return this.workspaces.get(this.fallbackWorkspace)?.globalRegexScripts ?? [] }
+  get presetRegexScripts() { return this.workspaces.get(this.fallbackWorkspace)?.presetRegexScripts ?? [] }
+  get globalVariables() { return this.workspaces.get(this.fallbackWorkspace)?.globalVariables ?? {} }
+  get selectedCardId() { return this.workspaces.get(this.fallbackWorkspace)?.selectedCardId ?? null }
+
+  rootForWorkspace(workspace) {
+    return join(resolve(workspace), '.dsh', 'sillytavern')
+  }
+
+  workspaceOf(agent) { return resolve(agent?.session?.header?.cwd ?? this.fallbackWorkspace) }
+
+  workspaceFor(context) {
+    if (typeof context === 'string' && context !== '') return resolve(context)
+    if (context?.session?.header?.cwd) return this.workspaceOf(context)
+    if (typeof context?.workspace === 'string' && context.workspace !== '') return resolve(context.workspace)
+    return this.fallbackWorkspace
+  }
+
+  sessionKey(agent) { return `${this.workspaceOf(agent)}\0${safeSessionId(agent.id)}` }
+
+  async serial(key, operation, signal) {
+    const previous = this.tails.get(key) ?? Promise.resolve()
+    const current = previous.catch(() => undefined).then(() => {
+      signal?.throwIfAborted()
+      return operation()
+    })
+    this.tails.set(key, current)
+    const cleanup = () => { if (this.tails.get(key) === current) this.tails.delete(key) }
+    void current.then(cleanup, cleanup)
+    return awaitWithSignal(current, signal)
+  }
+
+  async loadCardRecord(path, expectedId, persist = false, signal) {
+    const raw = await readJson(path, null, MAX_CARD_READ_BYTES)
+    signal?.throwIfAborted()
+    if (raw === null || raw.id !== expectedId || ![1, 2, 3, 4].includes(Number(raw.schemaVersion))) return undefined
+    const card = snapshot(raw.card)
+    if (card?.data && Object.hasOwn(card.data, 'character_book')) delete card.data.character_book
+    const record = {
+      ...raw,
+      schemaVersion: 4,
+      card,
+      defaultWorldbookId: typeof raw.defaultWorldbookId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(raw.defaultWorldbookId) ? raw.defaultWorldbookId : null,
+      scripts: scriptsForRecord(raw),
+    }
+    assertJsonBytes(record, MAX_CARD_RECORD_BYTES, 'card record')
+    if (persist && JSON.stringify(record) !== JSON.stringify(raw)) await atomicJson(path, record, () => signal?.throwIfAborted())
+    return record
+  }
+
+  async loadWorldbookRecord(path, expectedId) {
+    const raw = await readJson(path, null, MAX_WORLDBOOK_RECORD_BYTES)
+    if (raw?.schemaVersion !== 1 || raw.id !== expectedId || typeof raw.name !== 'string' || raw.book === null || typeof raw.book !== 'object' || Array.isArray(raw.book)) return undefined
+    const book = normalizeWorldbookBook(raw.book, raw.name)
+    return { schemaVersion: 1, id: expectedId, name: book.name, book, createdAt: String(raw.createdAt ?? new Date(0).toISOString()), updatedAt: String(raw.updatedAt ?? raw.createdAt ?? new Date(0).toISOString()) }
+  }
+
+  async workspaceState(context) {
+    const workspace = this.workspaceFor(context)
+    const current = this.workspaces.get(workspace)
+    if (current !== undefined) return current
+    const pending = this.workspaceLoads.get(workspace)
+    if (pending !== undefined) return pending
+    const load = (async () => {
+      const root = this.rootForWorkspace(workspace)
+      await Promise.all([
+        mkdir(join(root, 'cards'), { recursive: true }),
+        mkdir(join(root, 'originals'), { recursive: true }),
+        mkdir(join(root, 'worldbooks'), { recursive: true }),
+        mkdir(join(root, 'memory'), { recursive: true }),
+      ])
+      const state = {
+        workspace,
+        root,
+        cards: new Map(),
+        worldbooks: new Map(),
+        bindings: normalizeBindingsDocument(await readJson(join(root, 'bindings.json'), { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024)),
+        templates: [],
+        globalRegexScripts: [],
+        presetRegexScripts: [],
+        globalVariables: {},
+        selectedCardId: null,
+      }
+      const [cardFiles, worldbookFiles] = await Promise.all([
+        readdir(join(root, 'cards'), { withFileTypes: true }),
+        readdir(join(root, 'worldbooks'), { withFileTypes: true }),
+      ])
+      for (const file of cardFiles) {
+        if (!file.isFile() || !/^[a-f0-9]{64}\.json$/.test(file.name)) continue
+        const id = file.name.slice(0, -5)
+        try {
+          const record = await this.loadCardRecord(join(root, 'cards', file.name), id, true)
+          if (record !== undefined) state.cards.set(id, record)
+        } catch { /* malformed workspace records are isolated */ }
+      }
+      for (const file of worldbookFiles) {
+        if (!file.isFile() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json$/.test(file.name)) continue
+        const id = file.name.slice(0, -5)
+        try {
+          const record = await this.loadWorldbookRecord(join(root, 'worldbooks', file.name), id)
+          if (record !== undefined) state.worldbooks.set(id, record)
+        } catch { /* malformed workspace records are isolated */ }
+      }
+      for (const card of state.cards.values()) if (card.defaultWorldbookId !== null && !state.worldbooks.has(card.defaultWorldbookId)) card.defaultWorldbookId = null
+      const templates = await readJson(join(root, 'templates.json'), { schemaVersion: 1, templates: [] }, 4 * 1024 * 1024)
+      state.templates = templates?.schemaVersion === 1 && Array.isArray(templates.templates) ? templates.templates.slice(0, 32) : []
+      const regex = normalizeRegexSourcesDocument(await readJson(join(root, 'regex-scripts.json'), { schemaVersion: 1, global: [], preset: [] }, 16 * 1024 * 1024))
+      state.globalRegexScripts = regex.global
+      state.presetRegexScripts = regex.preset
+      state.globalVariables = regex.variables
+      const selection = await readJson(join(root, 'selection.json'), { schemaVersion: 1, selectedCardId: null }, 64 * 1024)
+      state.selectedCardId = typeof selection?.selectedCardId === 'string' && state.cards.has(selection.selectedCardId) ? selection.selectedCardId : null
+      this.workspaces.set(workspace, state)
+      return state
+    })()
+    this.workspaceLoads.set(workspace, load)
+    try { return await load } finally { this.workspaceLoads.delete(workspace) }
+  }
+
+  async stateFor(context) {
+    await this.ready
+    return this.workspaceState(context)
+  }
+
+  async refreshTemplates(context, signal) {
+    if (isAbortSignal(context)) { signal = context; context = undefined }
+    const state = await this.stateFor(context)
+    signal?.throwIfAborted()
+    const document = await readJson(join(state.root, 'templates.json'), { schemaVersion: 1, templates: [] }, 4 * 1024 * 1024)
+    state.templates = document?.schemaVersion === 1 && Array.isArray(document.templates) ? document.templates.slice(0, 32) : []
+    return snapshot(state.templates)
+  }
+
+  async refreshRegexSources(context, signal) {
+    if (isAbortSignal(context)) { signal = context; context = undefined }
+    const state = await this.stateFor(context)
+    signal?.throwIfAborted()
+    const document = normalizeRegexSourcesDocument(await readJson(join(state.root, 'regex-scripts.json'), { schemaVersion: 1, global: [], preset: [] }, 16 * 1024 * 1024))
+    state.globalRegexScripts = document.global
+    state.presetRegexScripts = document.preset
+    state.globalVariables = document.variables
+    return snapshot(document)
+  }
+
+  async saveRegexSources(patch, signal, context) {
+    if (signal !== undefined && !isAbortSignal(signal)) { context = signal; signal = undefined }
+    context ??= patch?.context
+    const state = await this.stateFor(context)
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) throw new TypeError('regex source patch must be an object')
+    if (Object.hasOwn(patch, 'global') && !Array.isArray(patch.global)) throw new TypeError('global Regex source must be an array')
+    if (Object.hasOwn(patch, 'preset') && !Array.isArray(patch.preset)) throw new TypeError('preset Regex source must be an array')
+    if (Object.hasOwn(patch, 'variables') && (patch.variables === null || typeof patch.variables !== 'object' || Array.isArray(patch.variables))) throw new TypeError('global variables must be an object')
+    const path = join(state.root, 'regex-scripts.json')
+    return this.serial(`regex:${state.root}`, () => withFileLock(path, async () => {
+      const current = normalizeRegexSourcesDocument(await readJson(path, { schemaVersion: 1, global: [], preset: [] }, 16 * 1024 * 1024))
+      const next = {
+        schemaVersion: 1,
+        global: Object.hasOwn(patch, 'global') ? normalizeScriptList(patch.global).filter(script => script.kind === 'regex') : current.global,
+        preset: Object.hasOwn(patch, 'preset') ? normalizeScriptList(patch.preset).filter(script => script.kind === 'regex') : current.preset,
+        variables: Object.hasOwn(patch, 'variables') ? snapshot(patch.variables) : current.variables,
+      }
+      assertSafeOwnedJson(next, 16 * 1024 * 1024, 'regex sources')
+      await atomicJson(path, next, () => signal?.throwIfAborted())
+      state.globalRegexScripts = next.global
+      state.presetRegexScripts = next.preset
+      state.globalVariables = next.variables
+      return snapshot(next)
+    }, signal), signal)
+  }
+
+  async readCardRecord(cardId, signal, persist = false, context) {
+    const state = await this.stateFor(context)
+    const record = await this.loadCardRecord(join(state.root, 'cards', `${cardId}.json`), cardId, persist, signal)
+    if (record === undefined) state.cards.delete(cardId)
+    else state.cards.set(cardId, record)
+    return record === undefined ? undefined : snapshot(record)
+  }
+
+  async refreshCard(id, signal, context) {
+    const cardId = safeCardId(id)
+    const state = await this.stateFor(context)
+    const path = join(state.root, 'cards', `${cardId}.json`)
+    return this.serial(`resources:${state.root}`, () => withFileLock(path, async () => {
+      const record = await this.loadCardRecord(path, cardId, true, signal)
+      if (record === undefined) state.cards.delete(cardId)
+      else state.cards.set(cardId, record)
+      return record === undefined ? undefined : snapshot(record)
+    }, signal), signal)
+  }
+
+  async refreshLibrary(context, signal) {
+    if (isAbortSignal(context)) { signal = context; context = undefined }
+    const state = await this.stateFor(context)
+    const [cardFiles, worldbookFiles] = await Promise.all([
+      readdir(join(state.root, 'cards'), { withFileTypes: true }),
+      readdir(join(state.root, 'worldbooks'), { withFileTypes: true }),
+    ])
+    const cardIds = new Set(cardFiles.filter(file => file.isFile() && /^[a-f0-9]{64}\.json$/.test(file.name)).map(file => file.name.slice(0, -5)))
+    const worldbookIds = new Set(worldbookFiles.filter(file => file.isFile() && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json$/.test(file.name)).map(file => file.name.slice(0, -5)))
+    for (const id of cardIds) {
+      try { await this.refreshCard(id, signal, state.workspace) } catch (error) { if (signal?.aborted) throw error }
+    }
+    for (const id of worldbookIds) {
+      try {
+        const record = await this.loadWorldbookRecord(join(state.root, 'worldbooks', `${id}.json`), id)
+        if (record !== undefined) state.worldbooks.set(id, record)
+      } catch (error) { if (signal?.aborted) throw error }
+    }
+    for (const id of state.cards.keys()) if (!cardIds.has(id)) state.cards.delete(id)
+    for (const id of state.worldbooks.keys()) if (!worldbookIds.has(id)) state.worldbooks.delete(id)
+    await Promise.all([this.refreshTemplates(state.workspace, signal), this.refreshRegexSources(state.workspace, signal), this.refreshSelection(state.workspace, signal)])
+    for (const session of this.sessions.values()) {
+      if (session.workspace !== state.workspace || session.binding === null) continue
+      if (!state.cards.has(session.binding.cardId)) session.binding = null
+      else if (session.binding.worldbookId !== null && !state.worldbooks.has(session.binding.worldbookId)) session.binding.worldbookId = null
+    }
+  }
+
+  async refreshSelection(context, signal) {
+    if (isAbortSignal(context)) { signal = context; context = undefined }
+    const state = await this.stateFor(context)
+    const selection = await readJson(join(state.root, 'selection.json'), { schemaVersion: 1, selectedCardId: null }, 64 * 1024)
+    signal?.throwIfAborted()
+    const rawCandidate = typeof selection?.selectedCardId === 'string' && /^[a-f0-9]{64}$/.test(selection.selectedCardId) ? selection.selectedCardId : null
+    if (rawCandidate !== null && !state.cards.has(rawCandidate)) {
+      const record = await this.loadCardRecord(join(state.root, 'cards', `${rawCandidate}.json`), rawCandidate, false, signal)
+      if (record !== undefined) state.cards.set(rawCandidate, record)
+    }
+    const candidate = rawCandidate !== null && state.cards.has(rawCandidate) ? rawCandidate : null
+    state.selectedCardId = candidate
+    return candidate
+  }
+
+  selectionView(context) {
+    const state = this.workspaces.get(this.workspaceFor(context))
+    const selected = state?.selectedCardId === null || state === undefined ? undefined : state.cards.get(state.selectedCardId)
+    return {
+      selectedCardId: selected?.id ?? null,
+      selectedCard: selected === undefined ? null : { id: selected.id, name: selected.card.data.name, nickname: selected.card.data.nickname },
+    }
+  }
+
+  async selectCard(cardId, context, signal) {
+    if (isAbortSignal(context)) { signal = context; context = undefined }
+    const state = await this.stateFor(context)
+    const id = cardId === null || cardId === undefined || cardId === '' ? null : safeCardId(cardId)
+    const path = join(state.root, 'selection.json')
+    return this.serial(`resources:${state.root}`, async () => {
+      if (id !== null) {
+        const cardPath = join(state.root, 'cards', `${id}.json`)
+        const record = await withFileLock(cardPath, () => this.loadCardRecord(cardPath, id, true, signal), signal)
+        if (record === undefined) {
+          state.cards.delete(id)
+          throw new Error(`card ${id} was not found`)
+        }
+        state.cards.set(id, record)
+      }
+      return this.serial(`selection:${state.root}`, () => withFileLock(path, async () => {
+        await atomicJson(path, { schemaVersion: 1, selectedCardId: id }, () => signal?.throwIfAborted())
+        state.selectedCardId = id
+        return this.selectionView(state.workspace)
+      }, signal), signal)
+    }, signal)
+  }
+
+  listCards(context) {
+    const state = this.workspaces.get(this.workspaceFor(context))
+    return [...(state?.cards.values() ?? [])].map(record => ({
+      id: record.id,
+      name: record.card.data.name,
+      nickname: record.card.data.nickname,
+      tags: record.card.data.tags,
+      creator: record.card.data.creator,
+      characterVersion: record.card.data.character_version,
+      format: record.format,
+      warnings: record.warnings,
+      importedAt: record.importedAt,
+      updatedAt: record.updatedAt,
+      scriptCount: record.scripts.length,
+      defaultWorldbookId: record.defaultWorldbookId,
+    })).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  }
+
+  getCard(id, context) {
+    if (!/^[a-f0-9]{64}$/.test(String(id))) return undefined
+    const record = this.workspaces.get(this.workspaceFor(context))?.cards.get(String(id))
+    return record === undefined ? undefined : snapshot(record)
+  }
+
+  listWorldbooks(context) {
+    const state = this.workspaces.get(this.workspaceFor(context))
+    return [...(state?.worldbooks.values() ?? [])].map(record => ({
+      id: record.id,
+      name: record.name,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      entryCount: Array.isArray(record.book.entries) ? record.book.entries.length : 0,
+    })).sort((left, right) => left.name.localeCompare(right.name))
+  }
+
+  getWorldbook(id, context) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(String(id))) return undefined
+    const record = this.workspaces.get(this.workspaceFor(context))?.worldbooks.get(String(id))
+    return record === undefined ? undefined : snapshot(record)
+  }
+
+  worldbookByName(state, name) {
+    const key = worldbookNameKey(name)
+    return [...state.worldbooks.values()].find(record => worldbookNameKey(record.name) === key)
+  }
+
+  worldbookNameConflict(name, existing) {
+    const error = new Error(`worldbook "${name}" already exists`)
+    error.code = 'worldbook-name-conflict'
+    error.details = { worldbookName: name, existingWorldbookId: existing.id }
+    return error
+  }
+
+  async writeWorldbook(state, record, signal) {
+    const id = safeWorldbookId(record.id)
+    const path = join(state.root, 'worldbooks', `${id}.json`)
+    assertSafeOwnedJson(record, MAX_WORLDBOOK_RECORD_BYTES, 'worldbook record')
+    await withFileLock(path, () => atomicJson(path, record, () => signal?.throwIfAborted()), signal)
+    state.worldbooks.set(id, record)
+    return snapshot(record)
+  }
+
+  async importWorldbook(bookValue, options = {}) {
+    const context = options.context ?? options.workspace
+    const signal = options.signal
+    const state = await this.stateFor(context)
+    const strategy = options.conflict ?? 'error'
+    if (!['error', 'overwrite', 'save-as'].includes(strategy)) throw new Error('worldbook conflict strategy must be error, overwrite, or save-as')
+    const requestedName = strategy === 'save-as' ? options.saveAsName : options.name
+    const book = normalizeWorldbookBook(bookValue, requestedName)
+    return this.serial(`resources:${state.root}`, async () => {
+      const sameName = this.worldbookByName(state, book.name)
+      if (sameName !== undefined && strategy === 'error') throw this.worldbookNameConflict(book.name, sameName)
+      if (strategy === 'save-as' && sameName !== undefined) throw this.worldbookNameConflict(book.name, sameName)
+      let target
+      if (strategy === 'overwrite') {
+        const overwriteId = options.overwriteId === undefined ? sameName?.id : safeWorldbookId(options.overwriteId)
+        target = overwriteId === undefined ? undefined : state.worldbooks.get(overwriteId)
+        if (target === undefined) throw new Error('overwrite target worldbook was not found')
+      }
+      const timestamp = new Date().toISOString()
+      const id = target?.id ?? randomUUID()
+      const record = {
+        schemaVersion: 1,
+        id,
+        name: book.name,
+        book,
+        createdAt: target?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      }
+      return this.writeWorldbook(state, record, signal)
+    }, signal)
+  }
+
+  async createWorldbook(book, options = {}) {
+    return this.importWorldbook(book, { ...options, conflict: options.conflict ?? 'error' })
+  }
+
+  async updateWorldbook(id, patch, options = {}) {
+    const worldbookId = safeWorldbookId(id)
+    const state = await this.stateFor(options.context ?? options.workspace)
+    const signal = options.signal
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) throw new TypeError('worldbook patch must be an object')
+    return this.serial(`resources:${state.root}`, async () => {
+      const path = join(state.root, 'worldbooks', `${worldbookId}.json`)
+      return withFileLock(path, async () => {
+        const existing = await this.loadWorldbookRecord(path, worldbookId)
+        if (existing === undefined) throw new Error(`worldbook ${worldbookId} was not found`)
+        const input = snapshot(Object.hasOwn(patch, 'book') ? patch.book : { ...existing.book, ...patch })
+        if (input !== null && typeof input === 'object' && !Array.isArray(input)) delete input.id
+        const book = normalizeWorldbookBook(input, patch.name ?? input.name ?? existing.name)
+        const collision = this.worldbookByName(state, book.name)
+        if (collision !== undefined && collision.id !== worldbookId) {
+          throw this.worldbookNameConflict(book.name, collision)
+        }
+        const record = { ...existing, name: book.name, book, updatedAt: new Date().toISOString() }
+        assertSafeOwnedJson(record, MAX_WORLDBOOK_RECORD_BYTES, 'worldbook record')
+        await atomicJson(path, record, () => signal?.throwIfAborted())
+        state.worldbooks.set(worldbookId, record)
+        return snapshot(record)
+      }, signal)
+    }, signal)
+  }
+
+  async importCard(bytes, metadata = {}, signal, context) {
+    if (signal !== undefined && !isAbortSignal(signal)) { context = signal; signal = undefined }
+    context ??= metadata.context ?? metadata.workspace
+    const state = await this.stateFor(context)
+    signal?.throwIfAborted()
+    const parsed = parseCardBytes(bytes, { strict: true })
+    const id = createHash('sha256').update(bytes).digest('hex')
+    const card = snapshot(parsed.card)
+    const embeddedWorldbook = card.data.character_book === null || typeof card.data.character_book !== 'object' || Array.isArray(card.data.character_book)
+      ? null
+      : snapshot(card.data.character_book)
+    delete card.data.character_book
+    let importedWorldbook
+    if (embeddedWorldbook !== null) {
+      const requestedConflict = metadata.worldbookConflict ?? metadata.conflict ?? 'error'
+      const conflict = requestedConflict !== null && typeof requestedConflict === 'object' ? requestedConflict.action : requestedConflict
+      importedWorldbook = await this.importWorldbook(embeddedWorldbook, {
+        context: state.workspace,
+        signal,
+        conflict,
+        overwriteId: metadata.overwriteWorldbookId,
+        saveAsName: requestedConflict !== null && typeof requestedConflict === 'object' ? requestedConflict.name : metadata.saveAsName,
+        name: metadata.worldbookName ?? embeddedWorldbook.name ?? `${card.data.name} Worldbook`,
+      })
+    }
+    return this.serial(`resources:${state.root}`, async () => {
+      const path = join(state.root, 'cards', `${id}.json`)
+      return withFileLock(path, async () => {
+        const timestamp = new Date().toISOString()
+        const existing = await this.loadCardRecord(path, id, false, signal)
+        const record = {
+          schemaVersion: 4,
+          id,
+          importedAt: existing?.importedAt ?? timestamp,
+          updatedAt: timestamp,
+          fileName: basename(String(metadata.fileName ?? `${card.data.name}${extensionFor(parsed.format)}`)),
+          mediaType: String(metadata.mediaType ?? (parsed.format === 'json-v3' ? 'application/json' : 'image/png')),
+          format: parsed.format,
+          warnings: parsed.warnings,
+          card,
+          defaultWorldbookId: importedWorldbook?.id ?? existing?.defaultWorldbookId ?? null,
+          scripts: existing?.scripts ?? normalizeScriptList(extractScripts(parsed.card)),
+        }
+        assertJsonBytes(record, MAX_CARD_RECORD_BYTES, 'card record')
+        await atomicJson(path, record, () => signal?.throwIfAborted())
+        await writeFile(join(state.root, 'originals', `${id}${extensionFor(parsed.format)}`), bytes)
+        state.cards.set(id, record)
+        return snapshot(record)
+      }, signal)
+    }, signal)
+  }
+
+  async updateCard(id, patch, signal, context) {
+    if (signal !== undefined && !isAbortSignal(signal)) { context = signal; signal = undefined }
+    context ??= patch?.context ?? patch?.workspace
+    const state = await this.stateFor(context)
+    const cardId = safeCardId(id)
+    let characterBookId
+    if (patch.characterBook !== undefined && patch.characterBook !== null) {
+      const existingCard = state.cards.get(cardId)
+      if (existingCard?.defaultWorldbookId && state.worldbooks.has(existingCard.defaultWorldbookId)) {
+        characterBookId = (await this.updateWorldbook(existingCard.defaultWorldbookId, { book: patch.characterBook }, { context: state.workspace, signal })).id
+      } else {
+        characterBookId = (await this.createWorldbook(patch.characterBook, { context: state.workspace, signal, name: `${existingCard?.card?.data?.name ?? 'Character'} Worldbook` })).id
+      }
+    }
+    return this.serial(`resources:${state.root}`, async () => {
+      const path = join(state.root, 'cards', `${cardId}.json`)
+      return withFileLock(path, async () => {
+        const existing = await this.loadCardRecord(path, cardId, false, signal)
+        if (existing === undefined) throw new Error(`card ${cardId} was not found`)
+        const record = snapshot(existing)
+        if (patch.cardData !== undefined) {
+          if (patch.cardData === null || typeof patch.cardData !== 'object' || Array.isArray(patch.cardData)) throw new Error('cardData must be an object')
+          for (const [key, field] of Object.entries(patch.cardData)) {
+            if (['name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'creator_notes', 'system_prompt', 'post_history_instructions', 'nickname'].includes(key) && typeof field === 'string') record.card.data[key] = field
+          }
+        }
+        if (Object.hasOwn(patch, 'defaultWorldbookId')) {
+          const worldbookId = patch.defaultWorldbookId === null || patch.defaultWorldbookId === '' ? null : safeWorldbookId(patch.defaultWorldbookId)
+          if (worldbookId !== null && !state.worldbooks.has(worldbookId)) throw new Error(`worldbook ${worldbookId} was not found`)
+          record.defaultWorldbookId = worldbookId
+        }
+        if (patch.characterBook !== undefined) record.defaultWorldbookId = patch.characterBook === null ? null : characterBookId
+        validateCardV3(record.card)
+        if (patch.scripts !== undefined) {
+          if (!Array.isArray(patch.scripts) || patch.scripts.length > 32) throw new Error('scripts must be an array with at most 32 entries')
+          assertSafeOwnedJson(patch.scripts, 8 * 1024 * 1024, 'scripts')
+          record.scripts = normalizeScriptList(patch.scripts)
+        }
+        record.schemaVersion = 4
+        record.updatedAt = new Date().toISOString()
+        assertJsonBytes(record, MAX_CARD_RECORD_BYTES, 'card record')
+        await atomicJson(path, record, () => signal?.throwIfAborted())
+        state.cards.set(cardId, record)
+        return snapshot(record)
+      }, signal)
+    }, signal)
+  }
+
+  async currentBindings(state) {
+    const path = join(state.root, 'bindings.json')
+    const bindings = normalizeBindingsDocument(await readJson(path, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+    state.bindings = bindings
+    return bindings
+  }
+
+  async inspectWorldbookReferences(id, context) {
+    const worldbookId = safeWorldbookId(id)
+    const state = await this.stateFor(context)
+    const bindings = await this.currentBindings(state)
+    return {
+      worldbookId,
+      cards: [...state.cards.values()].filter(card => card.defaultWorldbookId === worldbookId).map(card => ({ id: card.id, name: String(card.card.data.name ?? '') })),
+      sessions: Object.entries(bindings.sessions).flatMap(([sessionId, binding]) => binding.worldbookId === worldbookId ? [{ sessionId, cardId: binding.cardId, startedAt: binding.startedAt }] : []),
+    }
+  }
+
+  async inspectCardReferences(id, context) {
+    const cardId = safeCardId(id)
+    const state = await this.stateFor(context)
+    const bindings = await this.currentBindings(state)
+    return {
+      cardId,
+      sessions: Object.entries(bindings.sessions).flatMap(([sessionId, binding]) => binding.cardId === cardId ? [{ sessionId, startedAt: binding.startedAt, worldbookId: binding.worldbookId }] : []),
+    }
+  }
+
+  referenceError(kind, id, references) {
+    const error = new Error(`${kind} ${id} is still referenced`)
+    error.code = kind === 'worldbook' ? 'worldbook-references-required' : 'card-references-required'
+    error.details = { references }
+    return error
+  }
+
+  worldbookReferencesFrom(state, bindings, worldbookId) {
+    return {
+      worldbookId,
+      cards: [...state.cards.values()].filter(card => card.defaultWorldbookId === worldbookId).map(card => ({ id: card.id, name: String(card.card.data.name ?? '') })),
+      sessions: Object.entries(bindings.sessions).flatMap(([sessionId, binding]) => binding.worldbookId === worldbookId ? [{ sessionId, cardId: binding.cardId, startedAt: binding.startedAt }] : []),
+    }
+  }
+
+  async deleteWorldbookLocked(state, existing, bindings, signal) {
+    const worldbookId = existing.id
+    const references = this.worldbookReferencesFrom(state, bindings, worldbookId)
+    for (const reference of references.cards) {
+      const card = state.cards.get(reference.id)
+      if (card === undefined) continue
+      const next = { ...card, defaultWorldbookId: null, updatedAt: new Date().toISOString() }
+      const path = join(state.root, 'cards', `${card.id}.json`)
+      await withFileLock(path, () => atomicJson(path, next, () => signal?.throwIfAborted()), signal)
+      state.cards.set(card.id, next)
+    }
+    if (references.sessions.length > 0) {
+      for (const reference of references.sessions) {
+        const binding = bindings.sessions[reference.sessionId]
+        binding.worldbookId = null
+        binding.worldbookExplicit = true
+        binding.revision += 1
+      }
+      const bindingsPath = join(state.root, 'bindings.json')
+      await withFileLock(bindingsPath, () => atomicJson(bindingsPath, bindings, () => signal?.throwIfAborted()), signal)
+      state.bindings = bindings
+      for (const session of this.sessions.values()) {
+        if (session.workspace !== state.workspace || session.binding === null) continue
+        const persisted = bindings.sessions[session.agentId]
+        if (persisted !== undefined) session.binding = snapshot(persisted)
+      }
+    }
+    await rm(join(state.root, 'worldbooks', `${worldbookId}.json`), { force: true })
+    state.worldbooks.delete(worldbookId)
+    return { deleted: true, worldbookId, name: existing.name, clearedCards: references.cards.length, clearedSessions: references.sessions.length, references }
+  }
+
+  async deleteWorldbook(id, options = {}) {
+    if (isAbortSignal(options)) options = { signal: options }
+    const worldbookId = safeWorldbookId(id)
+    const state = await this.stateFor(options.context ?? options.workspace)
+    const signal = options.signal
+    return this.serial(`resources:${state.root}`, async () => {
+      const existing = state.worldbooks.get(worldbookId) ?? await this.loadWorldbookRecord(join(state.root, 'worldbooks', `${worldbookId}.json`), worldbookId)
+      if (existing === undefined) throw new Error(`worldbook ${worldbookId} was not found`)
+      const bindings = await this.currentBindings(state)
+      const references = this.worldbookReferencesFrom(state, bindings, worldbookId)
+      if (options.rejectIfReferenced === true && (references.cards.length > 0 || references.sessions.length > 0)) throw this.referenceError('worldbook', worldbookId, references)
+      return this.deleteWorldbookLocked(state, existing, bindings, signal)
+    }, signal)
+  }
+
+  async deleteCard(id, options = {}) {
+    if (isAbortSignal(options)) options = { signal: options }
+    const cardId = safeCardId(id)
+    const state = await this.stateFor(options.context ?? options.workspace)
+    const signal = options.signal
+    return this.serial(`resources:${state.root}`, async () => {
+      const path = join(state.root, 'cards', `${cardId}.json`)
+      const existing = await this.loadCardRecord(path, cardId, false, signal)
+      if (existing === undefined) throw new Error(`card ${cardId} was not found`)
+      const bindings = await this.currentBindings(state)
+      const references = {
+        cardId,
+        sessions: Object.entries(bindings.sessions).flatMap(([sessionId, binding]) => binding.cardId === cardId ? [{ sessionId, startedAt: binding.startedAt, worldbookId: binding.worldbookId }] : []),
+      }
+      const rejectedIds = new Set(Array.isArray(options.rejectSessionIds) ? options.rejectSessionIds.map(String) : [])
+      const blocked = options.rejectIfReferenced === true ? references.sessions : references.sessions.filter(item => rejectedIds.has(item.sessionId))
+      if (blocked.length > 0) throw this.referenceError('card', cardId, { ...references, sessions: blocked })
+      const deleteBoundWorldbook = (options.deleteWorldbook === true || options.deleteDefaultWorldbook === true) && existing.defaultWorldbookId !== null && state.worldbooks.has(existing.defaultWorldbookId)
+      let worldbookToDelete = null
+      if (deleteBoundWorldbook) {
+        worldbookToDelete = state.worldbooks.get(existing.defaultWorldbookId)
+        const allWorldbookReferences = this.worldbookReferencesFrom(state, bindings, existing.defaultWorldbookId)
+        const remainingReferences = {
+          ...allWorldbookReferences,
+          cards: allWorldbookReferences.cards.filter(card => card.id !== cardId),
+          sessions: allWorldbookReferences.sessions.filter(session => session.cardId !== cardId),
+        }
+        if ((remainingReferences.cards.length > 0 || remainingReferences.sessions.length > 0) && options.confirmWorldbookDelete !== true) {
+          throw this.referenceError('worldbook', existing.defaultWorldbookId, remainingReferences)
+        }
+      }
+      let unboundSessions = 0
+      for (const [sessionId, binding] of Object.entries(bindings.sessions)) {
+        if (binding.cardId !== cardId) continue
+        delete bindings.sessions[sessionId]
+        unboundSessions += 1
+      }
+      if (unboundSessions > 0) {
+        const bindingsPath = join(state.root, 'bindings.json')
+        await withFileLock(bindingsPath, () => atomicJson(bindingsPath, bindings, () => signal?.throwIfAborted()), signal)
+        state.bindings = bindings
+      }
+      const selectionPath = join(state.root, 'selection.json')
+      if (state.selectedCardId === cardId) {
+        await withFileLock(selectionPath, () => atomicJson(selectionPath, { schemaVersion: 1, selectedCardId: null }, () => signal?.throwIfAborted()), signal)
+        state.selectedCardId = null
+      }
+      await rm(join(state.root, 'originals', `${cardId}${extensionFor(existing.format)}`), { force: true })
+      await rm(path, { force: true })
+      state.cards.delete(cardId)
+      for (const session of this.sessions.values()) if (session.workspace === state.workspace && session.binding?.cardId === cardId) session.binding = null
+      let deletedWorldbook = null
+      if (worldbookToDelete !== null) deletedWorldbook = await this.deleteWorldbookLocked(state, worldbookToDelete, bindings, signal)
+      return { deleted: true, cardId, name: String(existing.card.data.name ?? ''), unboundSessions, selectedCardId: state.selectedCardId, references, deletedWorldbook }
+    }, signal)
+  }
+
+  async ensureSession(agent, signal) {
+    if (this.disposedAgents.has(agent)) throw new Error(`agent ${String(agent.id)} was disposed`)
+    const id = safeSessionId(agent.id)
+    const workspace = this.workspaceOf(agent)
+    const key = `${workspace}\0${id}`
+    const pending = this.sessionLoads.get(key)
+    if (pending !== undefined) return awaitWithSignal(pending, signal)
+    const epoch = this.sessionEpoch.get(key) ?? 0
+    const load = (async () => {
+      const state = await this.stateFor(workspace)
+      const memoryName = createHash('sha256').update(id).digest('hex')
+      const memoryPath = join(state.root, 'memory', `${memoryName}.json`)
+      let memory = normalizeMemoryDocument(await readJson(memoryPath, emptyMemoryDocument(id), 20 * 1024 * 1024), id)
+      await Promise.all([this.refreshTemplates(workspace), this.refreshRegexSources(workspace)])
+      return this.serial(`bindings:${state.root}`, async () => {
+        const bindingsPath = join(state.root, 'bindings.json')
+        return withFileLock(bindingsPath, async () => {
+          const bindings = normalizeBindingsDocument(await readJson(bindingsPath, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+          let binding = bindings.sessions[id] ?? null
+          if (binding !== null && !state.cards.has(binding.cardId)) {
+            const record = await this.loadCardRecord(join(state.root, 'cards', `${binding.cardId}.json`), binding.cardId, false)
+            if (record !== undefined) state.cards.set(binding.cardId, record)
+          }
+          if (binding !== null && !state.cards.has(binding.cardId)) {
+            delete bindings.sessions[id]
+            await atomicJson(bindingsPath, bindings)
+            binding = null
+          }
+          if (binding !== null && binding.worldbookId !== null && !state.worldbooks.has(binding.worldbookId)) {
+            const worldbook = await this.loadWorldbookRecord(join(state.root, 'worldbooks', `${binding.worldbookId}.json`), binding.worldbookId)
+            if (worldbook !== undefined) state.worldbooks.set(binding.worldbookId, worldbook)
+          }
+          if (binding !== null && binding.startedAt === null && binding.worldbookExplicit !== true) {
+            const defaultWorldbookId = state.cards.get(binding.cardId)?.defaultWorldbookId
+            if (defaultWorldbookId && !state.worldbooks.has(defaultWorldbookId)) {
+              const worldbook = await this.loadWorldbookRecord(join(state.root, 'worldbooks', `${defaultWorldbookId}.json`), defaultWorldbookId)
+              if (worldbook !== undefined) state.worldbooks.set(defaultWorldbookId, worldbook)
+            }
+          }
+          if (binding !== null && binding.worldbookId !== null && !state.worldbooks.has(binding.worldbookId)) binding.worldbookId = null
+          state.bindings = bindings
+          const cached = this.sessions.get(key)
+          if (cached?.memory.revision > memory.revision) memory = cached.memory
+          if (this.disposedAgents.has(agent)) throw new Error(`agent ${id} was disposed`)
+          const session = { key, agentId: id, epoch, workspace, state, binding: binding === null ? null : snapshot(binding), memory, memoryPath }
+          if ((this.sessionEpoch.get(key) ?? 0) === epoch) this.sessions.set(key, session)
+          return session
+        })
+      })
+    })()
+    this.sessionLoads.set(key, load)
+    const cleanup = () => { if (this.sessionLoads.get(key) === load) this.sessionLoads.delete(key) }
+    void load.then(cleanup, cleanup)
+    return awaitWithSignal(load, signal)
+  }
+
+  sessionSync(agent) { return this.sessions.get(this.sessionKey(agent)) }
+
+  assertAgentActive(agent, session) {
+    if (this.disposedAgents.has(agent) || (this.sessionEpoch.get(session.key) ?? 0) !== session.epoch) throw new Error(`agent ${session.agentId} was disposed`)
+  }
+
+  async ensureSelectedSession(agent, signal) {
+    const session = await this.ensureSession(agent, signal)
+    if (session.binding !== null) return session
+    const selectedCardId = await this.refreshSelection(session.workspace, signal)
+    if (selectedCardId === null) return session
+    await this.bind(agent, selectedCardId, { signal })
+    return this.sessionSync(agent) ?? session
+  }
+
+  async bind(agent, cardId, options = {}) {
+    const id = safeCardId(cardId)
+    const signal = options.signal
+    const session = await this.ensureSession(agent, signal)
+    const state = session.state
+    if (await this.refreshCard(id, signal, state.workspace) === undefined) throw new Error(`card ${id} was not found`)
+    const defaultWorldbookId = state.cards.get(id)?.defaultWorldbookId
+    if (defaultWorldbookId && !state.worldbooks.has(defaultWorldbookId)) {
+      const worldbook = await this.loadWorldbookRecord(join(state.root, 'worldbooks', `${defaultWorldbookId}.json`), defaultWorldbookId)
+      if (worldbook !== undefined) state.worldbooks.set(defaultWorldbookId, worldbook)
+    }
+    const expectedCardId = Object.hasOwn(options, 'expectedCardId')
+      ? options.expectedCardId === null || options.expectedCardId === '' ? null : safeCardId(options.expectedCardId)
+      : undefined
+    if (options.replace === true && expectedCardId === undefined) throw new Error('expectedCardId is required when replacing a bound character')
+    const path = join(state.root, 'bindings.json')
+    return this.serial(`bindings:${state.root}`, () => withFileLock(path, async () => {
+      const bindings = normalizeBindingsDocument(await readJson(path, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+      const previous = bindings.sessions[session.agentId] ?? null
+      if (expectedCardId !== undefined && (previous?.cardId ?? null) !== expectedCardId) {
+        const error = new Error('current session binding changed before replacement')
+        error.code = 'binding-changed'
+        throw error
+      }
+      if (previous !== null && previous.startedAt !== null && previous.cardId !== id) {
+        const error = new Error('a started session cannot change character')
+        error.code = 'session-started'
+        throw error
+      }
+      if (previous !== null && previous.cardId !== id && options.replace !== true) {
+        const error = new Error('current session already has a selected character')
+        error.code = 'replace-confirmation-required'
+        throw error
+      }
+      if (previous?.cardId === id) {
+        session.binding = snapshot(previous)
+        state.bindings = bindings
+        return this.sessionView(agent)
+      }
+      const next = previous === null
+        ? defaultBinding(id)
+        : { ...previous, revision: previous.revision + 1, cardId: id, boundAt: new Date().toISOString(), startedAt: null, worldbookId: null, worldbookExplicit: false, openingSwipeId: 0 }
+      bindings.sessions[session.agentId] = snapshot(next)
+      if (Object.keys(bindings.sessions).length > 4096) throw new Error('workspace bindings exceed 4096 sessions')
+      assertJsonBytes(bindings, 16 * 1024 * 1024, 'workspace bindings')
+      await atomicJson(path, bindings, () => this.assertAgentActive(agent, session))
+      session.binding = next
+      state.bindings = bindings
+      return this.sessionView(agent)
+    }, signal), signal)
+  }
+
+  async startSession(agent, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    const state = session.state
+    const path = join(state.root, 'bindings.json')
+    return this.serial(`bindings:${state.root}`, () => withFileLock(path, async () => {
+      const bindings = normalizeBindingsDocument(await readJson(path, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+      const current = bindings.sessions[session.agentId] ?? null
+      if (current === null) throw new Error('current session has no selected character')
+      if (current.startedAt !== null) {
+        session.binding = snapshot(current)
+        state.bindings = bindings
+        return this.sessionView(agent)
+      }
+      const cardPath = join(state.root, 'cards', `${current.cardId}.json`)
+      const diskCard = await this.loadCardRecord(cardPath, current.cardId, false, signal)
+      if (diskCard !== undefined) state.cards.set(current.cardId, diskCard)
+      const card = diskCard ?? state.cards.get(current.cardId)
+      if (card === undefined) throw new Error(`card ${current.cardId} was not found`)
+      if (card.defaultWorldbookId && !state.worldbooks.has(card.defaultWorldbookId)) {
+        const worldbook = await this.loadWorldbookRecord(join(state.root, 'worldbooks', `${card.defaultWorldbookId}.json`), card.defaultWorldbookId)
+        if (worldbook !== undefined) state.worldbooks.set(card.defaultWorldbookId, worldbook)
+      }
+      const inheritedId = card.defaultWorldbookId !== null && state.worldbooks.has(card.defaultWorldbookId) ? card.defaultWorldbookId : null
+      const next = {
+        ...current,
+        revision: current.revision + 1,
+        startedAt: new Date().toISOString(),
+        worldbookId: current.worldbookExplicit ? current.worldbookId : inheritedId,
+      }
+      bindings.sessions[session.agentId] = snapshot(next)
+      await atomicJson(path, bindings, () => this.assertAgentActive(agent, session))
+      session.binding = next
+      state.bindings = bindings
+      return this.sessionView(agent)
+    }, signal), signal)
+  }
+
+  async updateSession(agent, patch, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    const state = session.state
+    const path = join(state.root, 'bindings.json')
+    return this.serial(`bindings:${state.root}`, () => withFileLock(path, async () => {
+      const bindings = normalizeBindingsDocument(await readJson(path, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+      const current = bindings.sessions[session.agentId] ?? null
+      if (current === null) throw new Error('current session has no selected character')
+      const next = snapshot(current)
+      if (patch.userPersona !== undefined) {
+        const name = String(patch.userPersona.name ?? 'User')
+        const description = String(patch.userPersona.description ?? '')
+        if (Buffer.byteLength(name, 'utf8') > 1024 || Buffer.byteLength(description, 'utf8') > 64 * 1024) throw new Error('user persona exceeds the size limit')
+        next.userPersona = { name, description }
+      }
+      if (patch.templateIds !== undefined) {
+        if (!Array.isArray(patch.templateIds) || patch.templateIds.length > 32) throw new Error('templateIds must contain at most 32 entries')
+        next.templateIds = patch.templateIds.map(String)
+      }
+      if (patch.variables !== undefined) {
+        if (patch.variables === null || typeof patch.variables !== 'object' || Array.isArray(patch.variables)) throw new Error('variables must be an object')
+        assertSafeOwnedJson(patch.variables, 1024 * 1024, 'variables')
+        next.variables = snapshot(patch.variables)
+      }
+      if (patch.scriptInjections !== undefined) {
+        if (!Array.isArray(patch.scriptInjections) || patch.scriptInjections.length > 64) throw new Error('scriptInjections must contain at most 64 entries')
+        const injections = patch.scriptInjections.map(item => ({ id: String(item.id ?? randomUUID()), text: String(item.text ?? ''), order: Number(item.order ?? 0) }))
+        if (injections.some(item => Buffer.byteLength(item.text, 'utf8') > 16 * 1024) || Buffer.byteLength(JSON.stringify(injections), 'utf8') > 64 * 1024) throw new Error('scriptInjections exceed the size limit')
+        next.scriptInjections = injections
+      }
+      if (Object.hasOwn(patch, 'worldbookId')) {
+        const worldbookId = patch.worldbookId === null || patch.worldbookId === '' ? null : safeWorldbookId(patch.worldbookId)
+        if (worldbookId !== null && !state.worldbooks.has(worldbookId)) throw new Error(`worldbook ${worldbookId} was not found`)
+        next.worldbookId = worldbookId
+        next.worldbookExplicit = true
+      }
+      if (patch.openingSwipeId !== undefined) {
+        const openingSwipeId = Number(patch.openingSwipeId)
+        const record = state.cards.get(current.cardId)
+        const count = (Array.isArray(record?.card?.data?.alternate_greetings) ? record.card.data.alternate_greetings.length : 0) + 1
+        if (!Number.isSafeInteger(openingSwipeId) || openingSwipeId < 0 || openingSwipeId >= count) throw new RangeError(`opening swipeId ${openingSwipeId} is outside 0..${count - 1}`)
+        next.openingSwipeId = openingSwipeId
+      }
+      next.revision = current.revision + 1
+      bindings.sessions[session.agentId] = snapshot(next)
+      assertJsonBytes(bindings, 16 * 1024 * 1024, 'workspace bindings')
+      await atomicJson(path, bindings, () => this.assertAgentActive(agent, session))
+      session.binding = next
+      state.bindings = bindings
+      return this.sessionView(agent)
+    }, signal), signal)
+  }
+
+  effectiveWorldbook(state, binding, card) {
+    if (binding === null || card === undefined) return null
+    const id = binding.startedAt === null && binding.worldbookExplicit !== true ? card.defaultWorldbookId : binding.worldbookId
+    return id === null ? null : state.worldbooks.get(id) ?? null
+  }
+
+  async memory(agent, operation, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    return this.serial(`memory:${session.workspace}:${session.agentId}`, () => withFileLock(session.memoryPath, async () => {
+      const current = normalizeMemoryDocument(await readJson(session.memoryPath, emptyMemoryDocument(session.agentId), 20 * 1024 * 1024), session.agentId)
+      if (Object.hasOwn(operation, 'expectedRevision')) {
+        if (!Number.isSafeInteger(operation.expectedRevision) || operation.expectedRevision < 0) throw new Error('memory expectedRevision must be a non-negative safe integer')
+        if (current.revision !== operation.expectedRevision) {
+          const error = new Error(`memory revision changed from ${operation.expectedRevision} to ${current.revision}`)
+          error.code = 'memory-revision-conflict'
+          throw error
+        }
+      }
+      const applied = applyMemoryOperation(current, operation)
+      if (applied.changed) {
+        assertMemoryKeywordsInSource(applied.document, sessionEvents(agent.session))
+        await atomicJson(session.memoryPath, applied.document, () => this.assertAgentActive(agent, session))
+      }
+      session.memory = applied.document
+      return { result: applied.result, revision: session.memory.revision, rows: operation.action === 'query' ? applied.result : undefined }
+    }, signal), signal)
+  }
+
+  async memorySnapshot(agent, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    return this.serial(`memory:${session.workspace}:${session.agentId}`, () => withFileLock(session.memoryPath, async () => {
+      const current = normalizeMemoryDocument(await readJson(session.memoryPath, emptyMemoryDocument(session.agentId), 20 * 1024 * 1024), session.agentId)
+      this.assertAgentActive(agent, session)
+      session.memory = current
+      return snapshot(current)
+    }, signal), signal)
+  }
+
+  async memoryGraph(agent, request, signal) {
+    const document = await this.memorySnapshot(agent, signal)
+    return { result: queryMemoryGraph(document, request), revision: document.revision }
+  }
+
+  disposeSession(agent) {
+    this.disposedAgents.add(agent)
+    const key = this.sessionKey(agent)
+    this.sessionEpoch.set(key, (this.sessionEpoch.get(key) ?? 0) + 1)
+    this.sessions.delete(key)
+    this.sessionLoads.delete(key)
+  }
+
+  sessionView(agent) {
+    const session = this.sessionSync(agent)
+    if (session === undefined) return { sessionId: agent.id, ready: false, binding: null, card: null, worldbook: null, worldbookId: null, memory: emptyMemoryDocument(agent.id), templates: [], globalRegexScripts: [], presetRegexScripts: [], globalVariables: {} }
+    const card = session.binding === null ? null : session.state.cards.get(session.binding.cardId) ?? null
+    const worldbook = card === null ? null : this.effectiveWorldbook(session.state, session.binding, card)
+    return {
+      sessionId: agent.id,
+      ready: true,
+      workspace: session.workspace,
+      binding: session.binding === null ? null : snapshot(session.binding),
+      card: card === null ? null : snapshot(card),
+      worldbook: worldbook === null ? null : snapshot(worldbook),
+      worldbookId: worldbook?.id ?? null,
+      memory: snapshot(session.memory),
+      templates: snapshot(session.state.templates),
+      globalRegexScripts: snapshot(session.state.globalRegexScripts),
+      presetRegexScripts: snapshot(session.state.presetRegexScripts),
+      globalVariables: snapshot(session.state.globalVariables),
+    }
+  }
+
+  promptState(agent) {
+    const session = this.sessionSync(agent)
+    if (session === undefined || session.binding === null) return undefined
+    const record = session.state.cards.get(session.binding.cardId)
+    if (record === undefined) return undefined
+    const selected = session.binding.templateIds.length === 0
+      ? session.state.templates.filter(template => template.enabled !== false)
+      : session.state.templates.filter(template => session.binding.templateIds.includes(template.id) && template.enabled !== false)
+    return { record, binding: session.binding, worldbook: this.effectiveWorldbook(session.state, session.binding, record), memory: session.memory, templates: selected, globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables }
+  }
+
+  regexEntries(agent) {
+    const state = this.promptState(agent)
+    if (state === undefined) return []
+    return [
+      ...state.globalRegexScripts.map((script, index) => ({ scope: 'global', index, script })),
+      ...state.presetRegexScripts.map((script, index) => ({ scope: 'preset', index, script })),
+      ...state.record.scripts.flatMap((script, index) => script.kind === 'regex' ? [{ scope: 'scoped', index, script }] : []),
+    ]
+  }
+
+  findRegex(agent, name) {
+    const target = String(name).trim()
+    return this.regexEntries(agent).find(entry => String(entry.script.name).localeCompare(target, undefined, { sensitivity: 'base' }) === 0)
+  }
+
+  async toggleRegex(agent, name, requested, signal) {
+    const entry = this.findRegex(agent, name)
+    if (entry === undefined) throw new Error(`Regex script "${String(name)}" was not found`)
+    const enabled = requested === undefined ? entry.script.enabled !== true : requested === true
+    const script = { ...entry.script, enabled, approvedHash: enabled ? scriptHash('regex', entry.script.source, entry.script) : null }
+    if (entry.scope === 'scoped') {
+      const state = this.promptState(agent)
+      await this.updateCard(state.record.id, { scripts: state.record.scripts.map((item, index) => index === entry.index ? script : item) }, signal, agent)
+    } else {
+      const state = this.promptState(agent)
+      const scripts = (entry.scope === 'global' ? state.globalRegexScripts : state.presetRegexScripts).map((item, index) => index === entry.index ? script : item)
+      await this.saveRegexSources({ [entry.scope]: scripts }, signal, agent)
+    }
+    return { name: entry.script.name, enabled, scope: entry.scope }
+  }
+
+  async greetingState(agent, signal) {
+    const session = await this.ensureSession(agent, signal)
+    const binding = session.binding ?? (session.state.selectedCardId === null ? null : defaultBinding(session.state.selectedCardId))
+    if (binding === null) return undefined
+    const record = session.state.cards.get(binding.cardId)
+    if (record === undefined) return undefined
+    return { record, binding, worldbook: this.effectiveWorldbook(session.state, binding, record), memory: session.memory, templates: [], globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables }
+  }
+
+  async saveTemplate(template, signal, context) {
+    if (signal !== undefined && !isAbortSignal(signal)) { context = signal; signal = undefined }
+    context ??= template?.context ?? template?.workspace
+    const state = await this.stateFor(context)
+    const id = String(template.id ?? randomUUID())
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id)) throw new Error('template id has an unsafe shape')
+    const content = String(template.content ?? '')
+    const name = String(template.name ?? 'Prompt Template')
+    if (Buffer.byteLength(content, 'utf8') > 256 * 1024) throw new Error('template content exceeds 262144 bytes')
+    if (Buffer.byteLength(name, 'utf8') > 1024) throw new Error('template name exceeds 1024 bytes')
+    const normalized = { id, name, content, position: ['before', 'after', 'post-history'].includes(template.position) ? template.position : 'after', order: Number.isFinite(Number(template.order)) ? Number(template.order) : 0, enabled: template.enabled !== false }
+    const path = join(state.root, 'templates.json')
+    return this.serial(`templates:${state.root}`, () => withFileLock(path, async () => {
+      const document = await readJson(path, { schemaVersion: 1, templates: [] }, 4 * 1024 * 1024)
+      const next = document?.schemaVersion === 1 && Array.isArray(document.templates) ? snapshot(document.templates) : []
+      const index = next.findIndex(item => item.id === id)
+      if (index === -1 && next.length >= 32) throw new Error('template library exceeds 32 templates')
+      if (index === -1) next.push(normalized)
+      else next[index] = normalized
+      next.sort((left, right) => left.order - right.order)
+      const nextDocument = { schemaVersion: 1, templates: next }
+      assertJsonBytes(nextDocument, 4 * 1024 * 1024, 'template library')
+      await atomicJson(path, nextDocument, () => signal?.throwIfAborted())
+      state.templates = next
+      return snapshot(normalized)
+    }, signal), signal)
+  }
+
+  async deleteTemplate(id, signal, context) {
+    if (signal !== undefined && !isAbortSignal(signal)) { context = signal; signal = undefined }
+    const state = await this.stateFor(context)
+    const path = join(state.root, 'templates.json')
+    return this.serial(`templates:${state.root}`, () => withFileLock(path, async () => {
+      const document = await readJson(path, { schemaVersion: 1, templates: [] }, 4 * 1024 * 1024)
+      const next = document?.schemaVersion === 1 && Array.isArray(document.templates) ? snapshot(document.templates) : []
+      const index = next.findIndex(item => item.id === String(id))
+      if (index !== -1) next.splice(index, 1)
+      await atomicJson(path, { schemaVersion: 1, templates: next }, () => signal?.throwIfAborted())
+      state.templates = next
+      return index !== -1
+    }, signal), signal)
+  }
+}

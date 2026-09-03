@@ -1,0 +1,3 @@
+name: 酒馆模式
+description: 导入 SillyTavern Character Card V3，在 DSH 原生会话中使用角色卡、世界书、提示词模板、可信脚本渲染和异步维护的事件化长期记忆。
+order: 4
