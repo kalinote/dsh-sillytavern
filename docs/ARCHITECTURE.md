@@ -16,7 +16,7 @@ Agent preset 是 standing scope，不是一会话一实例。因此 Prompt provi
 
 ## Client/Host 协议
 
-第一版采用插件自有同源 HTTP JSON 路由 `/api/dsh-sillytavern`。Client 页面发起请求；trusted iframe 不能直接调用 Host，而是通过 `postMessage` 请求父 Client，由父 Client代理 HTTP。这样 iframe 的 lifecycle 与 Host carrier 分离，且不需要修改 DSH Remote allowlist 或生成 Typert 文件。
+第一版采用插件自有同源 HTTP JSON 路由 `/api/dsh-sillytavern`。Client 页面发起请求；trusted iframe 不能直接调用 Host，而是通过 `postMessage` 请求父 Client，由父 Client代理 HTTP。iframe 也通过同一套 channel/source 校验桥回传由 `ResizeObserver` 测得的内容高度，父 Client 只调整对应 iframe 的块尺寸。这样 iframe 的 lifecycle 与 Host carrier 分离，且不需要修改 DSH Remote allowlist 或生成 Typert 文件。
 
 主要路由：
 

@@ -246,6 +246,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(slotOptions[5].key, 'narrator')
     assert.equal(slotOptions[1].inject, undefined)
     hookStates = [
+      null,
       { loading: false, error: null, value: { binding: { cardId: 'card-a' }, card: { card: { data: { name: 'Alice' } } } } },
       { loading: false, error: null, value: { cards: [{ id: 'card-a', name: 'Alice' }] } },
       false,

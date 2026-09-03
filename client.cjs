@@ -1111,6 +1111,34 @@ self.onmessage = event => {
   let seq = 0;
   const pending = new Map();
   const listeners = new Map();
+  let resizeFrame = 0;
+  let resizeObserver;
+  let resizeStarted = false;
+  let lastFrameHeight = -1;
+  const measureFrameHeight = () => {
+    resizeFrame = 0;
+    const root = document.documentElement;
+    const body = document.body;
+    const height = Math.ceil(Math.max(root?.offsetHeight || 0, body?.scrollHeight || 0, body?.offsetHeight || 0));
+    if (!Number.isFinite(height) || height <= 0 || height === lastFrameHeight) return;
+    lastFrameHeight = height;
+    parent.postMessage({ __dshSillyTavern: true, channel, event: 'frame-resize', payload: { height } }, '*');
+  };
+  const scheduleFrameResize = () => {
+    if (resizeFrame !== 0) return;
+    resizeFrame = requestAnimationFrame(measureFrameHeight);
+  };
+  const observeFrameSize = () => {
+    if (resizeStarted) return;
+    resizeStarted = true;
+    scheduleFrameResize();
+    addEventListener('load', scheduleFrameResize, { once: true });
+    document.fonts?.ready?.then(scheduleFrameResize, () => {});
+    if (resizeObserver !== undefined || typeof ResizeObserver !== 'function') return;
+    resizeObserver = new ResizeObserver(scheduleFrameResize);
+    resizeObserver.observe(document.documentElement);
+    if (document.body) resizeObserver.observe(document.body);
+  };
   const rpc = (action, args = {}) => new Promise((resolve, reject) => {
     const id = ++seq;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error('SillyTavern script RPC timed out')); }, 5000);
@@ -1162,7 +1190,7 @@ self.onmessage = event => {
   window.eventOn = eventOn;
   window.eventEmit = eventEmit;
   window.tavern_events = { APP_READY: 'app_ready', MESSAGE_RECEIVED: 'message_received', CHARACTER_CHANGED: 'character_changed' };
-  window.__dshTavernReady = () => { eventEmit('app_ready', { source: 'dsh-sillytavern' }); parent.postMessage({ __dshSillyTavern: true, channel, event: 'frame-ready' }, '*'); };
+  window.__dshTavernReady = () => { observeFrameSize(); eventEmit('app_ready', { source: 'dsh-sillytavern' }); parent.postMessage({ __dshSillyTavern: true, channel, event: 'frame-ready' }, '*'); };
 })();
 <\/script>`
       const ready = `<script>window.__dshTavernReady?.()<\/script>`
@@ -1222,12 +1250,19 @@ self.onmessage = event => {
       const frame = React.useRef(null)
       const cursor = React.useRef({ cardId: undefined, seq: -1, initialized: false })
       const [ready, setReady] = React.useState(false)
+      const [height, setHeight] = React.useState(null)
       React.useEffect(() => {
         cursor.current = { cardId: undefined, seq: -1, initialized: false }
         setReady(false)
+        setHeight(null)
         const listener = async event => {
           const message = event.data
           if (!message || message.__dshSillyTavern !== true || message.channel !== channel || event.source !== frame.current?.contentWindow) return
+          if (message.event === 'frame-resize') {
+            const next = Math.ceil(Number(message.payload?.height))
+            if (Number.isFinite(next) && next > 0) setHeight(previous => previous === next ? previous : next)
+            return
+          }
           if (message.event === 'frame-ready') { setReady(true); return }
           if (!message.id) return
           try {
@@ -1275,6 +1310,7 @@ self.onmessage = event => {
         title: script.name,
         sandbox: 'allow-scripts allow-forms allow-popups allow-downloads allow-modals',
         srcDoc,
+        style: height === null ? undefined : { height, minHeight: 0 },
         onLoad: () => setReady(true),
       })
     }
@@ -1754,9 +1790,10 @@ self.onmessage = event => {
 
     function TavernCharacterSelect({ sessionId, blocks, registerMessageRenderers, appendInput }) {
       const version = useOverlay().version
-      const session = useAsync(() => api(`/session?sessionId=${encodeURIComponent(sessionId)}`), [sessionId, version])
-      const library = useAsync(() => api(`/library?sessionId=${encodeURIComponent(sessionId)}`), [sessionId, version])
       const eventState = useSessionEventState(sessionId)
+      const eventCardId = eventState?.card?.id || null
+      const session = useAsync(signal => api(`/session?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version, eventCardId])
+      const library = useAsync(signal => api(`/library?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version])
       const [busy, setBusy] = React.useState(false)
       const ownedBlock = React.useRef(Object.freeze({ reason: '正在切换角色卡…' }))
       const previousBlock = React.useRef(undefined)
@@ -2108,7 +2145,7 @@ self.onmessage = event => {
     const RUNTIME_CSS = `
 .dst-memory-empty-state{margin:12px 0;padding:28px 16px;border:1px dashed #cbd5e1;border-radius:11px;color:#64748b;text-align:center}.dst-memory-table{gap:12px}.dst-memory-row{content-visibility:auto;contain-intrinsic-size:180px;display:flex;flex-direction:column;gap:12px;border-radius:12px;padding:14px;background:var(--dsh-surface,#fff)}.dst-memory-row-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dst-memory-identity{display:flex;min-width:0;align-items:center;gap:8px}.dst-memory-identity strong{overflow-wrap:anywhere}.dst-memory-table-name{flex:none;padding:2px 8px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:11px;font-weight:700}.dst-memory-meta{display:flex;flex:none;align-items:center;justify-content:flex-end;gap:8px;color:#64748b;font-size:11px}.dst-memory-value{min-width:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--dsh-surface,#fff) 94%,#326fd1 6%)}.dst-memory-fields{display:flex;flex-direction:column;margin:0}.dst-memory-field{display:grid;grid-template-columns:minmax(90px,25%) minmax(0,1fr);gap:12px;padding:7px 0;border-bottom:1px solid #dce3ed}.dst-memory-field:first-child{padding-top:0}.dst-memory-field:last-child{padding-bottom:0;border-bottom:0}.dst-memory-field dt{color:#64748b;font-size:12px;font-weight:650;overflow-wrap:anywhere}.dst-memory-field dd{min-width:0;margin:0;overflow-wrap:anywhere;white-space:pre-wrap}.dst-memory-array{display:flex;flex-direction:column;gap:5px;margin:0;padding-left:24px}.dst-memory-array>li{padding-left:3px}.dst-memory-scalar.number{color:#6b21a8;font-variant-numeric:tabular-nums}.dst-memory-scalar.boolean{display:inline-block;padding:1px 7px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:12px}.dst-memory-scalar.boolean.false{background:#f1f5f9;color:#64748b}.dst-memory-scalar.null,.dst-memory-scalar.empty,.dst-memory-empty{color:#94a3b8;font-style:italic}.dst-memory-nested{min-width:0;border:1px solid #dce3ed;border-radius:8px;background:var(--dsh-surface,#fff)}.dst-memory-nested>summary{padding:5px 8px;color:#326fd1;cursor:pointer;font-size:12px;user-select:none}.dst-memory-nested>.dst-memory-fields,.dst-memory-nested>.dst-memory-array{margin:0 8px 8px}.dst-memory-row-actions{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dst-memory-raw{min-width:0;color:#64748b;font-size:12px}.dst-memory-raw>summary{cursor:pointer;user-select:none}.dst-memory-raw pre{box-sizing:border-box;max-width:min(720px,calc(100vw - 96px));max-height:300px;margin:8px 0 0;padding:10px;overflow:auto;border-radius:8px;background:#0f172a;color:#e2e8f0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:640px){.dst-memory-row-head{flex-direction:column}.dst-memory-meta{flex-wrap:wrap;justify-content:flex-start}.dst-memory-field{grid-template-columns:1fr;gap:3px}.dst-memory-row-actions{align-items:flex-end}}
 .dst-memory-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:22px 0 10px}.dst-memory-section-head>.dst-section-title{margin:0}.dst-memory-event-empty{padding:14px;border:1px dashed #cbd5e1;border-radius:10px}.dst-memory-event-graph{display:flex;flex-direction:column;gap:14px}.dst-memory-event-node{content-visibility:auto;contain-intrinsic-size:260px;border:1px solid #cbd5e1;border-radius:12px;padding:14px;background:color-mix(in srgb,var(--dsh-surface,#fff) 97%,#326fd1 3%)}.dst-memory-event-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.dst-memory-event-head strong{overflow-wrap:anywhere}.dst-memory-event-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}.dst-memory-event-relations{min-width:0;padding:9px 10px;border:1px solid #dce3ed;border-radius:9px;background:var(--dsh-surface,#fff);font-size:12px}.dst-memory-event-relations>strong{display:block;margin-bottom:4px;color:#475569}.dst-memory-event-relations ul{display:flex;flex-direction:column;gap:4px;margin:0;padding-left:18px}.dst-memory-event-relations li{overflow-wrap:anywhere}.dst-memory-event-relations code{color:#24548a}.dst-memory-event-relations small{display:block;color:#64748b}.dst-memory-event-rows{margin-top:12px}.dst-memory-ungrouped{margin-top:22px}.dst-memory-provenance{flex-basis:100%}@media(max-width:640px){.dst-memory-section-head{display:block}.dst-memory-event-links{grid-template-columns:1fr}}
-.dst-markdown-content{display:flow-root;min-width:0;overflow-wrap:anywhere}.dst-markdown-content>*>:first-child,.dst-legacy-font>*>:first-child{margin-top:0}.dst-markdown-content>*>:last-child,.dst-legacy-font>*>:last-child{margin-bottom:0}.dst-legacy-font{margin:0 0 1em;color:inherit}.dst-assistant-message{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary,#182033);font:15px/1.65 system-ui,sans-serif}.dst-assistant-message>*>:first-child{margin-top:0}.dst-assistant-message>[data-turn-process-inline][hidden]{margin-bottom:0}.dst-user-row{display:flex;flex-direction:column;align-items:flex-end;gap:6px}.dst-user-stack{display:flex;flex-direction:column;align-items:flex-end;gap:8px;min-width:0;max-width:min(calc(var(--dsh-chat-content-width,748px)*.702),82%)}.dst-user-message{box-sizing:border-box;max-width:100%;padding:10px 16px;border-radius:22px;background:var(--dsw-specific-bubble,var(--dsw-alias-bg-layer-2,#eef2f7));color:var(--dsw-alias-label-primary,#182033);font-size:var(--dsh-content-font-size,14px);line-height:calc(22px + var(--dsh-content-font-delta,0px));white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}.dst-user-message>*>:first-child{margin-top:0}.dst-user-message>*>:last-child{margin-bottom:0}.dst-assistant-reasoning{margin:8px 0;color:var(--dsw-alias-label-secondary,#64748b)}.dst-assistant-reasoning>summary{cursor:pointer}.dst-assistant-reasoning>pre,.dst-assistant-unknown{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.55 ui-monospace,monospace}.dst-assistant-stopped,.dst-script-render-error{display:block;margin-top:6px;color:#b45309;font-size:12px}.dst-script-rendering{padding:8px 0;color:var(--dsw-alias-label-secondary,#64748b);font-size:13px}.dst-script-conversation{display:flex;width:100%;min-width:0;flex-direction:column;gap:10px}.dst-script-conversation .dst-trusted-frame{display:block;width:100%;height:520px;min-height:280px;border:0;border-radius:12px;background:var(--dsw-alias-bg-base,#fff)}
+.dst-markdown-content{display:flow-root;min-width:0;overflow-wrap:anywhere}.dst-markdown-content>*>:first-child,.dst-legacy-font>*>:first-child{margin-top:0}.dst-markdown-content>*>:last-child,.dst-legacy-font>*>:last-child{margin-bottom:0}.dst-legacy-font{margin:0 0 1em;color:inherit}.dst-assistant-message{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary,#182033);font:15px/1.65 system-ui,sans-serif}.dst-assistant-message>*>:first-child{margin-top:0}.dst-assistant-message>[data-turn-process-inline][hidden]{margin-bottom:0}.dst-user-row{display:flex;flex-direction:column;align-items:flex-end;gap:6px}.dst-user-stack{display:flex;flex-direction:column;align-items:flex-end;gap:8px;min-width:0;max-width:min(calc(var(--dsh-chat-content-width,748px)*.702),82%)}.dst-user-message{box-sizing:border-box;max-width:100%;padding:10px 16px;border-radius:22px;background:var(--dsw-specific-bubble,var(--dsw-alias-bg-layer-2,#eef2f7));color:var(--dsw-alias-label-primary,#182033);font-size:var(--dsh-content-font-size,14px);line-height:calc(22px + var(--dsh-content-font-delta,0px));white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}.dst-user-message>*>:first-child{margin-top:0}.dst-user-message>*>:last-child{margin-bottom:0}.dst-assistant-reasoning{margin:8px 0;color:var(--dsw-alias-label-secondary,#64748b)}.dst-assistant-reasoning>summary{cursor:pointer}.dst-assistant-reasoning>pre,.dst-assistant-unknown{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.55 ui-monospace,monospace}.dst-assistant-stopped,.dst-script-render-error{display:block;margin-top:6px;color:#b45309;font-size:12px}.dst-script-rendering{padding:8px 0;color:var(--dsw-alias-label-secondary,#64748b);font-size:13px}.dst-script-conversation{display:flex;width:100%;min-width:0;flex-direction:column;gap:10px}.dst-script-conversation .dst-trusted-frame{display:block;width:100%;height:280px;min-height:0;border:0;border-radius:12px;background:var(--dsw-alias-bg-base,#fff)}
 .dst-story-progress-toggle{box-sizing:border-box;display:flex;align-items:center;width:100%;min-width:0;height:33px;margin-bottom:8px;padding:0 0 8px;border:0;border-bottom:1px solid var(--dsw-alias-border-l2,#e2e8f0);background:none;color:var(--dsw-alias-label-secondary,#64748b);cursor:pointer;text-align:left;font:inherit}.dst-story-progress-label{min-width:0;overflow:hidden;font-size:14px;line-height:24px;text-overflow:ellipsis;white-space:nowrap}.dst-story-progress-chevron{flex:none;width:16px;height:16px;margin-left:6px;color:var(--dsw-alias-label-tertiary,#81858c);transform:rotate(-90deg);transition:transform 100ms ease}.dst-story-progress-toggle[data-open] .dst-story-progress-chevron{transform:rotate(0deg)}.dst-story-progress-toggle:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#8fb5f5);outline-offset:2px}[data-chat-flow-kind='system-prompt']:has([data-dst-system-prompt-hidden]){display:none}@media(prefers-reduced-motion:reduce){.dst-story-progress-chevron{transition:none}}
 `
 

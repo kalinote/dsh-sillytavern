@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 修复新会话首条真实用户消息自动绑定角色卡后，Client 仍持有未绑定 `/session` 快照，导致第一次助手输出缺少 Regex 脚本而显示原文的问题；事件状态中的角色 ID 变化现在会重新加载完整 Session。
+- 对话中的 Regex HTML iframe 现在通过受 channel/source 校验的消息桥同步实际内容高度，不再为每个短 HTML 片段固定保留 520px 空白。
+
 ## 0.9.0
 
 - 长期记忆升级为 schema 5，移除记忆行 `tags` 并改用 2–10 个唯一 `keywords`。关键词用于显式查询、后台维护上下文筛选和生成前自动召回匹配。
