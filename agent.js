@@ -36,7 +36,7 @@ export function apply(ctx) {
   ctx.systemPrompt.section({
     name: 'dsh-sillytavern:memory-guidance',
     order: 115,
-    text: 'Long-term memory is recalled automatically before generation and maintained by a separate background Agent after the final reply is persisted. Your only responsibility is to continue the story. Never add, update, delete, deduplicate, or correct memory yourself. When automatically recalled facts are insufficient, use st_memory_query for matching rows or st_memory_graph_query for an event node plus its direct incoming/outgoing precedes relations. Explicit queries bypass automatic-recall and compaction gates. Use a short distinctive key, name, keyword, phrase, or eventId; structured characters/timeRange/location filters are also available, and a location path matches descendants.',
+    text: 'Long-term memory is recalled automatically before generation and maintained by separate background Agents: incrementally after ordinary completed rounds and through periodic consolidation. Your only responsibility is to continue the story. Never add, update, delete, deduplicate, or correct memory yourself. When automatically recalled facts are insufficient, use st_memory_query for matching rows or st_memory_graph_query for an event node plus its direct incoming/outgoing precedes relations. Explicit queries bypass automatic-recall and compaction gates. Use a short distinctive key, name, keyword, phrase, or eventId; structured characters/timeRange/location filters are also available, and a location path matches descendants.',
   })
   for (const definition of memoryToolDefinitions(ctx.sillyTavern)) ctx.tools.register(definition)
 
@@ -63,6 +63,19 @@ export function apply(ctx) {
       await ctx.sillyTavern.ensure(agent)
       const view = ctx.sillyTavern.sessionView(agent)
       return { kind: 'success', text: `长期记忆：${view.memory.rows.length} 行、${view.memory.eventEdges.length} 条事件关系，修订 ${view.memory.revision}` }
+    },
+  })
+  ctx.commands.register({
+    name: 'st-memory-consolidate',
+    description: '手动排队一次当前会话的定期记忆整理',
+    async handler({ agent, signal }) {
+      const result = await ctx.sillyTavern.consolidateMemory(agent, signal)
+      if (result.reason === 'no-completed-rounds') return { kind: 'error', text: '当前会话还没有可整理的完整对话轮次。' }
+      if (result.reason === 'unavailable') return { kind: 'error', text: '当前会话无法进行记忆整理。' }
+      if (result.reason === 'already-pending') {
+        return { kind: 'success', text: `定期记忆整理已在队列中：第 ${result.startTurn}–${result.endTurn} 轮，共 ${result.chunks} 个连续任务。` }
+      }
+      return { kind: 'success', text: `已排队定期记忆整理：第 ${result.startTurn}–${result.endTurn} 轮，共 ${result.chunks} 个连续任务。` }
     },
   })
   ctx.commands.register({

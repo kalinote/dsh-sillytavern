@@ -34,12 +34,23 @@ function agent(workspace, id, events = []) {
 }
 
 function maintenanceJob(id, turn, eventSeq = turn * 10) {
+  const round = {
+    turn,
+    startSeq: Math.max(0, eventSeq - 2),
+    endSeq: eventSeq + 1,
+    sourceRefs: [{ eventSeq, turn, role: 'assistant' }],
+    messages: [{ role: 'assistant', text: `final body ${turn}`, seq: eventSeq }],
+  }
   return {
     id,
+    kind: 'incremental',
+    trigger: 'automatic',
     turn,
-    sourceRefs: [{ eventSeq, turn, role: 'assistant' }],
-    turnMessages: [{ role: 'assistant', text: `final body ${turn}`, seq: eventSeq }],
-    recentContext: [],
+    startTurn: turn,
+    endTurn: turn,
+    sourceRefs: round.sourceRefs,
+    rounds: [round],
+    turnMessages: round.messages,
     status: 'pending',
     attempts: 0,
     createdAt: Date.now(),
@@ -50,6 +61,16 @@ function maintenanceJob(id, turn, eventSeq = turn * 10) {
 function addJobSource(live, job) {
   const source = job.turnMessages.find(message => message.role === 'assistant' && message.seq === job.sourceRefs.find(ref => ref.role === 'assistant')?.eventSeq)
   if (source !== undefined) live.session.events.push(event('assistant/message', source.seq, { message: { content: [{ type: 'text', text: source.text }] } }))
+}
+
+function appendConversationRound(live, turn, userText = `user ${turn}`, assistantText = `assistant ${turn}`) {
+  let seq = (live.session.events.at(-1)?.seq ?? -1) + 1
+  live.session.events.push(event('turn/start', seq++, { turn }))
+  live.session.events.push(event('user/message', seq++, { content: [{ type: 'text', text: userText }], source: { kind: 'user' } }))
+  live.session.events.push(event('assistant/message', seq++, { message: { content: [{ type: 'text', text: assistantText }], source: { kind: 'model' } } }))
+  const ended = event('turn/end', seq, { turn, reason: { kind: 'completed' } })
+  live.session.events.push(ended)
+  return ended
 }
 
 test('maintenance structured output schema is accepted by the DSH runtime subset', () => {
@@ -154,26 +175,32 @@ test('automatic recall promotes important rows, gates ordinary rows on source co
   assert.match(prompt.system, /Raw compacted scene fallback/)
 })
 
-test('maintenance job captures the completed final body, user provenance, and prior conversation context', () => {
+test('incremental maintenance captures only real user messages and the completed final body', () => {
   const events = [
     event('user/message', 0, { content: [{ type: 'text', text: 'Earlier question' }], source: { kind: 'user' } }),
     event('assistant/message', 1, { message: { content: [{ type: 'text', text: 'Earlier answer' }], source: { kind: 'model' } } }),
     event('turn/start', 2, { turn: 2 }),
-    event('user/message', 3, { content: [{ type: 'text', text: 'Latest user text' }], source: { kind: 'user' } }),
-    event('user/message', 4, { content: [{ type: 'text', text: 'Injected runtime context' }], source: { kind: 'context' } }),
-    event('assistant/message', 5, { message: { content: [{ type: 'text', text: 'Intermediate assistant text' }], source: { kind: 'model' } } }),
-    event('assistant/message', 6, { message: { content: [{ type: 'text', text: 'Persisted final body' }], source: { kind: 'model' } } }),
-    event('turn/end', 7, { turn: 2, reason: { kind: 'completed' } }),
+    event('user/message', 3, { content: [{ type: 'text', text: 'Earlier same-turn user text' }], source: { kind: 'user' } }),
+    event('user/message', 4, { content: [{ type: 'text', text: 'Latest user text' }], source: { kind: 'user' } }),
+    event('user/message', 5, { content: [{ type: 'text', text: 'Injected runtime context' }], source: { kind: 'context' } }),
+    event('assistant/message', 6, { message: { content: [{ type: 'text', text: 'Intermediate assistant text' }], source: { kind: 'model' } } }),
+    event('assistant/message', 7, { message: { content: [{ type: 'text', text: 'Persisted final body' }], source: { kind: 'model' } } }),
+    event('turn/end', 8, { turn: 2, reason: { kind: 'completed' } }),
   ]
   const live = agent('G:\\fiction', 'session-job-capture', events)
   const job = createMemoryMaintenanceJob(live, events.at(-1))
-  assert.equal(job.id, 'turn-2-assistant-6')
+  assert.equal(job.id, 'incremental-turn-2-assistant-7')
+  assert.equal(job.kind, 'incremental')
   assert.deepEqual(job.sourceRefs, [
-    { eventSeq: 3, turn: 2, role: 'user' },
-    { eventSeq: 6, turn: 2, role: 'assistant' },
+    { eventSeq: 4, turn: 2, role: 'user' },
+    { eventSeq: 7, turn: 2, role: 'assistant' },
   ])
-  assert.deepEqual(job.recentContext.map(message => message.text), ['Earlier question', 'Earlier answer'])
-  assert.equal(job.turnMessages.at(-1).text, 'Persisted final body')
+  assert.deepEqual(job.turnMessages.map(message => message.text), ['Latest user text', 'Persisted final body'])
+  assert.deepEqual(job.rounds[0].messages, job.turnMessages)
+  assert.equal(JSON.stringify(job).includes('Earlier question'), false)
+  assert.equal(JSON.stringify(job).includes('Earlier same-turn user text'), false)
+  assert.equal(JSON.stringify(job).includes('Injected runtime context'), false)
+  assert.equal(JSON.stringify(job).includes('Intermediate assistant text'), false)
   assert.equal(createMemoryMaintenanceJob(live, { ...events.at(-1), data: { turn: 2, reason: { kind: 'aborted' } } }), null)
 })
 
@@ -372,6 +399,189 @@ test('background manager retries transient failures and restores an interrupted 
   const resumedState = JSON.parse(await readFile(resumedManager.statePath(live), 'utf8'))
   assert.equal(resumedState.pending.length, 0)
   assert.deepEqual(resumedState.completed, ['retry-job', 'restart-job'])
+})
+
+test('automatic scheduling consolidates every ten complete rounds with one-round successful-boundary overlap', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sillytavern-periodic-schedule-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = join(root, 'workspace')
+  const live = agent(workspace, 'session-periodic-schedule')
+  const store = new SillyTavernStore({ fallbackWorkspace: workspace })
+  await store.ready
+  await store.ensureSession(live)
+  const starts = []
+  const manager = new MemoryMaintenanceManager({
+    store,
+    subagents: {
+      async start(_provider, options) {
+        starts.push(options)
+        return { result: Promise.resolve({ stopReason: 'completed', structured: { operations: [] } }), async dispose() {} }
+      },
+    },
+  })
+  t.after(() => manager.dispose())
+
+  for (let turn = 1; turn <= 9; turn += 1) {
+    const ended = appendConversationRound(live, turn)
+    assert.equal((await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, ended))).kind, 'incremental')
+  }
+  await waitFor(() => manager.workers.size === 0 && starts.length === 9, 'first nine incremental jobs did not settle')
+
+  const tenth = appendConversationRound(live, 10)
+  const firstPeriodic = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, tenth))
+  assert.deepEqual(firstPeriodic, { queued: true, kind: 'periodic', startTurn: 1, endTurn: 10, chunks: 1 })
+  await waitFor(() => manager.workers.size === 0 && starts.length === 10, 'first periodic job did not settle')
+  assert.match(starts.at(-1).label, /Periodic memory consolidation/)
+  assert.match(starts.at(-1).prompt[0].text, /"turn":1/)
+  assert.match(starts.at(-1).prompt[0].text, /"turn":10/)
+  let state = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
+  assert.deepEqual(state.lastPeriodicBoundary, { endSeq: tenth.seq, turn: 10 })
+
+  for (let turn = 11; turn <= 19; turn += 1) {
+    const ended = appendConversationRound(live, turn)
+    assert.equal((await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, ended))).kind, 'incremental')
+  }
+  await waitFor(() => manager.workers.size === 0 && starts.length === 19, 'second period incremental jobs did not settle')
+  const twentieth = appendConversationRound(live, 20)
+  const secondPeriodic = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, twentieth))
+  assert.deepEqual(secondPeriodic, { queued: true, kind: 'periodic', startTurn: 10, endTurn: 20, chunks: 1 })
+  await waitFor(() => manager.workers.size === 0 && starts.length === 20, 'second periodic job did not settle')
+  const secondPrompt = starts.at(-1).prompt[0].text
+  assert.doesNotMatch(secondPrompt, /"turn":9,/)
+  assert.match(secondPrompt, /"turn":10/)
+  assert.match(secondPrompt, /"turn":20/)
+  state = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
+  assert.deepEqual(state.lastPeriodicBoundary, { endSeq: twentieth.seq, turn: 20 })
+})
+
+test('a failed periodic consolidation does not advance its boundary and the next trigger covers the missed rounds', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sillytavern-periodic-failure-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = join(root, 'workspace')
+  const live = agent(workspace, 'session-periodic-failure')
+  const store = new SillyTavernStore({ fallbackWorkspace: workspace })
+  await store.ready
+  await store.ensureSession(live)
+  const starts = []
+  const manager = new MemoryMaintenanceManager({
+    store,
+    periodicInterval: 2,
+    maxAttempts: 1,
+    subagents: {
+      async start(_provider, options) {
+        starts.push(options)
+        return {
+          result: Promise.resolve(starts.length === 2
+            ? { stopReason: 'canceled', diagnostic: 'manual cancellation' }
+            : { stopReason: 'completed', structured: { operations: [] } }),
+          async dispose() {},
+        }
+      },
+    },
+  })
+  t.after(() => manager.dispose())
+
+  const first = appendConversationRound(live, 1)
+  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, first))
+  await waitFor(() => manager.workers.size === 0 && starts.length === 1, 'incremental setup did not settle')
+  const second = appendConversationRound(live, 2)
+  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, second))
+  await waitFor(() => manager.workers.size === 0 && starts.length === 2, 'failed periodic job did not settle')
+  let state = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
+  assert.equal(state.lastPeriodicBoundary, null)
+  assert.equal(state.failed.at(-1).kind, 'periodic')
+
+  const third = appendConversationRound(live, 3)
+  const retriedRange = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, third))
+  assert.deepEqual(retriedRange, { queued: true, kind: 'periodic', startTurn: 1, endTurn: 3, chunks: 1 })
+  await waitFor(() => manager.workers.size === 0 && starts.length === 3, 'replacement periodic job did not settle')
+  assert.match(starts.at(-1).prompt[0].text, /"turn":1/)
+  assert.match(starts.at(-1).prompt[0].text, /"turn":3/)
+  state = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
+  assert.deepEqual(state.lastPeriodicBoundary, { endSeq: third.seq, turn: 3 })
+})
+
+test('manual periodic consolidation queues behind an in-flight incremental job without aborting it', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sillytavern-periodic-manual-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = join(root, 'workspace')
+  const live = agent(workspace, 'session-periodic-manual')
+  const store = new SillyTavernStore({ fallbackWorkspace: workspace })
+  await store.ready
+  await store.ensureSession(live)
+  const starts = []
+  let releaseIncremental
+  const manager = new MemoryMaintenanceManager({
+    store,
+    periodicInterval: 100,
+    subagents: {
+      async start(_provider, options) {
+        starts.push(options)
+        if (starts.length === 1) {
+          return {
+            result: new Promise(resolve => { releaseIncremental = resolve }),
+            async dispose() {},
+          }
+        }
+        return { result: Promise.resolve({ stopReason: 'completed', structured: { operations: [] } }), async dispose() {} }
+      },
+    },
+  })
+  t.after(() => manager.dispose())
+
+  const ended = appendConversationRound(live, 1)
+  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, ended))
+  await waitFor(() => starts.length === 1 && releaseIncremental !== undefined, 'incremental job did not start')
+  const incrementalSignal = starts[0].signal
+  const manual = await manager.enqueuePeriodic(live)
+  assert.deepEqual(manual, { queued: true, kind: 'periodic', startTurn: 1, endTurn: 1, chunks: 1 })
+  assert.equal(incrementalSignal.aborted, false)
+  assert.equal(starts.length, 1, 'manual consolidation must remain queued behind the incremental job')
+  releaseIncremental({ stopReason: 'completed', structured: { operations: [] } })
+  await waitFor(() => manager.workers.size === 0 && starts.length === 2, 'manual periodic job did not follow the incremental job')
+  assert.match(starts[1].label, /Periodic memory consolidation/)
+})
+
+test('a multi-chunk periodic range advances the boundary only after its final whole-round task succeeds', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sillytavern-periodic-chunks-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = join(root, 'workspace')
+  const live = agent(workspace, 'session-periodic-chunks')
+  const store = new SillyTavernStore({ fallbackWorkspace: workspace })
+  await store.ready
+  await store.ensureSession(live)
+  const starts = []
+  let releaseFinalChunk
+  const manager = new MemoryMaintenanceManager({
+    store,
+    periodicInterval: 2,
+    periodicContextBytes: 1024,
+    subagents: {
+      async start(_provider, options) {
+        starts.push(options)
+        if (starts.length === 3) {
+          return { result: new Promise(resolve => { releaseFinalChunk = resolve }), async dispose() {} }
+        }
+        return { result: Promise.resolve({ stopReason: 'completed', structured: { operations: [] } }), async dispose() {} }
+      },
+    },
+  })
+  t.after(() => manager.dispose())
+
+  const first = appendConversationRound(live, 1, 'u1', `first ${'a'.repeat(600)}`)
+  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, first))
+  await waitFor(() => manager.workers.size === 0 && starts.length === 1, 'incremental setup did not settle')
+  const second = appendConversationRound(live, 2, 'u2', `second ${'b'.repeat(600)}`)
+  const scheduled = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, second))
+  assert.equal(scheduled.kind, 'periodic')
+  assert.equal(scheduled.chunks, 2)
+  await waitFor(() => starts.length === 3 && releaseFinalChunk !== undefined, 'final periodic chunk did not start')
+  const interim = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
+  assert.equal(interim.lastPeriodicBoundary, null)
+  releaseFinalChunk({ stopReason: 'completed', structured: { operations: [] } })
+  await waitFor(() => manager.workers.size === 0, 'final periodic chunk did not settle')
+  const completed = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
+  assert.deepEqual(completed.lastPeriodicBoundary, { endSeq: second.seq, turn: 2 })
 })
 
 test('background maintenance enforces one global concurrency budget across sessions', async t => {

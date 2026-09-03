@@ -23,6 +23,11 @@ test('agent face registers validated tools and loads session state inside prompt
     sessionView: agent => ({ card: null, memory: { rows: [], eventEdges: [], revision: 0 }, sessionId: agent.id }),
     memory: async (_agent, operation, signal) => { calls.push(operation); assert.equal(signal.aborted, false); return { revision: 1, result: [] } },
     memoryGraph: async (_agent, request, signal) => { calls.push(['graph', request]); assert.equal(signal.aborted, false); return { revision: 1, result: { events: [] } } },
+    consolidateMemory: async (agent, signal) => {
+      calls.push(['consolidateMemory', agent.id])
+      assert.equal(signal.aborted, false)
+      return { queued: true, startTurn: 1, endTurn: 2, chunks: 1 }
+    },
     ensure: async () => { calls.push('ensure') },
     flushOpening: agent => { calls.push(['flushOpening', agent.id]); return true },
     transformUserMessages: (_agent, messages) => messages.map(message => ({ ...message, transformed: true })),
@@ -42,7 +47,7 @@ test('agent face registers validated tools and loads session state inside prompt
   assert.equal(contexts.length, 0)
   assert.equal(variables.length, 2)
   assert.deepEqual(tools.map(tool => tool.name), ['st_memory_query', 'st_memory_graph_query'])
-  assert.deepEqual(commands.map(command => command.name), ['st-import', 'st-character', 'st-memory', 'narrator', 'regex', 'regex-state', 'regex-toggle'])
+  assert.deepEqual(commands.map(command => command.name), ['st-import', 'st-character', 'st-memory', 'st-memory-consolidate', 'narrator', 'regex', 'regex-state', 'regex-toggle'])
   const querySchema = tools[0].parameters
   assert.deepEqual(querySchema.properties.characterMatch.enum, ['any', 'all'])
   assert.deepEqual(querySchema.properties.order.enum, ['time_asc', 'time_desc', 'relevance'])
@@ -54,7 +59,8 @@ test('agent face registers validated tools and loads session state inside prompt
   assert.equal(tools[1].parameters.properties.eventId.type, 'string')
   assert.match(tools[0].description, /bypass/)
   assert.match(tools[1].description, /incoming\/outgoing/)
-  assert.match(sections[1].text, /maintained by a separate background Agent/)
+  assert.match(sections[1].text, /maintained by separate background Agents/)
+  assert.match(sections[1].text, /periodic consolidation/)
   assert.match(sections[1].text, /Never add, update, delete, deduplicate, or correct memory/)
   assert.match(sections[1].text, /st_memory_graph_query/)
 
@@ -62,10 +68,11 @@ test('agent face registers validated tools and loads session state inside prompt
   const preStep = await events.get('agent/pre-step')({ agent: preStepAgent, messages: [], signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [{ source: { kind: 'user' }, content: [] }] }))
   assert.equal(preStep.messages[0].transformed, true)
   const commandSignal = new AbortController().signal
-  assert.deepEqual(await commands[3].handler({ agent: preStepAgent, rawInput: ' scene ', signal: commandSignal }), { kind: 'success', text: 'narrator:scene' })
-  assert.deepEqual(await commands[4].handler({ agent: preStepAgent, rawInput: ' name="选项" <opinion>x</opinion>', signal: commandSignal }), { kind: 'success', text: '选项:<opinion>x</opinion>' })
-  assert.deepEqual(await commands[5].handler({ agent: preStepAgent, rawInput: '选项', signal: commandSignal }), { kind: 'success', text: 'true' })
-  assert.deepEqual(await commands[6].handler({ agent: preStepAgent, rawInput: 'state=off 选项', signal: commandSignal }), { kind: 'success', text: '选项' })
+  assert.deepEqual(await commands[3].handler({ agent: preStepAgent, signal: commandSignal }), { kind: 'success', text: '已排队定期记忆整理：第 1–2 轮，共 1 个连续任务。' })
+  assert.deepEqual(await commands[4].handler({ agent: preStepAgent, rawInput: ' scene ', signal: commandSignal }), { kind: 'success', text: 'narrator:scene' })
+  assert.deepEqual(await commands[5].handler({ agent: preStepAgent, rawInput: ' name="选项" <opinion>x</opinion>', signal: commandSignal }), { kind: 'success', text: '选项:<opinion>x</opinion>' })
+  assert.deepEqual(await commands[6].handler({ agent: preStepAgent, rawInput: '选项', signal: commandSignal }), { kind: 'success', text: 'true' })
+  assert.deepEqual(await commands[7].handler({ agent: preStepAgent, rawInput: 'state=off 选项', signal: commandSignal }), { kind: 'success', text: '选项' })
   calls.length = 0
 
   const controller = new AbortController()

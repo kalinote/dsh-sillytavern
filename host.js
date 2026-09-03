@@ -187,6 +187,12 @@ export async function apply(ctx, config = {}) {
       if (!eligible(agent)) throw new Error('memory graph queries are unavailable outside a SillyTavern parent Agent')
       return store.memoryGraph(agent, request, signal)
     },
+    async consolidateMemory(agent, signal) {
+      if (!eligible(agent)) throw new Error('memory consolidation is unavailable outside a SillyTavern parent Agent')
+      signal?.throwIfAborted()
+      await ensure(agent, signal)
+      return memoryMaintenance.enqueuePeriodic(agent, { signal })
+    },
     transformUserMessages(agent, messages) {
       return transformRawUserMessages(messages, store.promptState(agent), sessionMessages(agent))
     },
@@ -642,21 +648,26 @@ export async function apply(ctx, config = {}) {
     }
   }
   await Promise.all(ctx.agents.list().map(agent => recoverAgent(agent, 'plugin startup')))
+  const maintenanceEventTails = new WeakMap()
   ctx.on('session/event', (session, event) => {
     if (!active || event.type !== 'turn/end' || event.data?.reason?.kind !== 'completed') return
     const agent = ctx.agents.get(String(session.id))
     if (agent === undefined || agent.session !== session || !eligible(agent)) return
-    const job = createMemoryMaintenanceJob(agent, event)
-    if (job === null) return
-    void (async () => {
+    const previous = maintenanceEventTails.get(session) ?? Promise.resolve()
+    const current = previous.catch(() => undefined).then(async () => {
       try {
         if (!await ctx.sessions.flush(session)) throw new Error('no session durability listener participated in the final-body flush')
         if (!active || ctx.agents.get(String(session.id)) !== agent || agent.session !== session || !eligible(agent)) return
-        await memoryMaintenance.enqueue(agent, job)
+        const job = createMemoryMaintenanceJob(agent, event)
+        if (job !== null) await memoryMaintenance.enqueueCompletedTurn(agent, job)
       } catch (error) {
         console.error('[dsh-sillytavern] failed to durably enqueue background memory maintenance job', error)
       }
-    })()
+    }).finally(() => {
+      if (maintenanceEventTails.get(session) === current) maintenanceEventTails.delete(session)
+    })
+    maintenanceEventTails.set(session, current)
+    void current
   })
   ctx.on('agent/inbox/inserted', recordOpeningBeforeFirstUser)
   ctx.on('agent/inbox/claimed', finishPendingOpeningOnClaim)

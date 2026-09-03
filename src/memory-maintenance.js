@@ -2,12 +2,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { sessionEvents, sessionMessages } from './prompt.js'
+import { sessionEvents } from './prompt.js'
 
-const MAX_JOB_TEXT = 64 * 1024
-const MAX_CONTEXT_MESSAGES = 20
-const MAX_PROMPT_MEMORY_CHARS = 180 * 1024
-const MAX_STATE_BYTES = 4 * 1024 * 1024
+export const PERIODIC_MAINTENANCE_INTERVAL = 10
+export const PERIODIC_MAINTENANCE_OVERLAP = 1
+export const MAX_PERIODIC_CONTEXT_BYTES = 160 * 1024
+const MAX_MAINTENANCE_CANDIDATE_GROUPS = 120
+const MAX_STATE_BYTES = 16 * 1024 * 1024
 const MAX_COMPLETED_IDS = 512
 const MAX_FAILED_JOBS = 64
 const MAX_PATCH_OPERATIONS = 100
@@ -100,20 +101,19 @@ function contentText(content) {
 
 function eventMessage(event) {
   if (event?.type === 'user/message') {
-    const text = contentText(event.data?.content).slice(-MAX_JOB_TEXT)
+    const text = contentText(event.data?.content)
     return text === '' ? undefined : { role: 'user', text, seq: event.seq, sourceKind: event.data?.source?.kind ?? null }
   }
   if (event?.type === 'assistant/message') {
-    const text = contentText(event.data?.message?.content).slice(-MAX_JOB_TEXT)
+    const text = contentText(event.data?.message?.content)
     return text === '' ? undefined : { role: 'assistant', text, seq: event.seq, sourceKind: event.data?.message?.source?.kind ?? null }
   }
   return undefined
 }
 
-export function createMemoryMaintenanceJob(agent, turnEndEvent) {
+function conversationRoundFromEndEvent(events, turnEndEvent) {
   const turn = turnEndEvent?.data?.turn
   if (!Number.isSafeInteger(turn) || turn <= 0 || turnEndEvent?.data?.reason?.kind !== 'completed') return null
-  const events = sessionEvents(agent?.session)
   const endIndex = events.findIndex(event => event.seq === turnEndEvent.seq)
   if (endIndex === -1) return null
   let startIndex = -1
@@ -129,18 +129,43 @@ export function createMemoryMaintenanceJob(agent, turnEndEvent) {
   const finalAssistant = messages.findLast(message => message.role === 'assistant')
   if (finalAssistant === undefined) return null
   const users = messages.filter(message => message.role === 'user' && message.sourceKind === 'user')
+  if (users.length === 0) return null
   const sourceMessages = [...users, finalAssistant]
   const sourceRefs = sourceMessages.map(message => ({ eventSeq: message.seq, turn, role: message.role }))
-  const turnStartSeq = events[startIndex].seq
-  const recentContext = sessionMessages(agent, MAX_CONTEXT_MESSAGES)
-    .filter(message => message.seq < turnStartSeq)
-    .map(message => ({ role: message.role, text: message.text.slice(-8192), seq: message.seq }))
   return {
-    id: `turn-${turn}-assistant-${finalAssistant.seq}`,
     turn,
+    startSeq: events[startIndex].seq,
+    endSeq: turnEndEvent.seq,
     sourceRefs,
-    turnMessages: messages.map(({ role, text, seq }) => ({ role, text, seq })),
-    recentContext,
+    messages: sourceMessages.map(({ role, text, seq }) => ({ role, text, seq })),
+  }
+}
+
+export function completedConversationRounds(agent) {
+  const events = sessionEvents(agent?.session)
+  return events
+    .filter(event => event?.type === 'turn/end' && event.data?.reason?.kind === 'completed')
+    .map(event => conversationRoundFromEndEvent(events, event))
+    .filter(Boolean)
+    .sort((left, right) => left.endSeq - right.endSeq)
+}
+
+function createIncrementalJob(round) {
+  const latestUser = round.messages.findLast(message => message.role === 'user')
+  const finalAssistant = round.messages.findLast(message => message.role === 'assistant')
+  const messages = [latestUser, finalAssistant]
+  const sourceRefs = messages.map(message => ({ eventSeq: message.seq, turn: round.turn, role: message.role }))
+  const incrementalRound = { ...clone(round), messages: clone(messages), sourceRefs: clone(sourceRefs) }
+  return {
+    id: `incremental-turn-${round.turn}-assistant-${finalAssistant.seq}`,
+    kind: 'incremental',
+    trigger: 'automatic',
+    turn: round.turn,
+    startTurn: round.turn,
+    endTurn: round.turn,
+    sourceRefs,
+    rounds: [incrementalRound],
+    turnMessages: clone(messages),
     status: 'pending',
     attempts: 0,
     createdAt: Date.now(),
@@ -148,75 +173,111 @@ export function createMemoryMaintenanceJob(agent, turnEndEvent) {
   }
 }
 
-function searchableRow(row) {
-  return `${row.table}\n${row.key}\n${row.eventId ?? ''}\n${row.keywords?.join(' ') ?? ''}\n${row.characters?.join(' ') ?? ''}\n${row.location?.join(' ') ?? ''}\n${JSON.stringify(row.value)}`.toLocaleLowerCase()
+export function createMemoryMaintenanceJob(agent, turnEndEvent) {
+  const round = conversationRoundFromEndEvent(sessionEvents(agent?.session), turnEndEvent)
+  return round === null ? null : createIncrementalJob(round)
 }
 
-function searchTerms(text) {
-  const normalized = String(text).toLocaleLowerCase()
-  const terms = new Set(normalized.match(/[\p{L}\p{N}_-]{2,}/gu) ?? [])
-  for (const run of normalized.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]{2,}/gu) ?? []) {
-    const points = [...run]
-    for (let index = 0; index < points.length - 1; index += 1) terms.add(points.slice(index, index + 2).join(''))
+export function normalizeMaintenanceMatchText(text) {
+  return String(text ?? '').normalize('NFKC').toLocaleLowerCase().replace(/\s+/gu, ' ').trim()
+}
+
+function keywordScore(row, normalizedText) {
+  const matches = []
+  const seen = new Set()
+  for (const keyword of Array.isArray(row.keywords) ? row.keywords : []) {
+    const normalized = normalizeMaintenanceMatchText(keyword)
+    if (normalized === '' || seen.has(normalized) || !normalizedText.includes(normalized)) continue
+    seen.add(normalized)
+    matches.push({ keyword, length: [...normalized].length })
   }
-  return [...terms].slice(-128)
+  return {
+    count: matches.length,
+    longest: matches.reduce((value, match) => Math.max(value, match.length), 0),
+    totalLength: matches.reduce((value, match) => value + match.length, 0),
+    keywords: matches.map(match => match.keyword),
+  }
 }
 
-function boundedPush(list, value, budget) {
-  const size = JSON.stringify(value).length
-  if (budget.used + size > budget.limit) return false
-  budget.used += size
-  list.push(value)
-  return true
+function eventSummary(document, eventId) {
+  const rows = document.rows.filter(row => row.eventId === eventId)
+  return {
+    eventId,
+    memoryCount: rows.length,
+    memories: rows.slice(0, 4).map(row => ({ table: row.table, key: row.key })),
+  }
 }
 
-function memoryContext(document, contextText) {
-  const raw = JSON.stringify({ rows: document.rows, eventEdges: document.eventEdges })
-  if (raw.length <= MAX_PROMPT_MEMORY_CHARS) return { complete: true, rows: document.rows, eventEdges: document.eventEdges }
-  const terms = searchTerms(contextText)
-  const scored = document.rows.map(row => {
-    const text = searchableRow(row)
-    let matches = 0
-    for (const term of terms) if (text.includes(term)) matches += 1
-    return { row, matches }
-  }).sort((left, right) => right.matches - left.matches || right.row.importance - left.row.importance || right.row.updatedAt - left.row.updatedAt)
-  const selected = scored.slice(0, 120).map(item => item.row)
-  const selectedIds = new Set(selected.map(row => row.id))
-  const selectedEvents = new Set(selected.map(row => row.eventId).filter(Boolean))
+export function selectMaintenanceMemory(document, text, options = {}) {
+  const normalizedText = normalizeMaintenanceMatchText(text)
+  const touchedRowIds = new Set(Array.isArray(options.touchedRowIds) ? options.touchedRowIds : [])
+  const touchedEventIds = new Set(Array.isArray(options.touchedEventIds) ? options.touchedEventIds : [])
+  const scored = document.rows.map(row => ({ row, score: keywordScore(row, normalizedText) }))
+    .filter(item => item.score.count > 0)
+    .sort((left, right) => right.score.count - left.score.count
+      || right.score.longest - left.score.longest
+      || right.score.totalLength - left.score.totalLength
+      || right.row.importance - left.row.importance
+      || right.row.updatedAt - left.row.updatedAt)
+  const seeds = scored.map(item => item.row)
   for (const row of document.rows) {
-    if (selected.length >= 180) break
-    if (row.eventId && selectedEvents.has(row.eventId) && !selectedIds.has(row.id)) {
-      selected.push(row)
-      selectedIds.add(row.id)
-    }
+    if (touchedRowIds.has(row.id) || row.eventId && touchedEventIds.has(row.eventId)) seeds.push(row)
   }
-  const eventEdges = document.eventEdges.filter(edge => selectedEvents.has(edge.predecessorEventId) || selectedEvents.has(edge.successorEventId)).slice(0, 240)
-  const index = []
-  const budget = { used: 0, limit: 72 * 1024 }
-  for (const row of document.rows) {
-    if (!boundedPush(index, {
-      id: row.id,
-      table: row.table,
-      key: row.key,
-      eventId: row.eventId ?? null,
-      importance: row.importance,
-      recallPolicy: row.recallPolicy,
-      keywords: row.keywords,
-    }, budget)) break
+  const selectedGroupKeys = []
+  const selectedGroupSet = new Set()
+  for (const row of seeds) {
+    const groupKey = row.eventId ? `event:${row.eventId}` : `row:${row.id}`
+    if (selectedGroupSet.has(groupKey)) continue
+    selectedGroupSet.add(groupKey)
+    selectedGroupKeys.push(groupKey)
   }
-  return { complete: false, rows: selected, eventEdges, rowIndex: index }
+  const keptGroupKeys = selectedGroupKeys.slice(0, MAX_MAINTENANCE_CANDIDATE_GROUPS)
+  const scoredRank = new Map(scored.map((item, index) => [item.row.id, index]))
+  const rows = keptGroupKeys.flatMap(groupKey => document.rows
+    .filter(row => (row.eventId ? `event:${row.eventId}` : `row:${row.id}`) === groupKey)
+    .sort((left, right) => (scoredRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (scoredRank.get(right.id) ?? Number.MAX_SAFE_INTEGER)))
+  const eventIds = new Set(rows.map(row => row.eventId).filter(Boolean))
+  const eventEdges = document.eventEdges.filter(edge => eventIds.has(edge.predecessorEventId) || eventIds.has(edge.successorEventId))
+  const neighborIds = new Set()
+  for (const edge of eventEdges) {
+    if (!eventIds.has(edge.predecessorEventId)) neighborIds.add(edge.predecessorEventId)
+    if (!eventIds.has(edge.successorEventId)) neighborIds.add(edge.successorEventId)
+  }
+  const hitByRowId = new Map(scored.map(item => [item.row.id, item.score.keywords]))
+  return {
+    complete: selectedGroupKeys.length <= MAX_MAINTENANCE_CANDIDATE_GROUPS,
+    omittedCandidateGroups: Math.max(0, selectedGroupKeys.length - MAX_MAINTENANCE_CANDIDATE_GROUPS),
+    rows: rows.map(row => ({ ...row, matchedKeywords: hitByRowId.get(row.id) ?? [] })),
+    eventEdges,
+    neighborEventSummaries: [...neighborIds].map(eventId => eventSummary(document, eventId)),
+  }
 }
 
-export function buildMemoryMaintenancePrompt(job, document) {
-  const contextText = [...job.recentContext, ...job.turnMessages].map(message => message.text).join('\n').slice(-160 * 1024)
-  const memory = memoryContext(document, contextText)
+function contextText(job) {
+  return job.rounds.flatMap(round => round.messages).map(message => message.text).join('\n')
+}
+
+function promptForJob(job, document, touches = {}) {
+  const memory = selectMaintenanceMemory(document, contextText(job), job.kind === 'periodic' ? touches : {})
+  const periodic = job.kind === 'periodic'
   const instructions = [
-    'Maintain the long-term memory for a roleplay conversation after its final text has been persisted.',
+    periodic
+      ? 'Periodically consolidate long-term memory for the supplied contiguous roleplay conversation rounds.'
+      : 'Incrementally maintain long-term memory after the latest completed roleplay round.',
     'Produce only the structured patch requested by the output tool. An empty operations array is valid.',
     '',
     'Responsibilities:',
-    '- Add durable facts established by the latest completed turn.',
-    '- Correct or delete contradicted facts, merge duplicates, and update an existing row instead of creating a near-duplicate.',
+    ...(periodic ? [
+      '- Merge near-duplicate memories produced round by round.',
+      '- Correct missed contradictions.',
+      '- Complete direct event relationships.',
+      '- Recalibrate importance and recallPolicy.',
+      '- Delete state that is no longer valid.',
+      '- Merge events that were incorrectly split, including moving their rows to one stable eventId and repairing edges.',
+    ] : [
+      '- Add durable facts established by the latest completed round.',
+      '- Correct or delete contradicted candidate facts, and update a candidate row instead of creating a near-duplicate.',
+    ]),
     '- Group multiple memories from the same logical event with one stable eventId.',
     '- Link events, never individual memory rows. Use a precedes edge only for a direct narrative prerequisite or progression, not mere temporal adjacency.',
     '- If an existing event is continued, reuse its exact eventId. Do not invent a second id for the same event.',
@@ -231,20 +292,44 @@ export function buildMemoryMaintenancePrompt(job, document) {
     '- Source references are added by the host; do not include them in operations.',
     `- Return at most ${MAX_PATCH_OPERATIONS} operations.`,
     '',
-    `Latest completed turn: ${job.turn}`,
+    `Maintenance mode: ${job.kind}.`,
+    `Conversation range: turn ${job.startTurn} through turn ${job.endTurn}.`,
+    ...(periodic ? [
+      `Periodic trigger: ${job.trigger}.`,
+      `Continuous context task: ${job.chunkIndex + 1} of ${job.chunkCount}.`,
+      'Candidate rows were selected only by normalized keyword substring hits across this task context plus rows/events touched during the current maintenance period.',
+    ] : [
+      'Candidate rows were selected only by normalized keyword substring hits in the latest real user message(s) plus final assistant body.',
+    ]),
+    'Rows sharing a selected eventId are supplied together. Only direct edges are supplied; adjacent events appear only as brief summaries.',
+    memory.complete ? 'The candidate-group selection is complete.' : `The ranked candidate-group limit omitted ${memory.omittedCandidateGroups} lower-ranked groups.`,
   ].join('\n')
-  const narrative = JSON.stringify({ recentContext: job.recentContext, latestTurn: job.turnMessages }).slice(-160 * 1024)
-  const snapshotText = JSON.stringify(memory).slice(0, 300 * 1024)
-  return `${instructions}\n${narrative}\n\nCurrent memory snapshot (complete=${memory.complete}):\n${snapshotText}`.slice(0, 512 * 1024)
+  const narrative = JSON.stringify({ conversationRounds: job.rounds.map(round => ({ turn: round.turn, messages: round.messages })) })
+  const snapshotText = JSON.stringify(memory)
+  return { text: `${instructions}\n\nComplete conversation rounds for this task:\n${narrative}\n\nRelevant memory candidates:\n${snapshotText}`, memory }
+}
+
+export function buildMemoryMaintenancePrompt(job, document) {
+  return promptForJob(job, document).text
 }
 
 function emptyState(sessionId) {
-  return { schemaVersion: 1, sessionId, pending: [], failed: [], completed: [] }
+  return {
+    schemaVersion: 2,
+    sessionId,
+    lastPeriodicBoundary: null,
+    touchedRowIds: [],
+    touchedEventIds: [],
+    pending: [],
+    failed: [],
+    completed: [],
+  }
 }
 
 function normalizeJob(job) {
-  if (!job || typeof job !== 'object' || typeof job.id !== 'string' || !Number.isSafeInteger(job.turn) || job.turn <= 0) return undefined
-  if (!Array.isArray(job.sourceRefs) || !Array.isArray(job.turnMessages) || !Array.isArray(job.recentContext)) return undefined
+  if (!job || typeof job !== 'object' || typeof job.id !== 'string' || !['incremental', 'periodic'].includes(job.kind)) return undefined
+  if (!Number.isSafeInteger(job.turn) || job.turn <= 0 || !Array.isArray(job.sourceRefs) || !Array.isArray(job.turnMessages) || !Array.isArray(job.rounds)) return undefined
+  if (job.kind === 'periodic' && (typeof job.groupId !== 'string' || !Number.isSafeInteger(job.chunkIndex) || !Number.isSafeInteger(job.chunkCount))) return undefined
   return {
     ...clone(job),
     status: job.status === 'running' ? 'pending' : job.status === 'failed' ? 'failed' : 'pending',
@@ -253,11 +338,17 @@ function normalizeJob(job) {
 }
 
 function normalizeState(raw, sessionId) {
-  if (!raw || raw.schemaVersion !== 1 || raw.sessionId !== sessionId) return emptyState(sessionId)
+  if (!raw || raw.schemaVersion !== 2 || raw.sessionId !== sessionId) return emptyState(sessionId)
   const pending = (Array.isArray(raw.pending) ? raw.pending : []).map(normalizeJob).filter(Boolean)
   const failed = (Array.isArray(raw.failed) ? raw.failed : []).map(normalizeJob).filter(Boolean).slice(-MAX_FAILED_JOBS)
   const completed = [...new Set((Array.isArray(raw.completed) ? raw.completed : []).filter(value => typeof value === 'string'))].slice(-MAX_COMPLETED_IDS)
-  return { schemaVersion: 1, sessionId, pending, failed, completed }
+  const boundary = raw.lastPeriodicBoundary
+  const lastPeriodicBoundary = boundary && Number.isSafeInteger(boundary.endSeq) && boundary.endSeq >= 0 && Number.isSafeInteger(boundary.turn) && boundary.turn > 0
+    ? { endSeq: boundary.endSeq, turn: boundary.turn }
+    : null
+  const touchedRowIds = [...new Set((Array.isArray(raw.touchedRowIds) ? raw.touchedRowIds : []).filter(value => typeof value === 'string'))]
+  const touchedEventIds = [...new Set((Array.isArray(raw.touchedEventIds) ? raw.touchedEventIds : []).filter(value => typeof value === 'string'))]
+  return { schemaVersion: 2, sessionId, lastPeriodicBoundary, touchedRowIds, touchedEventIds, pending, failed, completed }
 }
 
 async function readState(path, sessionId) {
@@ -295,6 +386,72 @@ function mergeSourceRefs(...lists) {
   return refs
 }
 
+function conversationContextBytes(rounds) {
+  return Buffer.byteLength(JSON.stringify({
+    conversationRounds: rounds.map(round => ({ turn: round.turn, messages: round.messages })),
+  }), 'utf8')
+}
+
+export function splitPeriodicConversationRounds(rounds, limit = MAX_PERIODIC_CONTEXT_BYTES) {
+  if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('periodic memory context byte limit must be a positive integer')
+  const chunks = []
+  let current = []
+  for (const round of rounds) {
+    if (conversationContextBytes([round]) > limit) {
+      throw new Error(`complete conversation turn ${round.turn} exceeds the ${limit}-byte periodic memory context limit and cannot be split without truncation`)
+    }
+    if (current.length > 0 && conversationContextBytes([...current, round]) > limit) {
+      chunks.push(current)
+      current = []
+    }
+    current.push(round)
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
+function periodicContextRounds(rounds, boundary, targetEndSeq, overlap) {
+  const targetIndex = rounds.findLastIndex(round => round.endSeq <= targetEndSeq)
+  if (targetIndex === -1) return []
+  const boundaryIndex = boundary === null ? -1 : rounds.findLastIndex(round => round.endSeq <= boundary.endSeq)
+  const startIndex = boundaryIndex === -1 ? 0 : Math.max(0, boundaryIndex - overlap + 1)
+  return rounds.slice(startIndex, targetIndex + 1)
+}
+
+function createPeriodicJobs(rounds, boundary, target, trigger, overlap, contextLimit) {
+  const contextRounds = periodicContextRounds(rounds, boundary, target.endSeq, overlap)
+  if (contextRounds.length === 0) return []
+  const chunks = splitPeriodicConversationRounds(contextRounds, contextLimit)
+  const groupId = trigger === 'automatic'
+    ? `periodic-auto-after-${boundary?.endSeq ?? 'start'}-through-${target.endSeq}`
+    : `periodic-manual-through-${target.endSeq}-${randomUUID()}`
+  const timestamp = Date.now()
+  return chunks.map((chunk, chunkIndex) => {
+    const sourceRefs = mergeSourceRefs(...chunk.map(round => round.sourceRefs))
+    return {
+      id: `${groupId}-chunk-${chunkIndex + 1}-of-${chunks.length}`,
+      groupId,
+      kind: 'periodic',
+      trigger,
+      turn: chunk.at(-1).turn,
+      startTurn: chunk[0].turn,
+      endTurn: chunk.at(-1).turn,
+      periodStartTurn: contextRounds[0].turn,
+      periodEndTurn: target.turn,
+      boundary: { turn: target.turn, endSeq: target.endSeq },
+      chunkIndex,
+      chunkCount: chunks.length,
+      sourceRefs,
+      rounds: clone(chunk),
+      turnMessages: chunk.flatMap(round => clone(round.messages)),
+      status: 'pending',
+      attempts: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+  })
+}
+
 function operationsForCommit(rawOperations, document, sourceRefs) {
   if (!Array.isArray(rawOperations)) throw new Error('memory maintenance result has no operations array')
   if (rawOperations.length > MAX_PATCH_OPERATIONS) throw new Error(`memory maintenance result exceeds ${MAX_PATCH_OPERATIONS} operations`)
@@ -329,6 +486,34 @@ function operationsForCommit(rawOperations, document, sourceRefs) {
   return [...buckets.edgeDeletes, ...buckets.rowWrites, ...buckets.edgeWrites, ...buckets.rowDeletes]
 }
 
+function touchesFromCommit(selection, results) {
+  const rowIds = new Set(selection.rows.map(row => row.id))
+  const eventIds = new Set(selection.rows.map(row => row.eventId).filter(Boolean))
+  for (const result of Array.isArray(results) ? results : []) {
+    if (!result || typeof result !== 'object') continue
+    if (typeof result.table === 'string' && typeof result.id === 'string') rowIds.add(result.id)
+    if (typeof result.eventId === 'string') eventIds.add(result.eventId)
+    if (typeof result.predecessorEventId === 'string') eventIds.add(result.predecessorEventId)
+    if (typeof result.successorEventId === 'string') eventIds.add(result.successorEventId)
+  }
+  return { rowIds: [...rowIds], eventIds: [...eventIds] }
+}
+
+function touchesFromAppliedJob(document, job) {
+  const sourceKeys = new Set(job.sourceRefs.map(ref => `${ref.eventSeq}:${ref.turn}:${ref.role}`))
+  const hasJobSource = value => Array.isArray(value?.sourceRefs)
+    && value.sourceRefs.some(ref => sourceKeys.has(`${ref.eventSeq}:${ref.turn}:${ref.role}`))
+  const rows = document.rows.filter(hasJobSource)
+  const edges = document.eventEdges.filter(hasJobSource)
+  return {
+    rowIds: rows.map(row => row.id),
+    eventIds: [...new Set([
+      ...rows.map(row => row.eventId).filter(Boolean),
+      ...edges.flatMap(edge => [edge.predecessorEventId, edge.successorEventId]),
+    ])],
+  }
+}
+
 export class MemoryMaintenanceManager {
   constructor(options) {
     this.store = options.store
@@ -337,6 +522,9 @@ export class MemoryMaintenanceManager {
     this.maxAttempts = Math.max(1, Number.isSafeInteger(options.maxAttempts) ? options.maxAttempts : 3)
     this.maxConcurrency = Math.max(1, Number.isSafeInteger(options.maxConcurrency) ? options.maxConcurrency : 2)
     this.maxTokens = Math.max(512, Number.isSafeInteger(options.maxTokens) ? options.maxTokens : 4096)
+    this.periodicInterval = Math.max(1, Number.isSafeInteger(options.periodicInterval) ? options.periodicInterval : PERIODIC_MAINTENANCE_INTERVAL)
+    this.periodicOverlap = Math.max(0, Number.isSafeInteger(options.periodicOverlap) ? options.periodicOverlap : PERIODIC_MAINTENANCE_OVERLAP)
+    this.periodicContextBytes = Math.max(1024, Number.isSafeInteger(options.periodicContextBytes) ? options.periodicContextBytes : MAX_PERIODIC_CONTEXT_BYTES)
     this.agentOptions = options.agentOptions ?? {}
     this.isEligible = options.isEligible ?? (() => true)
     this.isCurrent = options.isCurrent ?? (() => true)
@@ -394,6 +582,76 @@ export class MemoryMaintenanceManager {
     })
     this.kick(agent)
     return inserted
+  }
+
+  async enqueueCompletedTurn(agent, job) {
+    if (job === null || !this.active || this.stoppedAgents.has(agent) || !this.isEligible(agent)) return { queued: false, kind: null }
+    const decision = await this.serialState(agent, async () => {
+      const state = await this.stateFor(agent)
+      const rounds = completedConversationRounds(agent)
+      const target = rounds.find(round => round.endSeq === job.rounds[0]?.endSeq)
+      if (target === undefined) return { queued: false, kind: null }
+      const alreadyCovered = state.lastPeriodicBoundary?.endSeq >= target.endSeq
+        || state.completed.includes(job.id)
+        || [...state.pending, ...state.failed].some(item => item.id === job.id || item.rounds.some(round => round.endSeq === target.endSeq))
+      if (alreadyCovered) return { queued: false, kind: job.kind }
+      const boundarySeq = state.lastPeriodicBoundary?.endSeq ?? -1
+      const completedSinceBoundary = rounds.filter(round => round.endSeq > boundarySeq && round.endSeq <= target.endSeq)
+      const periodicPending = state.pending.some(item => item.kind === 'periodic')
+      if (!periodicPending && completedSinceBoundary.length >= this.periodicInterval) {
+        const jobs = createPeriodicJobs(rounds, state.lastPeriodicBoundary, target, 'automatic', this.periodicOverlap, this.periodicContextBytes)
+        state.pending.push(...jobs)
+        await this.save(agent, state)
+        return {
+          queued: true,
+          kind: 'periodic',
+          startTurn: jobs[0].periodStartTurn,
+          endTurn: target.turn,
+          chunks: jobs.length,
+        }
+      }
+      if (conversationContextBytes(job.rounds) > this.periodicContextBytes) {
+        throw new Error(`complete conversation turn ${job.turn} exceeds the ${this.periodicContextBytes}-byte memory context limit and cannot be maintained without truncation`)
+      }
+      state.pending.push(clone(job))
+      await this.save(agent, state)
+      return { queued: true, kind: 'incremental', startTurn: job.turn, endTurn: job.turn, chunks: 1 }
+    })
+    this.kick(agent)
+    return decision
+  }
+
+  async enqueuePeriodic(agent, options = {}) {
+    if (!this.active || this.stoppedAgents.has(agent) || !this.isEligible(agent)) return { queued: false, reason: 'unavailable' }
+    options.signal?.throwIfAborted()
+    const result = await this.serialState(agent, async () => {
+      const state = await this.stateFor(agent)
+      const existing = state.pending.find(job => job.kind === 'periodic')
+      if (existing !== undefined) {
+        return {
+          queued: false,
+          reason: 'already-pending',
+          startTurn: existing.periodStartTurn,
+          endTurn: existing.periodEndTurn,
+          chunks: existing.chunkCount,
+        }
+      }
+      const rounds = completedConversationRounds(agent)
+      const target = rounds.at(-1)
+      if (target === undefined) return { queued: false, reason: 'no-completed-rounds' }
+      const jobs = createPeriodicJobs(rounds, state.lastPeriodicBoundary, target, 'manual', this.periodicOverlap, this.periodicContextBytes)
+      state.pending.push(...jobs)
+      await this.save(agent, state)
+      return {
+        queued: true,
+        kind: 'periodic',
+        startTurn: jobs[0].periodStartTurn,
+        endTurn: target.turn,
+        chunks: jobs.length,
+      }
+    })
+    this.kick(agent)
+    return result
   }
 
   async resume(agent) {
@@ -468,11 +726,19 @@ export class MemoryMaintenanceManager {
       await this.acquireCapacity(controller.signal)
       acquired = true
       const document = await this.store.memorySnapshot(agent, controller.signal)
-      if (document.appliedMaintenanceJobs.includes(job.id)) return
-      const prompt = buildMemoryMaintenancePrompt(job, document)
+      if (document.appliedMaintenanceJobs.includes(job.id)) return touchesFromAppliedJob(document, job)
+      const touches = job.kind === 'periodic'
+        ? await this.serialState(agent, async () => {
+          const state = await this.stateFor(agent)
+          return { touchedRowIds: clone(state.touchedRowIds), touchedEventIds: clone(state.touchedEventIds) }
+        })
+        : {}
+      const built = promptForJob(job, document, touches)
       run = await this.subagents.start(this.provider, {
-        label: `Memory maintenance turn ${job.turn}`,
-        prompt: [{ type: 'text', text: prompt }],
+        label: job.kind === 'periodic'
+          ? `Periodic memory consolidation ${job.chunkIndex + 1}/${job.chunkCount}, through turn ${job.periodEndTurn}`
+          : `Incremental memory maintenance turn ${job.turn}`,
+        prompt: [{ type: 'text', text: built.text }],
         parent: agent,
         signal: controller.signal,
         agentOptions: { ...this.agentOptions, maxTokens: this.maxTokens },
@@ -492,12 +758,13 @@ export class MemoryMaintenanceManager {
         throw error
       }
       const operations = operationsForCommit(result.structured.operations, latest, job.sourceRefs)
-      await this.store.memory(agent, {
+      const committed = await this.store.memory(agent, {
         action: 'batch',
         operations,
         expectedRevision: latest.revision,
         maintenanceJobId: job.id,
       }, controller.signal)
+      return touchesFromCommit(built.memory, committed.result)
     } finally {
       try { if (run !== undefined) await run.dispose() } finally {
         this.controllers.delete(key)
@@ -520,12 +787,21 @@ export class MemoryMaintenanceManager {
       })
       if (job === undefined) return
       try {
-        await this.execute(agent, job)
+        const touched = await this.execute(agent, job)
         await this.serialState(agent, async () => {
           const state = await this.stateFor(agent)
           state.pending = state.pending.filter(item => item.id !== job.id)
           state.completed.push(job.id)
           state.completed = [...new Set(state.completed)].slice(-MAX_COMPLETED_IDS)
+          state.touchedRowIds = [...new Set([...state.touchedRowIds, ...touched.rowIds])]
+          state.touchedEventIds = [...new Set([...state.touchedEventIds, ...touched.eventIds])]
+          if (job.kind === 'periodic' && job.chunkIndex === job.chunkCount - 1) {
+            if (state.lastPeriodicBoundary === null || job.boundary.endSeq > state.lastPeriodicBoundary.endSeq) {
+              state.lastPeriodicBoundary = clone(job.boundary)
+            }
+            state.touchedRowIds = []
+            state.touchedEventIds = []
+          }
           await this.save(agent, state)
         })
       } catch (error) {
@@ -545,6 +821,16 @@ export class MemoryMaintenanceManager {
             current.status = 'failed'
             state.pending.splice(index, 1)
             state.failed.push(current)
+            if (current.kind === 'periodic') {
+              const canceled = state.pending.filter(item => item.kind === 'periodic' && item.groupId === current.groupId)
+              state.pending = state.pending.filter(item => item.kind !== 'periodic' || item.groupId !== current.groupId)
+              state.failed.push(...canceled.map(item => ({
+                ...item,
+                status: 'failed',
+                updatedAt: Date.now(),
+                lastError: `periodic group canceled after chunk ${current.chunkIndex + 1} failed`,
+              })))
+            }
             state.failed = state.failed.slice(-MAX_FAILED_JOBS)
             await this.save(agent, state)
             return false
@@ -563,7 +849,7 @@ export class MemoryMaintenanceManager {
       const state = await this.stateFor(agent)
       const candidates = [...state.pending, ...state.failed]
       return candidates
-        .filter(job => job.sourceRefs.length > 0 && job.sourceRefs.every(ref => compactedSeqs.has(ref.eventSeq)))
+        .filter(job => job.kind === 'incremental' && job.sourceRefs.length > 0 && job.sourceRefs.every(ref => compactedSeqs.has(ref.eventSeq)))
         .slice(0, 4)
         .map(job => ({ id: job.id, turn: job.turn, turnMessages: clone(job.turnMessages) }))
     })
