@@ -6,10 +6,11 @@
 
 - 从输入框左下角“+”导入 V3 PNG、APNG 或 JSON；角色卡内携带的世界书会作为独立世界书资源一并导入；
 - V3 `ccv3` CRC/Base64/UTF-8/JSON 分层校验，V2-only 明确拒绝；对生态中常见但不规范的缺失 `group_only_greetings`/世界书 `extensions` 安全补空并给出警告；
-- 角色卡、用户设定/变量、首条问候、独立的结构化 Character Book V3 世界书管理和 system-role post-history 注入；角色卡可绑定一套默认世界书，Session 在首次真实用户消息时以其初始化自身的世界书引用，之后可独立修改该引用。世界书支持常驻/关键词/向量标记策略、Secondary Logic、概率、原生 JavaScript 正则、多级递归、Order、0–7 Position、`@depth`、Outlet 与递归控制，并在宏及 WORLD_INFO Regex 展开后按本轮模型真实 tokenizer 与上下文窗口比例（默认 25%）预算；卡内 `token_budget` 可进一步收紧该预算，最近一次激活条目、预算与运行时警告可在管理页查看；纯向量相似度激活仍需要未来接入 embedding retriever；
+- 角色卡、用户设定/变量、首条问候、独立的结构化 Character Book V3 世界书管理和 system-role post-history 注入；角色卡可绑定一套默认世界书，Session 在首次真实用户消息时以其初始化自身的世界书引用，之后可独立修改该引用；TavernHelper API 还可绑定工作区全局书及当前角色的 primary/additional 书，生成时按全局→角色→当前会话去重合并。世界书支持常驻/关键词/向量标记策略、Secondary Logic、概率、原生 JavaScript 正则、多级递归、Order、0–7 Position、`@depth`、Outlet 与递归控制，并在宏及 WORLD_INFO Regex 展开后按本轮模型真实 tokenizer 与上下文窗口比例（默认 25%）预算；卡内 `token_budget` 可进一步收紧该预算，最近一次激活条目、预算与运行时警告可在管理页查看；纯向量相似度激活仍需要未来接入 embedding retriever；
 - EJS 风格提示词模板与 `{{char}}`、`{{user}}`、`{{getvar::name}}`；
 - 生成前自动召回 + 主模型按需只读查询的长期记忆：主 Agent 只负责剧情生成，只暴露 `st_memory_query` 和 `st_memory_graph_query`。普通完成回合在后台进行增量维护，仅向独立维护 Agent 提供该轮最后一条真实用户消息、最终助手正文和关键词命中的相关记忆；每 10 个完整回合自动进行一次定期整理，用重叠 1 轮的完整上下文归并、纠错和补全关系，再由 Host 原子提交结构化 patch；
 - 工作区角色库、独立世界书库、角色编辑、模板、记忆和脚本管理 UI；管理页使用全屏弹窗；
+- 面向 TavernHelper 4.9.3 / SillyTavern 1.18.0 固定基线的 Session 级兼容运行时：所有 iframe 在角色代码执行前获得同步状态快照，共享 `TavernHelper`、`SillyTavern.getContext()`、变量、消息、事件、注入、生成、世界书、Regex 与常见前端生态 facade；已确认的 JavaScript 作为会话后台脚本持续运行；能力清单可从 `GET /api/dsh-sillytavern/compatibility` 读取；
 - 角色、变量、Prompt、Memory、增量事件 API 与 opaque-origin iframe 前端渲染；助手正文使用 DSH 原生 GFM Markdown，并兼容传统独占行 `<font color>`；状态栏等自定义标签只按角色卡或其他 Regex 来源实际定义的规则渲染，插件不猜测未命中标签的含义；
 - 将 `extensions.regex_scripts` 作为完整的 `findRegex → replaceString` 规则导入；支持 Global → Preset → Scoped 顺序、用户/助手/Slash/世界书/Reasoning placement、原始/显示/Prompt/Edit 阶段、depth、Trim Out、NONE/RAW/ESCAPED 宏替换以及 `/narrator`、`/regex`、`/regex-state`、`/regex-toggle`；导入规则默认启用，编辑执行材料后自动停用；
 - 所有插件数据均在工作区的 `.dsh/sillytavern/` 持久化；会话绑定、记忆与全局资源在该工作区内隔离，支持跨 Store 刷新、dead-owner lock 恢复与 dispose 提交屏障。
@@ -33,11 +34,11 @@ Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的�
 
 1. 用户在左侧自行新建或打开会话；
 2. 使用 DSH 原生 Agent 预设菜单选择“酒馆模式”；最近一次选择的工作区角色会在首次真实用户消息前作为候选角色；第一条真实用户消息才提交角色与默认世界书的 Session 引用；
-3. 会话开始前，角色卡的 `first_mes` 会显示在输入框上方；仅在酒馆模式空白会话中，Logo、开场内容与原生编辑框共同占据完整动态视口，开场内容弹性使用扣除 Logo/编辑区后的主要剩余高度，且不显示额外的“开场预览”徽标；Markdown 使用 DSH 原生渲染器，HTML 围栏/文档在 opaque-origin iframe 中按原样运行，插件不删除远程资源、脚本、内联事件、meta、iframe 或 CSS，也不注入 CSP；开场 iframe 提供 `setChatMessages` 的 message 0 swipe 切换和 `triggerSlash('/echo ...')` 兼容 API，可跳转并按当前会话持久化 `alternate_greetings`；选择本身不调用模型，用户仍在原生输入框中发送第一条回复；Host 会在原生用户消息进入日志前写入一个持久的 `st-opening` 展示节点，Client 通过官方 additive command-view Slot 将最终开场显示在对话顶部，原生用户消息只写入一次；模型每轮均从系统上下文读取同一已选开场，不增加模型调用；
+3. 会话开始前，角色卡的 `first_mes` 会显示在输入框上方；仅在酒馆模式空白会话中，Logo、开场内容与原生编辑框共同占据完整动态视口，开场内容弹性使用扣除 Logo/编辑区后的主要剩余高度，且不显示额外的“开场预览”徽标；Markdown 使用 DSH 原生渲染器，HTML 围栏/文档在 opaque-origin iframe 中按原样运行，插件不删除远程资源、脚本、内联事件、meta、iframe 或 CSS，也不注入 CSP；开场、消息 HTML、预览和后台脚本使用同一兼容桥，提供 `setChatMessages` 的 message 0 swipe、`triggerSlash('/echo ...')` 和常见 `#send_textarea`/`#send_but` 输入代理；选择本身不调用模型，用户仍在原生输入框中发送第一条回复；Host 会在原生用户消息进入日志前写入一个持久的 `st-opening` 展示节点，Client 通过官方 additive command-view Slot 将最终开场显示在对话顶部，原生用户消息只写入一次；模型每轮均从系统上下文读取同一已选开场，不增加模型调用；
 4. 输入框工具行左侧会出现带酒杯线框图标的系统风格角色卡菜单；没有绑定时显示“选择角色卡”，窄窗口会自动折叠文字以减少工具行换行；
 5. 未开始对话的会话可从下拉中选择工作区角色；首条真实用户消息后角色与世界书引用冻结，不能再换角色。所选角色也会成为以后新酒馆会话的默认角色；
 6. 若角色尚未导入，点击输入框左下角“+”，选择 `st-import` →“导入 V3 角色卡”，再选择 PNG/APNG/JSON；
-7. 从角色卡菜单底部的“管理酒馆模式”进入全屏管理页，管理角色设定、persona、世界书、记忆、脚本和模板。记忆页可录入剧情时间状态与时间轴范围、从大到小的地点路径、在场人物、召回策略和可选事件组 ID，并按事件聚合展示直接前置/后续关系及来源；同一事件涉及多个地点时每个地点单独一行，并使用不同 key。世界书是独立全局资源：编辑器下拉框选择要编辑的书，默认选中当前 Session 引用的书；另一个下拉框仅选择当前 Session 引用的书，两者互不等同。当前每张角色卡和每个 Session 均暂限一套世界书，未来可扩展为多书引用。世界书页以结构化条目编辑器管理激活策略、关键字、概率、Order 与 Position，并原样保留未展示的扩展字段；脚本的“启用”只控制对话匹配策略，管理页不会自动执行，只有点击“运行预览”后才会临时挂载 iframe，再次点击“停止预览”即卸载；
+7. 从角色卡菜单底部的“管理酒馆模式”进入全屏管理页，管理角色设定、persona、世界书、记忆、脚本和模板。记忆页可录入剧情时间状态与时间轴范围、从大到小的地点路径、在场人物、召回策略和可选事件组 ID，并按事件聚合展示直接前置/后续关系及来源；同一事件涉及多个地点时每个地点单独一行，并使用不同 key。世界书是独立全局资源：编辑器下拉框选择要编辑的书，默认选中当前 Session 引用的书；另一个下拉框仅选择当前 Session 引用的书，两者互不等同。当前每张角色卡和每个 Session 均暂限一套世界书，未来可扩展为多书引用。世界书页以结构化条目编辑器管理激活策略、关键字、概率、Order 与 Position，并原样保留未展示的扩展字段；已确认并启用的 JavaScript 会在当前 Session 持续挂载为后台脚本，Regex 仍按文本阶段运行，管理页“运行预览”只创建额外的临时预览；
 8. 酒馆会话处于前台时，Client 仅对该会话临时接管 assistant/user/steering 及过程展示 renderer：显示阶段 Regex 在按次创建、可由组件卸载取消且没有代码内容过滤或执行时限的 Worker 中运行；Host 在用户入日志前执行原始 User Input 规则，在模型流持久化前执行原始 AI/Reasoning 规则，并通过一次受控的公共 LLM 重派发把 promptOnly 历史投影给模型而不改写持久日志。匹配结果精确替换对应 text/reasoning block，HTML 在 opaque-origin iframe 中交互运行，并通过已校验的消息桥按实际内容高度自适应。共享 Regex 引擎已实现 `isEdit`/`runOnEdit` 语义；当前 DSH 尚无原生持久消息编辑事件，因此会话 UI 暂无可接入的编辑阶段触发器。DSH 原生 `turnProcess` 折叠在酒馆对话中显示为“剧情推进”，仍由原生状态控制思考过程、工具调用和多层工具调用；系统提示词行仅从酒馆对话视图隐藏，不影响实际模型提示词。最终剧情正文、图片、Regex/HTML 渲染结果和状态栏保持可见。
 
 ## 数据
@@ -50,9 +51,15 @@ Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的�
 
 `eventId` 将同一事件的多条记忆聚合为一个隐式事件节点；关系单独保存在 `eventEdges`，当前只支持事件到事件的 `precedes`，不在记忆行之间建边。一个事件跨多个地点时仍以多行、不同 key 保存并共享 `eventId`。增量维护在普通成功 `turn/end`、最终正文持久化后排队：它把该轮最后一条真实用户消息与最终助手正文合为 `latestText`，以 Unicode NFKC、英文小写和统一空白标准化，再按关键词命中数、命中关键词长度、重要度依次排序候选；命中某行会补齐同一 `eventId` 的其他行，只提供该事件的直接关系边，相邻事件仅提供短摘要。第 10、20……个完整回合触发自动定期整理时跳过本轮增量维护。定期整理以最近一次成功整理的边界为准，默认每 10 轮执行一次、与上次成功边界重叠 1 轮；失败或取消不推进该边界。它使用该窗口中全部真实用户消息和最终助手正文命中关键词候选，并处理逐轮近似记忆合并、矛盾修正、事件关系补全、重要度/召回策略调整、失效状态删除和误拆事件合并。完整上下文总量上限为 160 KiB；超限时仅按完整回合拆为连续的多个整理任务，绝不从正文中间截断并声称其完整。`/st-memory-consolidate` 可手动排入整理任务，不会中断正在执行的增量维护。任务按 Session FIFO、全局并发上限执行，失败重试，Host 只在维护 Agent 基于当前 memory revision 时提交 patch，并在同一写盘事务中记录任务 ID，以封闭崩溃后的重复执行窗口。启动恢复失败会明确记录，并在 Agent idle 与下一次生成前继续重试。若来源剧情先被 compact 而任务尚未完成，生成前会临时注入任务中保存的原始正文，避免上下文空窗。主 Agent 不拥有任何记忆写入、修正或去重工具。
 
-角色记录以 `defaultWorldbookId` 保存默认世界书引用；Session binding 以 `worldbookId` 和 `startedAt` 保存本会话引用与首次真实用户消息时间。首次真实用户消息只会用角色的默认世界书初始化该 Session 引用；其后可在 Session 世界书下拉框独立改选。修改世界书内容会影响所有引用该书的角色和 Session；修改角色默认世界书只影响之后开始的会话，不改写已有 Session 引用。导入角色卡时，卡内 `character_book` 只作为世界书导入源；导入完成后，运行时只读取独立世界书。若同名世界书已存在，必须选择“覆盖”（整本替换，不增量合并）或“另存为”。
+角色记录以 `defaultWorldbookId` 保存默认世界书引用；Session binding 以 `worldbookId` 和 `startedAt` 保存本会话引用与首次真实用户消息时间。首次真实用户消息只会用角色的默认世界书初始化该 Session 引用；其后可在 Session 世界书下拉框独立改选。兼容层另在 `compatibility.json` 持久化全局书及当前角色 primary/additional 绑定；Prompt 依次合并全局、角色、当前会话书并按资源 ID 去重。修改世界书内容会影响所有引用该书的角色和 Session；修改角色默认世界书只影响之后开始的会话，不改写已有 Session 引用。导入角色卡时，卡内 `character_book` 只作为世界书导入源；导入完成后，运行时只读取独立世界书。若同名世界书已存在，必须选择“覆盖”（整本替换，不增量合并）或“另存为”。
 
-删除世界书会在确认框列出引用它的角色卡与 Session；确认后删除资源并清除这些引用。删除角色卡前会检查尚未删除或归档的 Session，有任何此类 Session 时禁止删除并列出它们；可删除时，确认框可勾选同步删除该卡默认绑定的世界书。脚本源不改写。角色记录 Schema 4 延续 Schema 3 的 Regex 规则模型：Character Card 的 `regex_scripts` 原子化保存为整条规则，并把 0.5.3 错误拆分出的字段迁回规则；Global/Preset 规则与 `{{globalvar::key}}` 全局变量保存在当前工作区的 `.dsh/sillytavern/regex-scripts.json`。授权 SHA-256 同时绑定类型、匹配式、替换内容、trim/placement 与阶段选项，任一修改都会自动停用。Regex 运行器遵循 SillyTavern 的 JavaScript RegExp 和替换回调语义，不限制 pattern、规则数、trim 数量，不做嵌套重复/alternation 拒绝，不过滤或清洗 replaceString，也不设置执行 deadline；`substituteRegex` NONE/RAW/ESCAPED 均执行。代码安全性由启用者自行验证。交互 HTML 和手动预览在 opaque-origin iframe 中运行；SillyTavern `#send_textarea` 写入映射到 DSH 官方 `inputActions.setDraft`，不开放父页面 DOM。
+删除世界书会在确认框列出引用它的角色卡与 Session；确认后删除资源并清除这些引用。删除角色卡前会检查尚未删除或归档的 Session，有任何此类 Session 时禁止删除并列出它们；可删除时，确认框可勾选同步删除该卡默认绑定的世界书。脚本源不改写。角色记录 Schema 4 延续 Schema 3 的 Regex 规则模型：Character Card 的 `regex_scripts` 原子化保存为整条规则，并把 0.5.3 错误拆分出的字段迁回规则；Global/Preset 规则与 `{{globalvar::key}}` 全局变量保存在当前工作区的 `.dsh/sillytavern/regex-scripts.json`。授权 SHA-256 同时绑定类型、匹配式、替换内容、trim/placement 与阶段选项，任一修改都会自动停用。Regex 运行器遵循 SillyTavern 的 JavaScript RegExp 和替换回调语义，不限制 pattern、规则数、trim 数量，不做嵌套重复/alternation 拒绝，不过滤或清洗 replaceString，也不设置执行 deadline；`substituteRegex` NONE/RAW/ESCAPED 均执行。代码安全性由启用者自行验证。交互 HTML 和手动预览在 opaque-origin iframe 中运行；常见的 parent `querySelector`/`getElementById`/jQuery `#send_textarea` 与 `#send_but` 调用映射到 DSH 官方 `inputActions.setDraft`，不开放父页面 DOM。
+
+## TavernHelper 兼容阶段 5
+
+兼容目标固定为 TavernHelper `4.9.3`（commit `e559c5a13f6337b2ac1a1086c69587793beb3823`）和 SillyTavern `1.18.0` release（commit `8172dcd0ee672d3cd9a5e5f7af134f91a45cd2b8`）。每个 Session 只有一个父层状态镜像和消息总线；开场、普通消息、管理预览与后台 JavaScript 在执行角色代码前就获得相同的初始快照，后续更新使用单调 revision 推送，不通过重载 iframe 更新状态。
+
+阶段 2–5 已覆盖全部变量作用域、持久消息投影与 CRUD/swipe、`filter/once` Prompt injection、常用 STScript 管线、独立生成与停止、具备 revision CAS 的命名世界书 CRUD/条目操作、global/character/chat 世界书绑定、Lorebook 兼容别名、Tavern Regex 查询/替换/格式化，以及宏、音频、剪贴板、弹窗、lodash/jQuery/toastr 等常见 iframe 依赖。消息删除/旋转只改变兼容投影，不破坏 DSH append-only 事件；生成、绑定和前端 facade 因宿主模型不同按 `degraded` 标注。角色/预设/persona 的完整 CRUD、原生扩展安装和脚本树 UI 等没有可靠 DSH 等价物的能力保持 `unavailable`，不会用成功空值伪装。脚本可通过 `TavernHelper.compatibility` 或同步 `getCompatibility()` 读取精确状态。
 
 ## 开发与验证
 

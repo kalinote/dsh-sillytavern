@@ -8,6 +8,9 @@ import { installBundledPreset } from './src/preset-installer.js'
 import { promptRegexRequest, transformRawAssistantStream, transformRawUserMessages } from './src/regex-pipeline.js'
 import { getRegexedString, REGEX_PLACEMENT, regexRulesForState, runRegexScript, regexScopeForState } from './src/regex.js'
 import { countModelTokens } from './src/tokenizer.js'
+import { buildCompatibilitySnapshot, compatibilityManifest } from './src/compatibility.js'
+import { execute as executeCompatSlash, registry as compatSlashRegistry } from './src/compat-slash.js'
+import { CompatibilityGenerationBroker } from './src/compat-generation.js'
 
 export const name = 'dsh-sillytavern'
 export const VERSION = '0.9.0'
@@ -28,12 +31,65 @@ function stripRequestBinding(system) {
     : { id, system: replaced.replace(/\n{3,}/g, '\n\n').trimEnd() }
 }
 
+function contentText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n')
+}
+
+function projectCompatibilityChat(options, agent, projection) {
+  if (!Array.isArray(options?.messages) || !Array.isArray(projection?.messages)) return options
+  const idBySeq = new Map()
+  for (const event of sessionEvents(agent.session)) {
+    const message = event?.type === 'user/message' ? event.data : event?.type === 'assistant/message' ? event.data?.message : null
+    if (message && typeof message.id === 'string') idBySeq.set(event.seq, message.id)
+  }
+  const overlayById = new Map()
+  const syntheticBefore = new Map()
+  const syntheticAfter = []
+  let pendingSynthetic = []
+  for (const item of projection.messages) {
+    const id = idBySeq.get(item.sourceSeq)
+    if (id === undefined) pendingSynthetic.push(item)
+    else {
+      overlayById.set(id, item)
+      if (pendingSynthetic.length > 0) syntheticBefore.set(id, pendingSynthetic.splice(0))
+    }
+  }
+  syntheticAfter.push(...pendingSynthetic)
+  const asMessage = item => ({
+    id: `dsh-sillytavern-compat-${item.uid ?? randomUUID()}`,
+    role: item.role,
+    content: [{ type: 'text', text: String(item.message ?? '') }],
+    source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'compatibility-message' },
+  })
+  const messages = options.messages.flatMap(message => {
+    const overlay = overlayById.get(message?.id)
+    if (overlay === undefined) return [message]
+    const before = (syntheticBefore.get(message.id) ?? []).filter(item => item.is_hidden !== true).map(asMessage)
+    if (overlay.is_hidden === true) return before
+    return [...before, { ...message, role: overlay.role, content: [{ type: 'text', text: String(overlay.message ?? '') }] }]
+  })
+  const existingText = new Set(messages.map(message => `${message.role}\u0000${contentText(message.content)}`))
+  for (const item of syntheticAfter) {
+    if (item.is_hidden === true) continue
+    const key = `${item.role}\u0000${String(item.message ?? '')}`
+    if (existingText.has(key)) continue
+    messages.push(asMessage(item))
+  }
+  return { ...options, messages }
+}
+
 export async function apply(ctx, config = {}) {
   const presetInstall = config.autoInstallPreset === false
     ? { status: 'disabled', presetId: 'sillytavern', version: VERSION }
     : await installBundledPreset(ctx.agentPresets, { version: VERSION })
   const store = new SillyTavernStore(config)
   await store.ready
+  const generationBroker = new CompatibilityGenerationBroker(options => ctx.llm.stream(options), {
+    maxResults: config.compatibilityGenerationResults ?? 100,
+    ttlMs: config.compatibilityGenerationTtlMs ?? 5 * 60 * 1000,
+  })
   let active = true
 
   const eligible = agent => agent?.session?.header?.origin !== 'subagent'
@@ -70,6 +126,7 @@ export async function apply(ctx, config = {}) {
   }
   ctx.effect(() => async () => {
     active = false
+    generationBroker.stopAll()
     await memoryMaintenance.dispose()
   })
 
@@ -109,6 +166,7 @@ export async function apply(ctx, config = {}) {
         await store.startSession(agent, signal)
         if (hasPendingFirstUser) flushPendingOpening(agent)
       }
+      await store.refreshCompatChat(agent, signal)
       const provider = typeof route.provider === 'string' ? route.provider : ''
       const model = typeof route.model === 'string' ? route.model : ''
       let contextWindow
@@ -134,13 +192,19 @@ export async function apply(ctx, config = {}) {
           console.warn(`[dsh-sillytavern] could not read memory maintenance fallback; story generation will continue: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
-      const prompt = await assembleSillyTavernPrompt(agent, store.promptState(agent), signal, {
+      const promptState = store.promptState(agent)
+      const lorebookSettings = promptState?.lorebookSettings ?? {}
+      const eligibleInjectionIds = new Set(Array.isArray(route.eligibleInjectionIds) ? route.eligibleInjectionIds.map(String) : [])
+      const injections = (promptState?.binding?.scriptInjections ?? []).filter(item => item.hasFilter !== true || eligibleInjectionIds.has(String(item.id)))
+      const prompt = await assembleSillyTavernPrompt(agent, promptState, signal, {
         compactedSeqs,
         pendingMemoryFallback,
         contextWindow,
-        budgetPercent: config.worldInfoBudgetPercent ?? 25,
-        budgetCap: config.worldInfoBudgetCap ?? 0,
+        budgetPercent: lorebookSettings.context_percentage ?? config.worldInfoBudgetPercent ?? 25,
+        budgetCap: lorebookSettings.budget_cap ?? config.worldInfoBudgetCap ?? 0,
+        scanDepth: lorebookSettings.scan_depth,
         fallbackTokenBudget: config.worldInfoFallbackTokenBudget ?? 2048,
+        injections,
         countTokens: text => countModelTokens(provider, model, text, signal),
       })
       if (diagnosticGeneration > (worldbookDiagnosticSuccesses.get(agent) ?? 0)) {
@@ -234,6 +298,7 @@ export async function apply(ctx, config = {}) {
     if (regexRequests.has(options)) return transformRawAssistantStream(next(), state, history)
     const marker = stripRequestBinding(options.system)
     let depthProjected = marker.system === options.system ? options : { ...options, system: marker.system }
+    depthProjected = projectCompatibilityChat(depthProjected, agent, store.compatChatProjection(agent))
     if (marker.id !== undefined) {
       const prepared = requestBindings.get(agent)?.get(marker.id)
       if (prepared === undefined) {
@@ -442,6 +507,125 @@ export async function apply(ctx, config = {}) {
     return new Set(ctx.agents.list().filter(candidate => resolve(store.workspaceOf(candidate)) === workspacePath).map(candidate => String(candidate.id)))
   }
 
+  const slashText = invocation => invocation.args.length > 0 ? invocation.args.join(' ') : String(invocation.pipe ?? '')
+  const triggerSlash = async (agent, source, signal) => {
+    const addMessage = async (role, invocation, isHidden = false) => {
+      const current = await store.refreshCompatChat(agent, signal)
+      await store.mutateCompatChat(agent, {
+        action: 'create',
+        expectedRevision: current.revision,
+        messages: [{ role, message: slashText(invocation), is_hidden: isHidden }],
+      }, signal)
+      return slashText(invocation)
+    }
+    const handlers = {
+      send: invocation => addMessage('user', invocation),
+      sendas: invocation => addMessage('assistant', invocation),
+      sys: invocation => addMessage('system', invocation),
+      comment: invocation => addMessage('system', invocation, true),
+      trigger: async invocation => { await agent.followup?.(slashText(invocation) || 'Continue'); return '' },
+      continue: async invocation => { await agent.followup?.(slashText(invocation) || 'Continue'); return '' },
+      regenerate: async invocation => { await agent.followup?.(slashText(invocation) || 'Regenerate the last response.'); return '' },
+      setvar: async invocation => {
+        const key = String(invocation.named.key ?? invocation.args[0] ?? '')
+        if (key === '') throw new TypeError('/setvar requires key=<name> or a first argument')
+        const value = invocation.named.value ?? invocation.args.slice(1).join(' ') ?? invocation.pipe
+        const current = store.compatibilityVariableSnapshot(agent)
+        await store.replaceCompatibilityVariables(agent, { type: 'chat' }, { ...current.scopes.chat, [key]: value }, { expectedRevision: current.revisions.chat }, signal)
+        return String(value ?? '')
+      },
+      getvar: invocation => {
+        const key = String(invocation.named.key ?? invocation.args[0] ?? '')
+        return String(store.compatibilityVariableSnapshot(agent).scopes.chat[key] ?? '')
+      },
+      inject: async invocation => {
+        const view = store.sessionView(agent)
+        const id = String(invocation.named.id ?? `slash-${randomUUID()}`)
+        const injections = [...(view.binding?.scriptInjections ?? []).filter(item => item.id !== id), { id, content: slashText(invocation), text: slashText(invocation), position: 'in_chat', depth: Number(invocation.named.depth ?? 0), role: invocation.named.role ?? 'system', should_scan: invocation.named.scan === 'true' }]
+        await store.updateSession(agent, { scriptInjections: injections, expectedRevision: view.binding.revision }, signal)
+        return id
+      },
+      flushinject: async () => {
+        const view = store.sessionView(agent)
+        await store.updateSession(agent, { scriptInjections: [], expectedRevision: view.binding.revision }, signal)
+        return ''
+      },
+      messages: () => JSON.stringify(store.compatChatProjection(agent).messages),
+      run: async invocation => {
+        const commands = ctx.get('commands')
+        if (typeof commands?.execute !== 'function') throw new Error('DSH command service is unavailable')
+        const result = await commands.execute(agent, slashText(invocation), [], signal)
+        return typeof result === 'string' ? result : JSON.stringify(result ?? '')
+      },
+    }
+    return executeCompatSlash(String(source ?? ''), { registry: compatSlashRegistry(handlers), context: { agent, store }, signal })
+  }
+
+  const compatibilityGenerationOptions = async (agent, mode, generationConfig, signal) => {
+    const request = generationConfig && typeof generationConfig === 'object' && !Array.isArray(generationConfig) ? generationConfig : {}
+    const custom = request.custom_api && typeof request.custom_api === 'object' ? request.custom_api : {}
+    if (typeof custom.apiurl === 'string' && custom.apiurl.trim() !== '') {
+      const error = new Error('custom_api.apiurl is unavailable in DSH compatibility mode; configure a DSH provider and select it by source/model')
+      error.code = 'generation-custom-api-unavailable'
+      throw error
+    }
+    await store.refreshCompatChat(agent, signal)
+    const state = store.promptState(agent)
+    if (state === undefined) throw new Error('current session has no selected character')
+    const provider = String(custom.source ?? agent.options?.provider ?? '').trim()
+    const model = String(custom.model ?? agent.options?.model ?? '').trim()
+    if (provider === '' || model === '') throw new Error('generation requires a configured provider and model')
+    const prepared = await service.promptFor(agent, signal, { provider, model, eligibleInjectionIds: request.__dshEligibleInjectionIds })
+    const historyLimit = request.max_chat_history === 'all' || request.max_chat_history === undefined
+      ? Number.MAX_SAFE_INTEGER
+      : Math.max(0, Math.trunc(Number(request.max_chat_history) || 0))
+    const history = store.compatChatProjection(agent).messages.filter(item => item.is_hidden !== true).slice(-historyLimit).map(item => ({
+      id: `dsh-sillytavern-generate-${item.uid ?? item.message_id}`,
+      role: item.role,
+      content: [{ type: 'text', text: String(item.message ?? '') }],
+      source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'compatibility-generation-history' },
+    }))
+    const userInput = String(request.user_input ?? '')
+    const imageValues = Array.isArray(request.image) ? request.image : request.image === undefined ? [] : [request.image]
+    const userBlocks = [...(userInput === '' ? [] : [{ type: 'text', text: userInput }]), ...imageValues.filter(value => typeof value === 'string').map(value => ({ type: 'image', url: value }))]
+    const card = state.record.card.data
+    const persona = state.binding.userPersona
+    const named = {
+      world_info_before: request.overrides?.world_info_before,
+      persona_description: request.overrides?.persona_description ?? persona.description,
+      char_description: request.overrides?.char_description ?? card.description,
+      char_personality: request.overrides?.char_personality ?? card.personality,
+      scenario: request.overrides?.scenario ?? card.scenario,
+      world_info_after: request.overrides?.world_info_after,
+      dialogue_examples: request.overrides?.dialogue_examples ?? card.mes_example,
+    }
+    let messages = history
+    let system = prepared.system
+    if (mode === 'raw' && Array.isArray(request.ordered_prompts)) {
+      messages = []
+      const systemParts = []
+      for (const item of request.ordered_prompts) {
+        if (typeof item === 'string') {
+          if (item === 'chat_history') messages.push(...(request.overrides?.chat_history?.prompts ?? history).map((entry, index) => entry?.content ? { id: `raw-history-${index}`, role: entry.role, content: [{ type: 'text', text: String(entry.content) }], source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'raw-history' } } : entry))
+          else if (item === 'user_input' && userBlocks.length > 0) messages.push({ id: `raw-user-${randomUUID()}`, role: 'user', content: userBlocks, source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'raw-user-input' } })
+          else if (named[item] !== undefined && String(named[item]).trim() !== '') systemParts.push(String(named[item]))
+        } else if (item && typeof item === 'object' && ['system', 'assistant', 'user'].includes(item.role)) messages.push({ id: `raw-role-${randomUUID()}`, role: item.role, content: [{ type: 'text', text: String(item.content ?? '') }], source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'raw-role-prompt' } })
+      }
+      system = systemParts.join('\n\n')
+    } else if (userBlocks.length > 0) messages.push({ id: `generate-user-${randomUUID()}`, role: 'user', content: userBlocks, source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'generation-user-input' } })
+    messages = injectWorldbookDepthMessages({ messages }, prepared.worldbookDepthEntries, randomUUID).messages
+    const result = { provider, model, system, messages }
+    if (request.tools !== undefined) result.tools = request.tools
+    if (request.tool_choice !== undefined) result.toolChoice = request.tool_choice
+    if (request.json_schema !== undefined) result.jsonSchema = request.json_schema
+    for (const [from, to] of [['temperature', 'temperature'], ['top_p', 'topP'], ['top_k', 'topK'], ['frequency_penalty', 'frequencyPenalty'], ['presence_penalty', 'presencePenalty']]) {
+      const value = custom[from]
+      if (typeof value === 'number' && Number.isFinite(value)) result[to] = value
+    }
+    if (typeof custom.max_tokens === 'number' && Number.isFinite(custom.max_tokens)) result.maxTokens = Math.max(1, Math.trunc(custom.max_tokens))
+    return result
+  }
+
   const handler = async (req, res) => {
     try {
       assertTrustedLoopbackRequest(req)
@@ -449,6 +633,10 @@ export async function apply(ctx, config = {}) {
       const route = url.pathname.slice('/api/dsh-sillytavern'.length) || '/'
       if (req.method === 'GET' && route === '/health') {
         sendJson(res, 200, { ok: true, value: { version: VERSION, preset: presetInstall } })
+        return
+      }
+      if (req.method === 'GET' && route === '/compatibility') {
+        sendJson(res, 200, { ok: true, value: compatibilityManifest() })
         return
       }
       if (req.method === 'GET' && route === '/library') {
@@ -474,12 +662,16 @@ export async function apply(ctx, config = {}) {
       }
       if (req.method === 'GET' && route === '/event-state') {
         const agent = await agentFor(url.searchParams.get('sessionId'), false)
+        await store.refreshCompatChat(agent)
         const afterValue = Number(url.searchParams.get('after') ?? -1)
         const after = Number.isSafeInteger(afterValue) ? afterValue : -1
         const view = store.sessionView(agent)
         const delta = sessionEventDelta(agent, after)
-        const history = delta.history.map(message => ({ ...message, text: message.text.slice(-8192) }))
-        sendJson(res, 200, { ok: true, value: { card: view.card === null ? null : { id: view.card.id, name: view.card.card.data.nickname || view.card.card.data.name }, history, cursor: delta.cursor, hasMore: delta.hasMore } })
+        const projected = store.compatChatProjection(agent).messages
+        const history = after < 0
+          ? projected.map(message => ({ role: message.role, text: message.message.slice(-8192), seq: message.sourceSeq ?? message.message_id, message_id: message.message_id }))
+          : delta.history.map(message => ({ ...message, text: message.text.slice(-8192) }))
+        sendJson(res, 200, { ok: true, value: { card: view.card === null ? null : { id: view.card.id, name: view.card.card.data.nickname || view.card.card.data.name }, history, messages: projected, cursor: delta.cursor, hasMore: delta.hasMore, compatChatRevision: store.compatChatProjection(agent).revision } })
         return
       }
       if (req.method === 'GET' && route === '/greeting') {
@@ -491,7 +683,42 @@ export async function apply(ctx, config = {}) {
       }
       if (req.method === 'GET' && route === '/session') {
         const agent = await agentFor(url.searchParams.get('sessionId'))
+        await store.refreshCompatChat(agent)
         sendJson(res, 200, { ok: true, value: { ...sessionView(agent), history: sessionMessages(agent, 100) } })
+        return
+      }
+      if (req.method === 'GET' && route === '/compat/runtime') {
+        const agent = await agentFor(url.searchParams.get('sessionId'))
+        await store.refreshCompatChat(agent)
+        const fallback = await store.greetingState(agent)
+        sendJson(res, 200, { ok: true, value: buildCompatibilitySnapshot({ sessionId: agent.id, view: sessionView(agent), fallback, messages: sessionMessages(agent, 100) }) })
+        return
+      }
+      if (req.method === 'GET' && route === '/compat/variables') {
+        const agent = await agentFor(url.searchParams.get('sessionId'))
+        sendJson(res, 200, { ok: true, value: store.compatibilityVariableSnapshot(agent, {
+          scriptId: url.searchParams.get('scriptId') ?? undefined,
+          extensionId: url.searchParams.get('extensionId') ?? undefined,
+        }) })
+        return
+      }
+      if (req.method === 'GET' && route === '/compat/chat') {
+        const agent = await agentFor(url.searchParams.get('sessionId'))
+        sendJson(res, 200, { ok: true, value: await store.refreshCompatChat(agent) })
+        return
+      }
+      if (req.method === 'GET' && route === '/compat/generation') {
+        const agent = await agentFor(url.searchParams.get('sessionId'), false)
+        const generation = generationBroker.get(url.searchParams.get('generationId'))
+        if (generation !== null && generation.sessionId !== String(agent.id)) throw new Error('generation belongs to another session')
+        sendJson(res, generation === null ? 404 : 200, generation === null ? { ok: false, error: 'generation not found' } : { ok: true, value: generation })
+        return
+      }
+      if (req.method === 'GET' && route === '/compat/models') {
+        const agent = await agentFor(url.searchParams.get('sessionId'), false)
+        const provider = String(url.searchParams.get('provider') ?? agent.options?.provider ?? '')
+        const models = typeof ctx.llm.listModels === 'function' ? await ctx.llm.listModels(provider) : []
+        sendJson(res, 200, { ok: true, value: Array.isArray(models) ? models.map(item => String(item?.id ?? item?.name ?? item)) : [] })
         return
       }
       if (req.method !== 'POST') {
@@ -541,7 +768,11 @@ export async function apply(ctx, config = {}) {
             try {
               if (selectionClosed()) throw new Error('opening greeting can only be selected before conversation messages exist')
               await store.ensureSelectedSession(agent, signal)
-              return await store.updateSession(agent, { openingSwipeId: body.swipeId }, signal)
+              const nextView = await store.updateSession(agent, { openingSwipeId: body.swipeId }, signal)
+              await store.refreshCompatChat(agent, signal)
+              const compatChat = store.compatChatProjection(agent)
+              if (compatChat.messages[0]?.extra?.dsh_opening === true) await store.mutateCompatChat(agent, { action: 'switch-swipe', expectedRevision: compatChat.revision, messageId: 0, swipeId: body.swipeId }, signal)
+              return nextView
             } finally {
               if (openingSelections.get(id) === selection) openingSelections.delete(id)
               if (selection.message !== undefined && active && ctx.agents.get(id) === agent && selection.agent === agent && selection.session === session && agent.session === session && sessionEvents(session).every(event => event.type !== 'user/message' && event.type !== 'assistant/message')) appendOpeningLifecycle(agent)
@@ -558,6 +789,98 @@ export async function apply(ctx, config = {}) {
         if (Object.hasOwn(patch, 'openingSwipeId')) throw new Error('openingSwipeId must be changed through /opening/select')
         const agent = await agentFor(body.sessionId)
         sendJson(res, 200, { ok: true, value: await store.updateSession(agent, patch) })
+        return
+      }
+      if (route === '/compat/variables/replace') {
+        const agent = await agentFor(body.sessionId)
+        sendJson(res, 200, { ok: true, value: await store.replaceCompatibilityVariables(agent, body.option ?? { type: 'chat' }, body.variables ?? {}, {
+          scriptId: body.scriptId,
+          extensionId: body.extensionId,
+          expectedRevision: body.expectedRevision,
+        }) })
+        return
+      }
+      if (route === '/compat/chat/mutate') {
+        const agent = await agentFor(body.sessionId)
+        const result = await store.mutateCompatChat(agent, body.mutation ?? body)
+        sendJson(res, 200, { ok: true, value: result })
+        return
+      }
+      if (route === '/compat/worldbook') {
+        const agent = await agentFor(body.sessionId)
+        await store.refreshLibrary(agent)
+        const action = String(body.action ?? '')
+        const name = String(body.name ?? '')
+        const options = { context: agent, expectedRevision: body.expectedRevision }
+        let value
+        if (action === 'get') value = store.getTavernWorldbookSnapshot(name, agent)
+        else if (action === 'create') value = await store.createTavernWorldbook(name, body.entries ?? [], options)
+        else if (action === 'create-or-replace') value = await store.createOrReplaceTavernWorldbook(name, body.entries ?? [], options)
+        else if (action === 'replace') {
+          await store.replaceTavernWorldbook(name, body.entries ?? [], options)
+          value = store.getTavernWorldbookSnapshot(name, agent)
+        } else if (action === 'create-entries') {
+          value = await store.createTavernWorldbookEntries(name, body.entries ?? [], options)
+          value = { ...value, revision: store.getTavernWorldbookSnapshot(name, agent).revision }
+        } else if (action === 'delete-entries') {
+          value = await store.deleteTavernWorldbookEntries(name, body.uids ?? [], options)
+          value = { ...value, revision: store.getTavernWorldbookSnapshot(name, agent).revision }
+        } else if (action === 'delete') value = await store.deleteTavernWorldbook(name, { ...options, rejectIfReferenced: false })
+        else if (action === 'rebind-global') value = await store.updateCompatibilityState(agent, { globalWorldbooks: body.names ?? [], lorebookSettings: { selected_global_lorebooks: body.names ?? [] } }, { expectedRevision: body.expectedRevision })
+        else if (action === 'rebind-character') value = await store.updateCompatibilityState(agent, { characterWorldbooks: body.worldbooks ?? {} }, { expectedRevision: body.expectedRevision })
+        else if (action === 'rebind-chat') {
+          const targetName = body.name === null || body.name === '' ? null : String(body.name)
+          const target = targetName === null ? null : store.getTavernWorldbookSnapshot(targetName, agent)
+          value = await store.updateSession(agent, { worldbookId: target?.id ?? null, expectedRevision: body.bindingRevision })
+        } else if (action === 'get-or-create-chat') {
+          const currentView = store.sessionView(agent)
+          if (currentView.binding?.worldbookExplicit === true && currentView.worldbook !== null) value = currentView.worldbook.name
+          else {
+            const requested = typeof body.name === 'string' && body.name.trim() !== ''
+              ? body.name.trim()
+              : `Chat Book ${String(agent.session.id)}`.replace(/[^a-z0-9]/gi, '_').replace(/_{2,}/g, '_').slice(0, 64)
+            const created = await store.createTavernWorldbook(requested, [], { context: agent })
+            if (!created && typeof body.name === 'string' && body.name.trim() !== '') throw new Error(`worldbook "${requested}" already exists`)
+            const target = store.getTavernWorldbookSnapshot(requested, agent)
+            await store.updateSession(agent, { worldbookId: target.id, expectedRevision: currentView.binding?.revision })
+            value = requested
+          }
+        } else if (action === 'set-lorebook-settings') value = await store.updateCompatibilityState(agent, { lorebookSettings: body.settings ?? {} }, { expectedRevision: body.expectedRevision })
+        else if (action === 'save-extension-settings') value = await store.updateCompatibilityState(agent, { extensionSettings: body.settings ?? {} }, { expectedRevision: body.expectedRevision })
+        else throw new TypeError(`unknown compatibility worldbook action ${action}`)
+        sendJson(res, 200, { ok: true, value })
+        return
+      }
+      if (route === '/compat/regex') {
+        const agent = await agentFor(body.sessionId)
+        sendJson(res, 200, { ok: true, value: await store.replaceCompatibilityRegexes(agent, body.changes ?? {}) })
+        return
+      }
+      if (route === '/compat/slash') {
+        const agent = await agentFor(body.sessionId)
+        sendJson(res, 200, { ok: true, value: await triggerSlash(agent, body.command) })
+        return
+      }
+      if (route === '/compat/generation/start') {
+        const agent = await agentFor(body.sessionId)
+        const options = await compatibilityGenerationOptions(agent, body.mode === 'raw' ? 'raw' : 'preset', body.config ?? {})
+        const started = generationBroker.start({ sessionId: agent.id, generationId: body.config?.generation_id, options })
+        void started.done.catch(() => undefined)
+        sendJson(res, 202, { ok: true, value: { generationId: started.generationId } })
+        return
+      }
+      if (route === '/compat/generation/stop') {
+        const agent = await agentFor(body.sessionId, false)
+        const current = generationBroker.get(body.generationId)
+        const stopped = current?.sessionId === String(agent.id) && generationBroker.stopById(body.generationId)
+        sendJson(res, 200, { ok: true, value: stopped === true })
+        return
+      }
+      if (route === '/compat/generation/stop-all') {
+        const agent = await agentFor(body.sessionId, false)
+        let stopped = false
+        for (const item of generationBroker.list({ sessionId: agent.id, activeOnly: true })) stopped = generationBroker.stopById(item.generationId) || stopped
+        sendJson(res, 200, { ok: true, value: stopped })
         return
       }
       if (route === '/memory') {
@@ -619,7 +942,7 @@ export async function apply(ctx, config = {}) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const code = typeof error?.code === 'string' ? error.code : undefined
-      const status = ['replace-confirmation-required', 'binding-changed', 'session-started', 'worldbook-name-conflict', 'worldbook-references-required', 'card-active-sessions', 'card-references-required'].includes(code) ? 409
+      const status = ['replace-confirmation-required', 'binding-changed', 'session-started', 'session-revision-conflict', 'regex-revision-conflict', 'compatibility-revision-conflict', 'chat-revision-conflict', 'worldbook-revision-conflict', 'worldbook-name-conflict', 'worldbook-references-required', 'card-active-sessions', 'card-references-required'].includes(code) ? 409
         : /untrusted API request/.test(message) ? 403
         : /not found|no live Agent/.test(message) ? 404
         : /not using/.test(message) ? 403

@@ -1,6 +1,7 @@
 import { isMemoryAutoRecallEligible, memoryLimits } from './memory.js'
 import { neutralizeDshTemplates, renderMacros, renderPromptTemplate } from './template.js'
 import { activateWorldbook } from './worldbook.js'
+import { projectInjectionDescriptors } from './compat-injections.js'
 import { getRegexedString, REGEX_PLACEMENT, regexRulesForState } from './regex.js'
 
 function promptRegex(text, placement, sources, options, phase) {
@@ -47,6 +48,16 @@ export function sessionMessages(agent, limit = 40) {
     if (message !== undefined) messages.push(message)
   }
   return messages.slice(-limit)
+}
+
+export function sessionTranscriptMessages(agent, limit = 10000) {
+  const messages = []
+  for (const event of sessionEvents(agent?.session)) {
+    if (event?.surfaceOp !== undefined && event.surfaceOp !== 'append') continue
+    const message = messageFromEvent(event)
+    if (message !== undefined) messages.push(message)
+  }
+  return messages.slice(-Math.max(0, Number.isSafeInteger(limit) ? limit : 10000))
 }
 
 export function sessionEventDelta(agent, after = -1, messageLimit = 100, eventLimit = 2000) {
@@ -329,17 +340,26 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
   if (state === undefined) return { system: '', postHistory: '', activeWorldbookEntries: [], worldbookDepthEntries: [] }
   signal?.throwIfAborted()
   const card = state.record.card
-  const messages = sessionMessages(agent, 100)
   const compactedSeqs = options.compactedSeqs instanceof Set ? options.compactedSeqs : compactedEventSeqs(agent)
+  const liveNativeSeqs = new Set(sessionTranscriptMessages(agent).map(message => message.seq))
+  const messages = Array.isArray(state.compatMessages)
+    ? state.compatMessages
+      .filter(message => message?.is_hidden !== true && !compactedSeqs.has(message?.sourceSeq ?? message?.event_seq))
+      .filter(message => message?.origin !== 'native' || liveNativeSeqs.has(message?.sourceSeq ?? message?.event_seq))
+      .map(message => ({ role: message.role, text: String(message.message ?? ''), seq: message.sourceSeq ?? message.event_seq ?? message.message_id }))
+    : sessionMessages(agent, 100)
   const scope = scopeFor(state, messages, compactedSeqs)
   const regexSources = regexRulesForState(state)
   let selectedOpening = ''
   try { selectedOpening = initialGreetingView(state, Number(state.binding.openingSwipeId ?? 0))?.text ?? '' } catch { selectedOpening = '' }
-  const rawMessages = [...(selectedOpening === '' ? [] : [selectedOpening]), ...messages.map(message => message.text)]
+  if (Array.isArray(state.compatMessages) && state.compatMessages.some(message => message?.extra?.dsh_opening === true)) selectedOpening = ''
+  const injectionProjection = projectInjectionDescriptors(options.injections ?? state.binding.scriptInjections.filter(item => item.hasFilter !== true))
+  const rawMessages = [...(selectedOpening === '' ? [] : [selectedOpening]), ...messages.map(message => message.text), ...injectionProjection.scan.map(item => item.content)]
   const world = await activateWorldbook(state.worldbook?.book, rawMessages, {
     contextWindow: options.contextWindow,
     budgetPercent: options.budgetPercent,
     budgetCap: options.budgetCap,
+    scanDepth: options.scanDepth,
     fallbackTokenBudget: options.fallbackTokenBudget,
     countTokens: options.countTokens,
     renderKey: key => renderMacros(String(key ?? '').slice(0, MAX_SECTION_CHARS), scope, MAX_SECTION_CHARS),
@@ -392,7 +412,7 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     authorNoteTop: boundedWorld(world.authorNoteTop ?? []),
     authorNoteBottom: boundedWorld(world.authorNoteBottom ?? []),
   }
-  const worldbookDepthEntries = world.depthEntries.flatMap(item => {
+  const worldbookDepthEntries = [...world.depthEntries, ...injectionProjection.messages].flatMap(item => {
     const rendered = boundedWorld([item.content])
     return rendered.length === 0 ? [] : [{ ...item, content: rendered[0] }]
   })
@@ -416,7 +436,6 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     section('Automatically recalled long-term memory', memoryText(state.memory, messages, compactedSeqs)),
     section('Compacted source awaiting background memory maintenance', pendingMemoryText(options.pendingMemoryFallback)),
     ...afterTemplates,
-    ...[...state.binding.scriptInjections].sort((left, right) => left.order - right.order).map(item => item.text),
     ...renderedWorld.authorNoteTop,
     section('Post-history instructions', [render(card.data.post_history_instructions), ...postTemplates].filter(value => value.trim() !== '').join('\n\n')),
     ...renderedWorld.authorNoteBottom,

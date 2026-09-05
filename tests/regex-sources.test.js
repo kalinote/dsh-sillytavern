@@ -90,6 +90,14 @@ test('persists Global and Preset Regex sources and exposes official source order
   assert.equal(restored.findRegex(live, 'Global').script.enabled, false)
   await restored.toggleRegex(live, 'Global', true)
   assert.equal(restored.findRegex(live, 'Global').script.enabled, true)
+
+  await restored.replaceCompatibilityRegexes(live, {
+    global: [regex({ id: 'api-global', name: 'API Global', source: 'from api' })],
+    character: [regex({ id: 'api-character', name: 'API Character', source: 'from card api' })],
+  })
+  assert.equal(restored.findRegex(live, 'API Global').script.enabled, true, 'compatibility writes receive a host-owned approval hash')
+  assert.equal(restored.findRegex(live, 'API Character').script.enabled, true)
+  assert.equal(restored.promptState(live).record.scripts.find(script => script.id === 'api-character').approvedHash?.length, 64)
 })
 
 test('normalizes malformed persisted binding fields before prompt access', async t => {

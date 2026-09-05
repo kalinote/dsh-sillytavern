@@ -52,7 +52,6 @@ window.__ModuleLoader__.load({
     const scriptPolicies = createSessionStore(Object.freeze([]))
     const scriptScopes = createSessionStore(Object.freeze({}))
     const scriptEvents = createSessionStore(null)
-    const composerBridges = new Map()
     const useSessionStore = (store, sessionId) => React.useSyncExternalStore(store.subscribe, () => store.get(sessionId), () => store.get(sessionId))
 
     const regexWorkerSource = String.raw`
@@ -253,6 +252,352 @@ self.onmessage = event => {
         return () => controller.abort()
       }, deps)
       return state
+    }
+
+    const compatRuntime = (() => {
+      const sessions = new Map()
+      const frames = new Map()
+      let removeWindowListener = null
+      let nextRevision = 0
+
+      const clone = value => value === undefined ? undefined : structuredClone(value)
+      const sessionFor = sessionId => {
+        const id = String(sessionId)
+        let runtime = sessions.get(id)
+        if (runtime === undefined) {
+          runtime = { id, snapshot: null, token: undefined, eventToken: undefined, listeners: new Set(), frames: new Set(), composer: null, queue: Promise.resolve(), cardId: undefined, eventSeq: -1, eventsInitialized: false }
+          sessions.set(id, runtime)
+        }
+        return runtime
+      }
+      const notify = runtime => { for (const listener of runtime.listeners) listener() }
+      const post = (registration, message) => registration.getWindow()?.postMessage({ __dshSillyTavern: true, channel: registration.channel, ...message }, '*')
+      const broadcastState = runtime => {
+        if (runtime.snapshot === null) return
+        for (const channel of runtime.frames) {
+          const registration = frames.get(channel)
+          if (registration !== undefined) post(registration, { event: 'compat-state', payload: clone(runtime.snapshot) })
+        }
+      }
+      const set = (sessionId, snapshot, token) => {
+        if (snapshot === null || snapshot === undefined) return
+        const runtime = sessionFor(sessionId)
+        if (token !== undefined && runtime.token === token) return
+        runtime.token = token
+        runtime.snapshot = { ...clone(snapshot), runtimeRevision: ++nextRevision }
+        const history = runtime.snapshot.state?.history || []
+        runtime.eventSeq = Math.max(runtime.eventSeq, ...history.map(message => Number(message?.seq)).filter(Number.isSafeInteger), -1)
+        runtime.cardId = runtime.snapshot.cardRecord?.id ?? null
+        notify(runtime)
+        broadcastState(runtime)
+      }
+      const patchSnapshot = (runtime, patch) => {
+        if (runtime.snapshot === null) return
+        runtime.snapshot = { ...runtime.snapshot, ...clone(patch), runtimeRevision: ++nextRevision }
+        notify(runtime)
+        broadcastState(runtime)
+      }
+      const broadcastEvent = (runtime, name, args, exceptChannel) => {
+        for (const channel of runtime.frames) {
+          if (channel === exceptChannel) continue
+          const registration = frames.get(channel)
+          if (registration !== undefined) post(registration, { event: 'compat-event', payload: { name, args: clone(args) } })
+        }
+      }
+      const applyEventState = (sessionId, state) => {
+        if (state === null || state === undefined) return
+        const runtime = sessionFor(sessionId)
+        if (runtime.snapshot === null) return
+        const history = Array.isArray(state.history) ? state.history : []
+        const eventToken = `${state.card?.id || 'none'}:${state.cursor ?? -1}:${state.compatChatRevision ?? -1}:${history.at(-1)?.seq ?? -1}:${history.length}:${state.unavailable === true}`
+        if (runtime.eventToken === eventToken) return
+        runtime.eventToken = eventToken
+        const stateView = { ...(runtime.snapshot.state || {}), history: clone(history) }
+        const patch = { state: stateView, chatRevision: Number(state.compatChatRevision ?? runtime.snapshot.chatRevision ?? 0) }
+        if (Array.isArray(state.messages)) patch.messages = clone(state.messages)
+        patchSnapshot(runtime, patch)
+        const cardId = state.card?.id ?? null
+        if (runtime.eventsInitialized && cardId !== runtime.cardId) broadcastEvent(runtime, 'chat_id_changed', [runtime.id])
+        const newer = history.filter(message => Number.isSafeInteger(message?.seq) && message.seq > runtime.eventSeq)
+        if (runtime.eventsInitialized) for (const message of newer) {
+          const projectedId = (runtime.snapshot.messages || []).findIndex(item => item.sourceSeq === message.seq || item.event_seq === message.seq)
+          const messageId = projectedId >= 0 ? projectedId : history.indexOf(message)
+          if (message.role === 'user') {
+            broadcastEvent(runtime, 'message_sent', [messageId])
+            broadcastEvent(runtime, 'user_message_rendered', [messageId])
+          } else if (message.role === 'assistant') {
+            broadcastEvent(runtime, 'message_received', [messageId, 'normal'])
+            broadcastEvent(runtime, 'character_message_rendered', [messageId, 'normal'])
+          }
+        }
+        runtime.eventsInitialized = true
+        runtime.cardId = cardId
+        if (history.length > 0) runtime.eventSeq = Math.max(runtime.eventSeq, ...history.map(message => Number(message?.seq)).filter(Number.isSafeInteger))
+      }
+      const mergeSessionView = (runtime, view) => {
+        const binding = view?.binding ?? runtime.snapshot?.state?.binding ?? null
+        patchSnapshot(runtime, {
+          bindingRevision: Number(binding?.revision ?? runtime.snapshot?.bindingRevision ?? 0),
+          variables: clone(binding?.variables ?? runtime.snapshot?.variables ?? {}),
+          scriptInjections: clone(binding?.scriptInjections ?? runtime.snapshot?.scriptInjections ?? []),
+          state: { ...(runtime.snapshot?.state || {}), ...(view || {}), history: runtime.snapshot?.state?.history || [] },
+        })
+      }
+      const patchVariableScope = (runtime, option, variables, metadata = {}) => {
+        if (runtime.snapshot === null) return
+        const type = String(option?.type || 'chat')
+        const scopes = clone(runtime.snapshot.variableScopes || {})
+        scopes[type] = clone(variables || {})
+        const patch = { variableScopes: scopes }
+        if (type === 'chat') {
+          patch.variables = clone(variables || {})
+          patch.state = { ...(runtime.snapshot.state || {}), binding: { ...(runtime.snapshot.state?.binding || {}), variables: clone(variables || {}) } }
+        } else if (type === 'global') patch.globalVariables = clone(variables || {})
+        const maps = clone(runtime.snapshot.variableMaps || {})
+        if (type === 'global') maps.global = clone(variables || {})
+        else if (type === 'preset') {
+          const ids = Array.isArray(runtime.snapshot.state?.binding?.templateIds) ? runtime.snapshot.state.binding.templateIds.map(String).sort() : []
+          maps.presets ||= {}; maps.presets[ids.length === 0 ? 'in_use' : ids.join('\u001f')] = clone(variables || {})
+        } else if (type === 'character') {
+          maps.characters ||= {}; maps.characters[String(runtime.snapshot.cardRecord?.id || '')] = clone(variables || {})
+        } else if (type === 'script') {
+          maps.scripts ||= {}; maps.scripts[`${String(runtime.snapshot.cardRecord?.id || 'none')}\u001f${String(metadata.scriptId || option?.script_id || 'unknown')}`] = clone(variables || {})
+        } else if (type === 'extension') {
+          maps.extensions ||= {}; maps.extensions[String(option?.extension_id || '')] = clone(variables || {})
+        } else if (type === 'message') {
+          const messages = clone(runtime.snapshot.messages || [])
+          const raw = option?.message_id ?? 'latest'
+          let index = raw === 'latest' ? messages.length - 1 : Number(raw)
+          if (index < 0) index = messages.length + index
+          if (Number.isSafeInteger(index) && messages[index]) messages[index].data = clone(variables || {})
+          patch.messages = messages
+        }
+        patch.variableMaps = maps
+        patchSnapshot(runtime, patch)
+      }
+      const persistVariableScope = (runtime, option, variables, metadata = {}) => {
+        const operation = runtime.queue.then(async () => {
+          const type = String(option?.type || 'chat')
+          const revisions = runtime.snapshot?.variableRevisions || {}
+          const revisionKey = type === 'chat' ? 'chat' : type === 'global' ? 'global' : type === 'message' ? 'message' : 'workspace'
+          try {
+            const value = await api('/compat/variables/replace', {
+              method: 'POST',
+              body: JSON.stringify({ sessionId: runtime.id, option, variables, scriptId: metadata.scriptId, extensionId: option?.extension_id, expectedRevision: Number(revisions[revisionKey] || 0) }),
+            })
+            patchVariableScope(runtime, option, variables, metadata)
+            patchSnapshot(runtime, { variableRevisions: clone(value?.revisions || revisions) })
+            return value
+          } catch (error) {
+            const fresh = await api(`/compat/runtime?sessionId=${encodeURIComponent(runtime.id)}`)
+            set(runtime.id, fresh)
+            throw error
+          }
+        })
+        runtime.queue = operation.catch(() => undefined)
+        return operation
+      }
+      const persistSessionPatch = (runtime, patch) => {
+        const operation = runtime.queue.then(async () => {
+          const expectedRevision = Number(runtime.snapshot?.bindingRevision ?? 0)
+          try {
+            const view = await api('/session/update', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, patch: { ...patch, expectedRevision } }) })
+            mergeSessionView(runtime, view)
+            return view
+          } catch (error) {
+            const fresh = await api(`/compat/runtime?sessionId=${encodeURIComponent(runtime.id)}`)
+            set(runtime.id, fresh)
+            throw error
+          }
+        })
+        runtime.queue = operation.catch(() => undefined)
+        return operation
+      }
+      const handleAction = async (registration, message) => {
+        const runtime = sessionFor(registration.sessionId)
+        const args = message.args || {}
+        if (registration.actions && typeof registration.actions[message.action] === 'function') return registration.actions[message.action](args, registration.channel)
+        if (message.action === 'getState') return clone(runtime.snapshot?.state ?? null)
+        if (message.action === 'getWorldbook') return clone(runtime.snapshot?.worldbook ?? null)
+        if (message.action === 'replaceVariables' || message.action === 'setVariables') {
+          const variables = args.variables && typeof args.variables === 'object' && !Array.isArray(args.variables) ? clone(args.variables) : {}
+          const option = args.option && typeof args.option === 'object' ? clone(args.option) : { type: 'chat' }
+          patchVariableScope(runtime, option, variables, { scriptId: registration.scriptId })
+          return persistVariableScope(runtime, option, variables, { scriptId: registration.scriptId })
+        }
+        if (message.action === 'injectPrompts') {
+          const incoming = Array.isArray(args.prompts) ? args.prompts : []
+          const byId = new Map((runtime.snapshot?.scriptInjections || []).map(item => [String(item.id), item]))
+          for (const item of incoming) byId.set(String(item.id), clone(item))
+          const scriptInjections = [...byId.values()]
+          patchSnapshot(runtime, { scriptInjections, state: { ...(runtime.snapshot?.state || {}), binding: { ...(runtime.snapshot?.state?.binding || {}), scriptInjections } } })
+          return persistSessionPatch(runtime, { scriptInjections })
+        }
+        if (message.action === 'uninjectPrompts') {
+          const ids = new Set((Array.isArray(args.ids) ? args.ids : []).map(String))
+          const scriptInjections = (runtime.snapshot?.scriptInjections || []).filter(item => !ids.has(String(item.id)))
+          patchSnapshot(runtime, { scriptInjections, state: { ...(runtime.snapshot?.state || {}), binding: { ...(runtime.snapshot?.state?.binding || {}), scriptInjections } } })
+          return persistSessionPatch(runtime, { scriptInjections })
+        }
+        if (message.action === 'mutateChat') {
+          const operation = runtime.queue.then(async () => {
+          const mutation = clone(args.mutation || {})
+          mutation.expectedRevision = Number(runtime.snapshot?.chatRevision || 0)
+          const value = await api('/compat/chat/mutate', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, mutation }) })
+          const messages = clone(value?.messages || [])
+          patchSnapshot(runtime, {
+            chatRevision: Number(value?.revision || 0),
+            messages,
+            state: { ...(runtime.snapshot?.state || {}), history: messages.map(item => ({ role: item.role, text: item.message ?? item.text ?? '', seq: item.sourceSeq ?? item.message_id })) },
+          })
+          const refresh = mutation.options?.refresh || 'affected'
+          if (mutation.action === 'set') {
+            for (const item of mutation.messages || []) broadcastEvent(runtime, 'message_updated', [item.message_id])
+          } else if (mutation.action === 'create') {
+            const before = mutation.options?.insert_before
+            const start = Number.isSafeInteger(before) ? before : Math.max(0, messages.length - (mutation.messages || []).length)
+            for (let offset = 0; offset < (mutation.messages || []).length; offset += 1) {
+              const id = start + offset
+              const item = mutation.messages[offset]
+              if (item?.role === 'user') broadcastEvent(runtime, 'message_sent', [id])
+              else if (item?.role === 'assistant') broadcastEvent(runtime, 'message_received', [id, 'normal'])
+            }
+          } else if (mutation.action === 'delete') {
+            for (const id of mutation.messageIds || []) broadcastEvent(runtime, 'message_deleted', [id])
+          } else if (mutation.action === 'switch-swipe') broadcastEvent(runtime, 'message_swiped', [mutation.messageId])
+          if (refresh === 'all') broadcastEvent(runtime, 'chat_id_changed', [runtime.id])
+          else if (refresh === 'affected') {
+            const affected = mutation.action === 'set' ? (mutation.messages || []).map(item => item.message_id)
+              : mutation.action === 'create' ? messages.slice(-(mutation.messages || []).length).map(item => item.message_id)
+              : []
+            for (const id of affected) {
+              const item = messages[id]
+              if (item?.role === 'user') broadcastEvent(runtime, 'user_message_rendered', [id])
+              else if (item?.role === 'assistant') broadcastEvent(runtime, 'character_message_rendered', [id, 'normal'])
+            }
+          }
+          return null
+          })
+          runtime.queue = operation.catch(() => undefined)
+          return operation
+        }
+        if (message.action === 'worldbook') {
+          const value = await api('/compat/worldbook', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, ...(args.request || {}) }) })
+          const fresh = await api(`/compat/runtime?sessionId=${encodeURIComponent(runtime.id)}`)
+          set(runtime.id, fresh)
+          return value
+        }
+        if (message.action === 'replaceRegexes') {
+          const operation = runtime.queue.then(async () => {
+            const changes = clone(args.changes || {})
+            if (Object.hasOwn(changes, 'global') || Object.hasOwn(changes, 'preset')) changes.expectedRevision = Number(runtime.snapshot?.regexRevision || 0)
+            const value = await api('/compat/regex', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, changes }) })
+            const fresh = await api(`/compat/runtime?sessionId=${encodeURIComponent(runtime.id)}`)
+            set(runtime.id, fresh)
+            broadcastEvent(runtime, 'settings_updated', [])
+            broadcastEvent(runtime, 'chat_id_changed', [runtime.id])
+            return value
+          })
+          runtime.queue = operation.catch(() => undefined)
+          return operation
+        }
+        if (message.action === 'flushWrites') return runtime.queue
+        if (message.action === 'memory') return api('/memory', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, operation: args.operation || {} }) })
+        if (message.action === 'triggerSlash') return api('/compat/slash', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, command: String(args.command || '') }) })
+        if (message.action === 'generate') {
+          const started = await api('/compat/generation/start', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, mode: args.mode === 'raw' ? 'raw' : 'preset', config: args.config || {} }) })
+          const generationId = String(started.generationId)
+          broadcastEvent(runtime, 'js_generation_started', [generationId])
+          broadcastEvent(runtime, 'generation_started', ['normal', {}, false])
+          let previous = ''
+          for (;;) {
+            await new Promise(resolve => window.setTimeout(resolve, 40))
+            const state = await api(`/compat/generation?sessionId=${encodeURIComponent(runtime.id)}&generationId=${encodeURIComponent(generationId)}`)
+            const full = String(state.full || '')
+            if (full !== previous) {
+              const incremental = full.startsWith(previous) ? full.slice(previous.length) : full
+              previous = full
+              broadcastEvent(runtime, 'js_stream_token_received_incrementally', [incremental, generationId])
+              broadcastEvent(runtime, 'js_stream_token_received_fully', [full, generationId])
+              broadcastEvent(runtime, 'stream_token_received', [full])
+            }
+            if (state.active) continue
+            if (state.status === 'failed') throw Object.assign(new Error(state.error?.message || 'generation failed'), { code: state.error?.code })
+            if (state.status === 'stopped') broadcastEvent(runtime, 'generation_stopped', [generationId])
+            broadcastEvent(runtime, 'js_generation_ended', [full, generationId])
+            broadcastEvent(runtime, 'generation_ended', [null])
+            return Array.isArray(state.toolCalls) && state.toolCalls.length > 0 ? { content: full, tool_calls: state.toolCalls } : full
+          }
+        }
+        if (message.action === 'stopGeneration') return api('/compat/generation/stop', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, generationId: args.generationId }) })
+        if (message.action === 'stopAllGeneration') return api('/compat/generation/stop-all', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id }) })
+        if (message.action === 'getModelList') return api(`/compat/models?sessionId=${encodeURIComponent(runtime.id)}&provider=${encodeURIComponent(String(args.provider || ''))}`)
+        if (message.action === 'appendInput') {
+          if (typeof runtime.composer !== 'function') throw new Error('conversation composer bridge is unavailable')
+          return runtime.composer(args.text)
+        }
+        throw new Error(`unsupported script API action ${message.action}`)
+      }
+      const onMessage = async event => {
+        const message = event.data
+        if (!message || message.__dshSillyTavern !== true || typeof message.channel !== 'string') return
+        const registration = frames.get(message.channel)
+        if (registration === undefined || event.source !== registration.getWindow()) return
+        if (message.event === 'frame-resize') {
+          const height = Math.ceil(Number(message.payload?.height))
+          if (Number.isFinite(height) && height > 0) registration.onResize?.(height)
+          return
+        }
+        if (message.event === 'frame-ready') {
+          registration.onReady?.()
+          const runtime = sessionFor(registration.sessionId)
+          if (runtime.snapshot !== null) post(registration, { event: 'compat-state', payload: clone(runtime.snapshot) })
+          return
+        }
+        if (message.event === 'compat-event') {
+          const name = String(message.payload?.name ?? '')
+          const args = Array.isArray(message.payload?.args) ? message.payload.args : []
+          if (name !== '') broadcastEvent(sessionFor(registration.sessionId), name, args, registration.channel)
+          return
+        }
+        if (!message.id) return
+        try {
+          const value = await handleAction(registration, message)
+          post(registration, { replyTo: message.id, ok: true, value: value ?? null })
+        } catch (error) {
+          post(registration, { replyTo: message.id, ok: false, error: error?.message || String(error), code: error?.code })
+        }
+      }
+      return {
+        start() {
+          if (removeWindowListener !== null) return () => undefined
+          if (typeof window.addEventListener !== 'function' || typeof window.removeEventListener !== 'function') return () => undefined
+          window.addEventListener('message', onMessage)
+          removeWindowListener = () => { window.removeEventListener('message', onMessage); removeWindowListener = null }
+          return removeWindowListener
+        },
+        get(sessionId) { return sessionId === undefined || sessionId === null ? null : sessionFor(sessionId).snapshot },
+        subscribe(sessionId, listener) { if (sessionId === undefined || sessionId === null) return () => undefined; const runtime = sessionFor(sessionId); runtime.listeners.add(listener); return () => runtime.listeners.delete(listener) },
+        set,
+        applyEventState,
+        setComposer(sessionId, composer) { const runtime = sessionFor(sessionId); runtime.composer = composer; return () => { if (runtime.composer === composer) runtime.composer = null } },
+        register(registration) {
+          frames.set(registration.channel, registration)
+          sessionFor(registration.sessionId).frames.add(registration.channel)
+          return () => { frames.delete(registration.channel); sessions.get(String(registration.sessionId))?.frames.delete(registration.channel) }
+        },
+        reset() {
+          removeWindowListener?.()
+          frames.clear()
+          sessions.clear()
+        },
+      }
+    })()
+
+    function useCompatSnapshot(sessionId) {
+      const subscribe = React.useCallback(listener => compatRuntime.subscribe(sessionId, listener), [sessionId])
+      const getSnapshot = React.useCallback(() => compatRuntime.get(sessionId), [sessionId])
+      return React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
     }
 
     function Button({ children, className = '', ...props }) {
@@ -1099,116 +1444,987 @@ self.onmessage = event => {
     }
 
     function compatibleHtmlSource(source) {
-      return String(source).replace(/\bwindow\.parent\.document\.querySelector\(\s*(['"])#send_textarea\1\s*\)/g, 'window.__dshComposerInput')
+      return String(source)
+        .replace(/\b(?:window\.)?parent\.document\.querySelector\(\s*(['"])#send_textarea\1\s*\)/g, 'window.__dshComposerInput')
+        .replace(/\b(?:window\.)?parent\.document\.getElementById\(\s*(['"])send_textarea\1\s*\)/g, 'window.__dshComposerInput')
+        .replace(/\b(?:window\.)?parent\.document\.querySelector\(\s*(['"])#send_but\1\s*\)/g, 'window.__dshComposerSend')
+        .replace(/\b(?:window\.)?parent\.document\.getElementById\(\s*(['"])send_but\1\s*\)/g, 'window.__dshComposerSend')
+        .replace(/\b(?:window\.)?parent\.(?:\$|jQuery)\(\s*(['"])#send_textarea\1\s*\)/g, 'window.__dshComposerJquery("#send_textarea")')
+        .replace(/\b(?:window\.)?parent\.(?:\$|jQuery)\(\s*(['"])#send_but\1\s*\)/g, 'window.__dshComposerJquery("#send_but")')
     }
 
-    function trustedDocument(script, channel) {
+    function installCompatibilityRuntime(root, initialSnapshot, channel, metadata) {
+      const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+      const deepFreeze = value => {
+        if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value
+        for (const child of Object.values(value)) deepFreeze(child)
+        return Object.freeze(value)
+      }
+      const assignArray = (target, values) => { target.splice(0, target.length, ...clone(values || [])) }
+      const assignObject = (target, value) => {
+        for (const key of Object.keys(target)) delete target[key]
+        Object.assign(target, clone(value || {}))
+      }
+      class CompatibilityUnavailableError extends Error {
+        constructor(capability, reason) { super(`${capability} is unavailable: ${reason}`); this.name = 'CompatibilityUnavailableError'; this.code = 'dsh-compat-unavailable'; this.capability = capability }
+      }
+      let snapshot = clone(initialSnapshot || {})
+      let seq = 0
+      let listenerSeq = 0
+      let disposed = false
+      const pending = new Map()
+      const listeners = new Map()
+      const chat = []
+      const characters = []
+      const chatMetadata = {}
+      if (metadata?.surface === 'message') root.parent.postMessage({ __dshSillyTavern: true, channel, event: 'compat-event', payload: { name: 'message_iframe_render_started', args: [String(metadata.scriptId || channel)] } }, '*')
+      const getBucket = name => {
+        const key = String(name)
+        if (!listeners.has(key)) listeners.set(key, [])
+        return listeners.get(key)
+      }
+      const removeRecord = record => {
+        const bucket = listeners.get(record.name)
+        if (!bucket) return
+        const index = bucket.indexOf(record)
+        if (index >= 0) bucket.splice(index, 1)
+        if (bucket.length === 0) listeners.delete(record.name)
+      }
+      const addListener = (name, fn, priority, once) => {
+        if (typeof fn !== 'function') throw new TypeError('event listener must be a function')
+        const bucket = getBucket(name)
+        const existing = bucket.find(record => record.fn === fn)
+        if (existing) return Object.freeze({ stop: () => removeRecord(existing) })
+        const record = { name: String(name), fn, priority, once, order: ++listenerSeq }
+        bucket.push(record)
+        bucket.sort((left, right) => left.priority - right.priority || left.order - right.order)
+        return Object.freeze({ stop: () => removeRecord(record) })
+      }
+      const dispatch = async (name, args) => {
+        const bucket = [...(listeners.get(String(name)) || [])]
+        for (const record of bucket) {
+          if (record.once) removeRecord(record)
+          await record.fn(...args)
+        }
+      }
+      const eventOn = (name, fn) => addListener(name, fn, 0, false)
+      const eventMakeFirst = (name, fn) => addListener(name, fn, -1, false)
+      const eventMakeLast = (name, fn) => addListener(name, fn, 1, false)
+      const eventOnce = (name, fn) => addListener(name, fn, 0, true)
+      const eventRemoveListener = (name, fn) => {
+        for (const record of [...(listeners.get(String(name)) || [])]) if (record.fn === fn) removeRecord(record)
+      }
+      const eventClearEvent = name => listeners.delete(String(name))
+      const eventClearListener = fn => { for (const bucket of [...listeners.values()]) for (const record of [...bucket]) if (record.fn === fn) removeRecord(record) }
+      const eventClearAll = () => listeners.clear()
+      const eventEmit = async (name, ...args) => {
+        await dispatch(name, args)
+        root.parent.postMessage({ __dshSillyTavern: true, channel, event: 'compat-event', payload: { name: String(name), args: clone(args) } }, '*')
+      }
+      const eventEmitAndWait = (name, ...args) => { void eventEmit(name, ...args) }
+      const eventSource = Object.freeze({ on: eventOn, makeFirst: eventMakeFirst, makeLast: eventMakeLast, once: eventOnce, removeListener: eventRemoveListener, emit: eventEmit, emitAndWait: eventEmitAndWait })
+      const rpc = (action, args = {}, timeout = 5000) => new Promise((resolve, reject) => {
+        const id = ++seq
+        const timer = root.setTimeout(() => { pending.delete(id); reject(new Error('SillyTavern script RPC timed out')) }, timeout)
+        pending.set(id, { resolve, reject, timer })
+        try { root.parent.postMessage({ __dshSillyTavern: true, channel, id, action, args }, '*') }
+        catch (error) { root.clearTimeout(timer); pending.delete(id); reject(error) }
+      })
+      const reportWriteError = error => { console.error('[dsh-sillytavern] compatibility write failed', error); void dispatch('dsh_compatibility_error', [error]).catch(next => console.error(next)) }
+      const variableType = option => String(option?.type || 'chat')
+      const presetKey = () => {
+        const ids = Array.isArray(snapshot.state?.binding?.templateIds) ? snapshot.state.binding.templateIds.map(String).sort() : []
+        return ids.length === 0 ? 'in_use' : ids.join('\u001f')
+      }
+      const scriptKey = () => `${String(snapshot.cardRecord?.id || 'none')}\u001f${String(metadata?.scriptId || 'unknown')}`
+      const messageIndex = option => {
+        const raw = option?.message_id ?? 'latest'
+        if (raw === 'latest') {
+          for (let index = (snapshot.messages || []).length - 1; index >= 0; index -= 1) if (snapshot.messages[index]?.role !== 'system') return index
+          return -1
+        }
+        const number = Number(raw)
+        if (!Number.isSafeInteger(number)) throw new TypeError('message_id must be a safe integer or latest')
+        return number < 0 ? (snapshot.messages || []).length + number : number
+      }
+      const currentMessageIndex = () => {
+        if (metadata?.surface !== 'message') return -1
+        if (Number.isSafeInteger(metadata.currentSourceSeq)) {
+          const index = (snapshot.messages || []).findIndex(message => message.sourceSeq === metadata.currentSourceSeq || message.event_seq === metadata.currentSourceSeq)
+          if (index >= 0) return index
+        }
+        return Number.isSafeInteger(metadata.currentMessageId) ? metadata.currentMessageId : -1
+      }
+      const readVariableScope = option => {
+        const type = variableType(option)
+        const maps = snapshot.variableMaps || {}
+        if (type === 'chat') return snapshot.variableScopes?.chat ?? snapshot.variables ?? {}
+        if (type === 'global') return snapshot.variableScopes?.global ?? snapshot.globalVariables ?? {}
+        if (type === 'preset') return maps.presets?.[presetKey()] ?? snapshot.variableScopes?.preset ?? {}
+        if (type === 'character') return maps.characters?.[String(snapshot.cardRecord?.id || '')] ?? snapshot.variableScopes?.character ?? {}
+        if (type === 'script') return maps.scripts?.[scriptKey()] ?? snapshot.variableScopes?.script ?? {}
+        if (type === 'extension') {
+          const extensionId = String(option?.extension_id || '')
+          if (extensionId === '') throw new TypeError('extension_id is required for extension variables')
+          return maps.extensions?.[extensionId] ?? {}
+        }
+        if (type === 'message') {
+          const message = (snapshot.messages || [])[messageIndex(option)]
+          if (!message) throw new RangeError('message_id is outside the current chat')
+          return message.data && typeof message.data === 'object' && !Array.isArray(message.data) ? message.data : {}
+        }
+        throw new TypeError(`unknown variable scope ${type}`)
+      }
+      const writeVariableScope = (option, variables) => {
+        const type = variableType(option)
+        const value = clone(variables)
+        snapshot.variableScopes ||= {}
+        snapshot.variableMaps ||= {}
+        snapshot.variableScopes[type] = value
+        if (type === 'chat') {
+          snapshot.variables = value
+          if (snapshot.state?.binding) snapshot.state.binding.variables = value
+        } else if (type === 'global') {
+          snapshot.globalVariables = value
+          snapshot.variableMaps.global = value
+        } else if (type === 'preset') {
+          snapshot.variableMaps.presets ||= {}; snapshot.variableMaps.presets[presetKey()] = value
+        } else if (type === 'character') {
+          snapshot.variableMaps.characters ||= {}; snapshot.variableMaps.characters[String(snapshot.cardRecord?.id || '')] = value
+        } else if (type === 'script') {
+          snapshot.variableMaps.scripts ||= {}; snapshot.variableMaps.scripts[scriptKey()] = value
+        } else if (type === 'extension') {
+          const extensionId = String(option?.extension_id || '')
+          if (extensionId === '') throw new TypeError('extension_id is required for extension variables')
+          snapshot.variableMaps.extensions ||= {}; snapshot.variableMaps.extensions[extensionId] = value
+        } else if (type === 'message') {
+          const index = messageIndex(option)
+          if (!(snapshot.messages || [])[index]) throw new RangeError('message_id is outside the current chat')
+          snapshot.messages[index].data = value
+        } else throw new TypeError(`unknown variable scope ${type}`)
+      }
+      const getVariables = option => clone(readVariableScope(option))
+      const replaceVariables = (variables, option) => {
+        if (variables === null || typeof variables !== 'object' || Array.isArray(variables)) throw new TypeError('replaceVariables expects an object')
+        writeVariableScope(option, variables)
+        syncContext()
+        void rpc('replaceVariables', { variables: clone(variables), option: clone(option || { type: 'chat' }), scriptId: metadata?.scriptId }).catch(reportWriteError)
+      }
+      const updateVariablesWith = (updater, option) => {
+        if (typeof updater !== 'function') throw new TypeError('updateVariablesWith expects a function')
+        const value = updater(getVariables(option))
+        if (value && typeof value.then === 'function') return value.then(next => { replaceVariables(next, option); return next })
+        replaceVariables(value, option)
+        return value
+      }
+      const mergeVariables = (target, source) => {
+        if (Array.isArray(source)) return clone(source)
+        if (source === null || typeof source !== 'object') return clone(source)
+        const result = target !== null && typeof target === 'object' && !Array.isArray(target) ? clone(target) : {}
+        for (const [key, value] of Object.entries(source)) result[key] = Array.isArray(value) ? clone(value) : value !== null && typeof value === 'object' ? mergeVariables(result[key], value) : clone(value)
+        return result
+      }
+      const insertOrAssignVariables = (variables, option) => { const next = mergeVariables(getVariables(option), variables || {}); replaceVariables(next, option); return next }
+      const insertVariables = (variables, option) => {
+        const next = mergeVariables(variables || {}, getVariables(option))
+        replaceVariables(next, option)
+        return next
+      }
+      const deleteVariable = (path, option) => {
+        const next = getVariables(option)
+        const parts = []
+        String(path ?? '').replace(/[^.[\]]+|\[(?:(['"])((?:(?!\1)[^\\]|\\.)*?)\1|([^\]]*))\]/g, (match, quote, quoted, bare) => {
+          parts.push(String(quote ? quoted.replace(/\\(['"\\])/g, '$1') : bare === undefined ? match : bare.trim()))
+          return match
+        })
+        let parent = next
+        let delete_occurred = false
+        for (const key of parts.slice(0, -1)) {
+          if (parent === null || typeof parent !== 'object' || !Object.hasOwn(parent, key)) { parent = null; break }
+          parent = parent[key]
+        }
+        const key = parts.at(-1)
+        if (parent !== null && parent !== undefined && typeof parent === 'object' && key !== undefined && Object.hasOwn(parent, key)) {
+          delete_occurred = true
+          delete parent[key]
+        }
+        replaceVariables(next, option)
+        return { variables: getVariables(option), delete_occurred }
+      }
+      const getAllVariables = () => {
+        const result = {
+          ...getVariables({ type: 'global' }),
+          ...getVariables({ type: 'character' }),
+        }
+        if (metadata?.surface !== 'message') Object.assign(result, getVariables({ type: 'script' }))
+        Object.assign(result, getVariables())
+        if (metadata?.surface === 'message') {
+          const end = currentMessageIndex()
+          for (const message of (snapshot.messages || []).slice(0, end + 1)) {
+            const variables = message?.data
+            if (variables && typeof variables === 'object' && !Array.isArray(variables)) Object.assign(result, variables)
+          }
+        }
+        return clone(result)
+      }
+      const injectionFilters = new Map()
+      const ownedInjectionIds = new Set()
+      const normalizedInjection = prompt => ({
+        id: String(prompt?.id || `dsh-injection-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+        position: prompt?.position === 'none' ? 'none' : 'in_chat',
+        depth: Number.isFinite(Number(prompt?.depth)) ? Number(prompt.depth) : 0,
+        role: ['system', 'assistant', 'user'].includes(prompt?.role) ? prompt.role : 'system',
+        content: String(prompt?.content ?? prompt?.text ?? ''),
+        text: String(prompt?.content ?? prompt?.text ?? ''),
+        order: Number.isFinite(Number(prompt?.order)) ? Number(prompt.order) : 0,
+        should_scan: prompt?.should_scan === true,
+        once: false,
+        ownerFrameId: channel,
+        hasFilter: typeof prompt?.filter === 'function',
+      })
+      const uninjectPrompts = ids => {
+        const values = [...new Set((Array.isArray(ids) ? ids : [ids]).map(String))]
+        snapshot.scriptInjections = (snapshot.scriptInjections || []).filter(item => !values.includes(String(item.id)))
+        for (const id of values) { injectionFilters.delete(id); ownedInjectionIds.delete(id) }
+        void rpc('uninjectPrompts', { ids: values }).catch(reportWriteError)
+      }
+      const injectPrompts = (prompts, options = {}) => {
+        if (!Array.isArray(prompts)) throw new TypeError('injectPrompts expects an array')
+        const normalized = prompts.map(normalizedInjection)
+        for (let index = 0; index < normalized.length; index += 1) {
+          normalized[index].once = options?.once === true
+          ownedInjectionIds.add(normalized[index].id)
+          if (typeof prompts[index]?.filter === 'function') injectionFilters.set(normalized[index].id, prompts[index].filter)
+        }
+        const ids = normalized.map(item => item.id)
+        const byId = new Map((snapshot.scriptInjections || []).map(item => [String(item.id), item]))
+        for (const item of normalized) byId.set(item.id, item)
+        snapshot.scriptInjections = [...byId.values()]
+        void rpc('injectPrompts', { prompts: normalized, options: clone(options) }).catch(reportWriteError)
+        let active = true
+        return Object.freeze({ uninject() { if (!active) return; active = false; uninjectPrompts(ids) } })
+      }
+      const activeGenerations = new Set()
+      const prepareGenerationConfig = async config => {
+        const eligibleInjectionIds = []
+        for (const item of snapshot.scriptInjections || []) {
+          const filter = injectionFilters.get(String(item.id))
+          if (typeof filter !== 'function') {
+            if (item.hasFilter !== true) eligibleInjectionIds.push(String(item.id))
+            continue
+          }
+          if (await filter()) eligibleInjectionIds.push(String(item.id))
+        }
+        return { ...clone(config || {}), __dshEligibleInjectionIds: eligibleInjectionIds }
+      }
+      const runGeneration = async (mode, config = {}) => {
+        const prepared = await prepareGenerationConfig(config)
+        const generationId = String(prepared.generation_id || `dsh-generation-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+        prepared.generation_id = generationId
+        if (activeGenerations.has(generationId)) throw new Error(`generation ${generationId} is already active`)
+        activeGenerations.add(generationId)
+        try {
+          const result = await rpc('generate', { mode, config: prepared }, 5 * 60 * 1000)
+          const onceIds = (snapshot.scriptInjections || []).filter(item => item.once === true && prepared.__dshEligibleInjectionIds.includes(String(item.id))).map(item => String(item.id))
+          if (onceIds.length > 0) uninjectPrompts(onceIds)
+          return result
+        } finally { activeGenerations.delete(generationId) }
+      }
+      const generate = config => runGeneration('preset', config)
+      const generateRaw = config => runGeneration('raw', config)
+      const stopGenerationById = generationId => {
+        const id = String(generationId ?? '')
+        if (!activeGenerations.has(id)) return false
+        void rpc('stopGeneration', { generationId: id }).catch(reportWriteError)
+        return true
+      }
+      const stopAllGeneration = () => {
+        if (activeGenerations.size === 0) return false
+        void rpc('stopAllGeneration').catch(reportWriteError)
+        return true
+      }
+      const getModelList = customApi => rpc('getModelList', { provider: String(customApi?.source || '') })
+      const macroLikes = []
+      const namedMacros = new Map()
+      const registerMacroLike = (regex, replace) => {
+        if (!(regex instanceof RegExp) && Object.prototype.toString.call(regex) !== '[object RegExp]') throw new TypeError('macro regex must be a RegExp')
+        if (typeof replace !== 'function') throw new TypeError('macro replacement must be a function')
+        if (!macroLikes.some(item => item.regex.source === regex.source)) macroLikes.push({ regex: new RegExp(regex.source, regex.flags), replace })
+        let active = true
+        return Object.freeze({ unregister() { if (!active) return; active = false; unregisterMacroLike(regex) } })
+      }
+      const unregisterMacroLike = regex => {
+        if (!(regex instanceof RegExp) && Object.prototype.toString.call(regex) !== '[object RegExp]') throw new TypeError('macro regex must be a RegExp')
+        const index = macroLikes.findIndex(item => item.regex.source === regex.source)
+        if (index >= 0) macroLikes.splice(index, 1)
+      }
+      const macroContext = extra => {
+        const messageId = currentMessageIndex()
+        return { ...(messageId >= 0 ? { message_id: messageId } : {}), ...extra }
+      }
+      const substituteParams = (input, userName, characterName) => {
+        let text = String(input ?? '')
+        const builtin = {
+          user: String(userName ?? snapshot.context?.name1 ?? snapshot.persona?.name ?? 'User'),
+          char: String(characterName ?? snapshot.context?.name2 ?? snapshot.character?.nickname ?? snapshot.character?.name ?? 'Character'),
+          lastMessageId: String(Math.max(-1, (snapshot.messages || []).length - 1)),
+          lastMessage: String((snapshot.messages || []).at(-1)?.message ?? ''),
+        }
+        text = text.replace(/{{\s*([^{}]+?)\s*}}/g, (substring, key) => {
+          const name = String(key).trim()
+          if (Object.hasOwn(builtin, name)) return builtin[name]
+          const registered = namedMacros.get(name)
+          if (registered === undefined) return substring
+          return typeof registered === 'function' ? String(registered('')) : String(registered)
+        })
+        const contextValue = macroContext({})
+        for (const item of macroLikes) {
+          const regex = new RegExp(item.regex.source, item.regex.flags)
+          text = text.replace(regex, (substring, ...args) => String(item.replace(contextValue, substring, ...args)))
+        }
+        return text
+      }
+      const registerMacro = (key, value) => { namedMacros.set(String(key), value) }
+      const unregisterMacro = key => { namedMacros.delete(String(key)) }
+      const pathParts = path => {
+        if (Array.isArray(path)) return path.map(String)
+        const parts = []
+        String(path ?? '').replace(/[^.[\]]+|\[(?:(['"])((?:(?!\1)[^\\]|\\.)*?)\1|([^\]]*))\]/g, (match, quote, quoted, bare) => {
+          parts.push(String(quote ? quoted.replace(/\\(['"\\])/g, '$1') : bare === undefined ? match : bare.trim()))
+          return match
+        })
+        return parts
+      }
+      const lodashGet = (object, path, fallback) => {
+        let value = object
+        for (const key of pathParts(path)) {
+          if (value === null || value === undefined || !Object.hasOwn(Object(value), key)) return fallback
+          value = value[key]
+        }
+        return value
+      }
+      const lodashSet = (object, path, value) => {
+        const parts = pathParts(path)
+        let target = object
+        for (let index = 0; index < parts.length; index += 1) {
+          const key = parts[index]
+          if (index === parts.length - 1) target[key] = value
+          else {
+            const nextArray = /^\d+$/.test(parts[index + 1])
+            if (target[key] === null || typeof target[key] !== 'object') target[key] = nextArray ? [] : {}
+            target = target[key]
+          }
+        }
+        return object
+      }
+      const lodashUnset = (object, path) => {
+        const parts = pathParts(path)
+        let target = object
+        for (const key of parts.slice(0, -1)) {
+          if (target === null || typeof target !== 'object' || !Object.hasOwn(target, key)) return true
+          target = target[key]
+        }
+        return parts.length === 0 || target === null || typeof target !== 'object' ? true : delete target[parts.at(-1)]
+      }
+      const lodashMerge = (target, ...sources) => {
+        for (const source of sources) {
+          if (source === null || typeof source !== 'object') continue
+          for (const [key, value] of Object.entries(source)) {
+            if (Array.isArray(value)) target[key] = clone(value)
+            else if (value !== null && typeof value === 'object') target[key] = lodashMerge(target[key] !== null && typeof target[key] === 'object' && !Array.isArray(target[key]) ? target[key] : {}, value)
+            else target[key] = value
+          }
+        }
+        return target
+      }
+      const lodash = value => {
+        let current = value
+        const chain = {
+          assign(...values) { current = Object.assign(current, ...values); return chain },
+          map(fn) { current = Array.from(current || []).map(fn); return chain },
+          sortBy(key) { current = Array.from(current || []).sort((left, right) => String(lodashGet(left, key, '')).localeCompare(String(lodashGet(right, key, '')))); return chain },
+          values() { current = Object.values(current || {}); return chain },
+          reject(fn) { current = Array.from(current || []).filter((item, index) => !fn(item, index)); return chain },
+          value() { return current },
+        }
+        return chain
+      }
+      Object.assign(lodash, {
+        get: lodashGet, set: lodashSet, unset: lodashUnset, has: (object, path) => lodashGet(object, path, Symbol.for('missing')) !== Symbol.for('missing'),
+        cloneDeep: clone, merge: lodashMerge, assign: Object.assign, isPlainObject: value => value !== null && typeof value === 'object' && !Array.isArray(value),
+        inRange: (value, start, end) => value >= Math.min(start, end === undefined ? 0 : start) && value < Math.max(start, end === undefined ? start : end),
+        times: (count, fn) => Array.from({ length: Math.max(0, Number(count) || 0) }, (_, index) => fn(index)), constant: value => () => value,
+        range: (start, end) => { if (end === undefined) { end = start; start = 0 } return Array.from({ length: Math.max(0, end - start) }, (_, index) => start + index) },
+        toString: value => value == null ? '' : String(value), random: (min, max) => Math.floor(Math.random() * (max - min + 1)) + min,
+        concat: (...values) => values.flat(), isNull: value => value === null, pick: (object, keys) => Object.fromEntries(keys.filter(key => Object.hasOwn(object || {}, key)).map(key => [key, object[key]])),
+        omitBy: (object, fn) => Object.fromEntries(Object.entries(object || {}).filter(([key, value]) => !fn(value, key))), clamp: (value, min, max) => Math.min(max, Math.max(min, value)),
+      })
+      const jquery = selector => {
+        const nodes = selector === undefined || selector === null ? [] : selector === root || selector?.nodeType ? [selector] : Array.isArray(selector) ? selector.filter(Boolean) : Array.from(root.document.querySelectorAll(String(selector)))
+        const wrapper = {
+          length: nodes.length,
+          get: index => nodes[index],
+          each(fn) { nodes.forEach((node, index) => fn.call(node, index, node)); return wrapper },
+          find(query) { return jquery(nodes.flatMap(node => Array.from(node.querySelectorAll(query)))) },
+          val(value) { if (arguments.length === 0) return nodes[0]?.value; nodes.forEach(node => { node.value = value }); return wrapper },
+          prop(name, value) { if (arguments.length === 1) return nodes[0]?.[name]; nodes.forEach(node => { node[name] = value }); return wrapper },
+          attr(name, value) { if (arguments.length === 1) return nodes[0]?.getAttribute?.(name); nodes.forEach(node => node.setAttribute?.(name, value)); return wrapper },
+          text(value) { if (arguments.length === 0) return nodes[0]?.textContent; nodes.forEach(node => { node.textContent = value }); return wrapper },
+          html(value) { if (arguments.length === 0) return nodes[0]?.innerHTML; nodes.forEach(node => { node.innerHTML = value }); return wrapper },
+          append(value) { nodes.forEach(node => node.insertAdjacentHTML?.('beforeend', String(value))); return wrapper },
+          on(name, handler) { nodes.forEach(node => node.addEventListener?.(name, handler)); return wrapper },
+          off(name, handler) { nodes.forEach(node => node.removeEventListener?.(name, handler)); return wrapper },
+          trigger(name) { nodes.forEach(node => node.dispatchEvent?.(new Event(name, { bubbles: true }))); return wrapper },
+          click(handler) { if (handler) return wrapper.on('click', handler); nodes.forEach(node => node.click?.()); return wrapper },
+          focus() { nodes[0]?.focus?.(); return wrapper },
+          add(other) { return jquery([...nodes, ...(other?.get ? Array.from({ length: other.length }, (_, index) => other.get(index)) : [])]) },
+          addClass(name) { nodes.forEach(node => node.classList?.add(...String(name).split(/\s+/))); return wrapper },
+          removeClass(name) { nodes.forEach(node => node.classList?.remove(...String(name).split(/\s+/))); return wrapper },
+          data(name, value) { if (arguments.length === 1) return nodes[0]?.dataset?.[name]; nodes.forEach(node => { if (node.dataset) node.dataset[name] = value }); return wrapper },
+        }
+        nodes.forEach((node, index) => { wrapper[index] = node })
+        return wrapper
+      }
+      const toast = level => (message, title) => { console[level === 'error' ? 'error' : level === 'warning' ? 'warn' : 'log'](`[${title || level}] ${String(message ?? '')}`); return null }
+      const toastr = Object.freeze({ success: toast('success'), info: toast('info'), warning: toast('warning'), error: toast('error'), clear() {} })
+      const POPUP_TYPE = Object.freeze({ TEXT: 1, CONFIRM: 2, INPUT: 3, DISPLAY: 4, CROP: 5 })
+      const POPUP_RESULT = Object.freeze({ AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: -1, CUSTOM1: 2, CUSTOM2: 3, CUSTOM3: 4, CUSTOM4: 5, CUSTOM5: 6, CUSTOM6: 7, CUSTOM7: 8, CUSTOM8: 9, CUSTOM9: 10 })
+      const popupText = content => typeof content === 'string' ? content : content?.textContent ?? String(content ?? '')
+      const callGenericPopup = async (content, type, inputValue) => type === POPUP_TYPE.CONFIRM ? root.confirm(popupText(content)) : type === POPUP_TYPE.INPUT ? root.prompt(popupText(content), inputValue ?? '') ?? undefined : (root.alert(popupText(content)), POPUP_RESULT.AFFIRMATIVE)
+      class Popup {
+        constructor(content, type = POPUP_TYPE.TEXT, inputValue = '', options = {}) {
+          this.content = content
+          this.type = type
+          this.inputValue = inputValue
+          this.options = options
+          this.result = POPUP_RESULT.CANCELLED
+          this.value = inputValue
+          this.dlg = null
+        }
+        async show() {
+          const value = await callGenericPopup(this.content, this.type, this.inputValue, this.options)
+          this.value = value
+          this.result = value === false || value === undefined ? POPUP_RESULT.NEGATIVE : value === true ? POPUP_RESULT.AFFIRMATIVE : value
+          return value
+        }
+        complete(result = POPUP_RESULT.AFFIRMATIVE) { this.result = result; return result }
+        static showConfirm(header, text) { return callGenericPopup([header, text].filter(Boolean).join('\n'), POPUP_TYPE.CONFIRM) }
+        static showInput(header, text, inputValue = '') { return callGenericPopup([header, text].filter(Boolean).join('\n'), POPUP_TYPE.INPUT, inputValue) }
+        static showText(header, text) { return callGenericPopup([header, text].filter(Boolean).join('\n'), POPUP_TYPE.TEXT) }
+      }
+      const copyText = text => {
+        if (root.navigator.clipboard?.writeText) return root.navigator.clipboard.writeText(String(text))
+        const area = root.document.createElement('textarea'); area.value = String(text); root.document.body.append(area); area.select(); root.document.execCommand('copy'); area.remove()
+      }
+      const audioState = Object.fromEntries(['bgm', 'ambient'].map(type => [type, { playlist: [], src: '', playing: false, progress: 0, settings: { enabled: true, mode: 'repeat', muted: false, volume: 100 }, element: null }]))
+      const audioStore = type => { if (!audioState[type]) throw new TypeError('audio type must be bgm or ambient'); return audioState[type] }
+      const audioTitle = url => String(url).split('/').at(-1)?.split('.').at(0) || String(url)
+      const playAudio = (type, audio) => {
+        const store = audioStore(type); const item = { title: audio?.title || audioTitle(audio?.url), url: String(audio?.url || '') }; const existing = store.playlist.find(entry => entry.title === item.title || entry.url === item.url)
+        if (existing) Object.assign(existing, item); else store.playlist.push(item); store.src = item.url; store.progress = 0; store.playing = true
+        store.element?.pause?.(); store.element = new root.Audio(item.url); store.element.loop = store.settings.mode === 'repeat'; store.element.muted = store.settings.muted; store.element.volume = store.settings.volume / 100; void store.element.play().catch(() => { store.playing = false })
+      }
+      const pauseAudio = type => { const store = audioStore(type); store.playing = false; store.element?.pause?.() }
+      const getAudioList = type => clone(audioStore(type).playlist)
+      const replaceAudioList = (type, list) => { audioStore(type).playlist = (list || []).map(item => ({ title: item.title || audioTitle(item.url), url: String(item.url || '') })) }
+      const appendAudioList = (type, list) => { audioStore(type).playlist.push(...(list || []).map(item => ({ title: item.title || audioTitle(item.url), url: String(item.url || '') }))) }
+      const getAudioSettings = type => clone(audioStore(type).settings)
+      const setAudioSettings = (type, settings) => { const store = audioStore(type); Object.assign(store.settings, clone(settings || {})); store.settings.volume = lodash.clamp(Number(store.settings.volume), 0, 100); if (store.element) { store.element.muted = store.settings.muted; store.element.volume = store.settings.volume / 100 } }
+      const getCurrentAudio = type => { const store = audioStore(type); return { src: store.src, title: store.playlist.find(item => item.url === store.src)?.title ?? '', playing: store.playing, progress: store.element?.currentTime ?? store.progress } }
+      const extensionSettings = {}
+      const context = {
+        chat,
+        characters,
+        groups: [],
+        name1: 'User',
+        name2: 'Character',
+        characterId: null,
+        groupId: null,
+        chatId: String(snapshot.sessionId || ''),
+        chatMetadata,
+        extensionSettings,
+        eventSource,
+        eventTypes: null,
+        getCurrentChatId: () => context.chatId,
+        substituteParams,
+        substituteParamsExtended: substituteParams,
+        registerMacro,
+        unregisterMacro,
+        saveSettingsDebounced: () => worldbookRpc({ action: 'save-extension-settings', settings: clone(extensionSettings), expectedRevision: snapshot.variableRevisions?.workspace }),
+        callGenericPopup,
+        Popup,
+        POPUP_TYPE,
+        POPUP_RESULT,
+        t: (strings, ...values) => Array.isArray(strings?.raw) ? strings.reduce((text, item, index) => text + item + (values[index] ?? ''), '') : String(strings ?? ''),
+        translate: text => String(text ?? ''),
+        getCurrentLocale: () => root.navigator.language || 'en',
+        isMobile: () => /Android|iPhone|iPad|Mobile/i.test(root.navigator.userAgent),
+        uuidv4: () => root.crypto?.randomUUID?.() || `dsh-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      }
+      const syncContext = () => {
+        assignArray(chat, snapshot.messages)
+        assignArray(characters, snapshot.characterCard ? [snapshot.characterCard] : [])
+        assignObject(chatMetadata, snapshot.context?.chatMetadata)
+        assignObject(extensionSettings, snapshot.extensionSettings)
+        context.name1 = String(snapshot.context?.name1 || snapshot.persona?.name || 'User')
+        context.name2 = String(snapshot.context?.name2 || snapshot.character?.nickname || snapshot.character?.name || 'Character')
+        context.characterId = snapshot.context?.characterId ?? snapshot.cardRecord?.id ?? null
+        context.chatId = String(snapshot.context?.chatId || snapshot.sessionId || '')
+      }
+      const getState = () => clone(snapshot.state || null)
+      const getCharacterCard = () => clone(snapshot.characterCard || null)
+      const getCurrentWorldbook = () => clone(snapshot.worldbook || null)
+      const unavailable = (name, reason) => () => { throw new CompatibilityUnavailableError(name, reason) }
+      const getLastMessageId = () => (snapshot.messages || []).length - 1
+      const chatRangeIds = range => {
+        const length = (snapshot.messages || []).length
+        if (range === undefined) range = '0-{{lastMessageId}}'
+        if (typeof range === 'number') {
+          if (!Number.isSafeInteger(range)) throw new TypeError('message range must be a safe integer')
+          const id = range < 0 ? length + range : range
+          return id >= 0 && id < length ? [id] : []
+        }
+        const expanded = String(range).trim().replaceAll('{{lastMessageId}}', String(length - 1))
+        if (/^-?\d+$/.test(expanded)) return chatRangeIds(Number(expanded))
+        const match = expanded.match(/^(-?\d+)\s*-\s*(-?\d+)$/)
+        if (!match) throw new TypeError(`invalid message range ${range}`)
+        const begin = Number(match[1]) < 0 ? length + Number(match[1]) : Number(match[1])
+        const end = Number(match[2]) < 0 ? length + Number(match[2]) : Number(match[2])
+        if (begin > end) throw new RangeError('message range start must not exceed its end')
+        const ids = []
+        for (let id = Math.max(0, begin); id <= Math.min(length - 1, end); id += 1) ids.push(id)
+        return ids
+      }
+      const getChatMessages = (range, options = {}) => {
+        const role = options.role || 'all'
+        const hideState = options.hide_state || 'all'
+        if (!['all', 'system', 'assistant', 'user'].includes(role)) throw new TypeError('invalid role filter')
+        if (!['all', 'hidden', 'unhidden'].includes(hideState)) throw new TypeError('invalid hide_state filter')
+        return chatRangeIds(range).map(id => snapshot.messages[id]).filter(Boolean)
+          .filter(item => role === 'all' || item.role === role)
+          .filter(item => hideState === 'all' || (hideState === 'hidden') === (item.is_hidden === true))
+          .map(item => options.include_swipes === true ? {
+            message_id: item.message_id,
+            name: String(item.name || (item.role === 'user' ? 'User' : item.role === 'system' ? 'System' : 'Character')),
+            role: item.role,
+            is_hidden: item.is_hidden === true,
+            swipe_id: Number(item.swipe_id || 0),
+            swipes: clone(item.swipes || [item.message ?? item.mes ?? item.text ?? '']),
+            swipes_data: clone(item.swipes_data || [item.data || {}]),
+            swipes_info: clone(item.swipes_info || [item.extra || {}]),
+          } : {
+            message_id: item.message_id,
+            name: String(item.name || (item.role === 'user' ? 'User' : item.role === 'system' ? 'System' : 'Character')),
+            role: item.role,
+            is_hidden: item.is_hidden === true,
+            message: String(item.message ?? item.mes ?? item.text ?? ''),
+            data: clone(item.data || {}),
+            extra: clone(item.extra || {}),
+          })
+      }
+      const mutateChat = mutation => rpc('mutateChat', { mutation }).then(() => undefined)
+      const setChatMessages = async (messages, options = {}) => {
+        if (metadata?.scriptId === 'opening-html' && (messages || []).some(item => Number(item?.message_id) === 0 && Number.isSafeInteger(Number(item?.swipe_id)))) {
+          const selection = await rpc('setChatMessages', { messages: clone(messages || []) })
+          await rpc('commitSwipe', { swipe_id: selection?.swipe_id })
+          return
+        }
+        await mutateChat({ action: 'set', messages: clone(messages || []), options: clone(options) })
+      }
+      const createChatMessages = (messages, options = {}) => mutateChat({ action: 'create', messages: clone(messages || []), options: clone(options) })
+      const deleteChatMessages = (messageIds, options = {}) => mutateChat({ action: 'delete', messageIds: clone(messageIds || []), options: clone(options) })
+      const rotateChatMessages = (begin, middle, end, options = {}) => mutateChat({ action: 'rotate', begin, middle, end, options: clone(options) })
+      const refreshOneMessage = async messageId => { await dispatch((snapshot.messages || [])[messageId]?.role === 'user' ? 'user_message_rendered' : 'character_message_rendered', [messageId, 'normal']) }
+      const triggerSlash = command => rpc('triggerSlash', { command: String(command ?? '') })
+      const worldbookRevisions = new Map()
+      const worldbookRpc = request => rpc('worldbook', { request })
+      const getWorldbookNames = () => clone(snapshot.worldbookNames || [])
+      const getWorldbookSnapshot = async name => {
+        const value = await worldbookRpc({ action: 'get', name: String(name) })
+        worldbookRevisions.set(String(name), Number(value.revision || 0))
+        return value
+      }
+      const getWorldbook = async name => clone((await getWorldbookSnapshot(name)).worldbook || [])
+      const createWorldbook = (name, entries = []) => worldbookRpc({ action: 'create', name: String(name), entries: clone(entries) })
+      const createOrReplaceWorldbook = async (name, entries = [], options = {}) => {
+        const key = String(name)
+        const value = await worldbookRpc({ action: 'create-or-replace', name: key, entries: clone(entries), expectedRevision: worldbookRevisions.get(key), options: clone(options) })
+        worldbookRevisions.delete(key)
+        return value
+      }
+      const replaceWorldbook = async (name, entries, options = {}) => {
+        const key = String(name)
+        const value = await worldbookRpc({ action: 'replace', name: key, entries: clone(entries), expectedRevision: worldbookRevisions.get(key), options: clone(options) })
+        worldbookRevisions.set(key, Number(value.revision || 0))
+      }
+      const updateWorldbookWith = async (name, updater, options = {}) => {
+        if (typeof updater !== 'function') throw new TypeError('updateWorldbookWith expects an updater function')
+        const current = await getWorldbook(name)
+        const next = await updater(clone(current))
+        await replaceWorldbook(name, next, options)
+        return getWorldbook(name)
+      }
+      const createWorldbookEntries = async (name, entries, options = {}) => {
+        const key = String(name)
+        if (!worldbookRevisions.has(key)) await getWorldbookSnapshot(key)
+        const value = await worldbookRpc({ action: 'create-entries', name: key, entries: clone(entries), expectedRevision: worldbookRevisions.get(key), options: clone(options) })
+        worldbookRevisions.set(key, Number(value.revision || 0))
+        return clone({ worldbook: value.worldbook, new_entries: value.new_entries })
+      }
+      const deleteWorldbookEntries = async (name, predicate, options = {}) => {
+        if (typeof predicate !== 'function') throw new TypeError('deleteWorldbookEntries expects a predicate function')
+        const key = String(name)
+        const current = await getWorldbookSnapshot(key)
+        const deleted = current.worldbook.filter(predicate)
+        const value = await worldbookRpc({ action: 'delete-entries', name: key, uids: deleted.map(item => item.uid), expectedRevision: current.revision, options: clone(options) })
+        worldbookRevisions.set(key, Number(value.revision || 0))
+        return clone({ worldbook: value.worldbook, deleted_entries: value.deleted_entries })
+      }
+      const deleteWorldbook = async name => {
+        const key = String(name)
+        const value = await worldbookRpc({ action: 'delete', name: key, expectedRevision: worldbookRevisions.get(key) })
+        worldbookRevisions.delete(key)
+        return value
+      }
+      const getGlobalWorldbookNames = () => clone(snapshot.globalWorldbooks || snapshot.lorebookSettings?.selected_global_lorebooks || [])
+      const rebindGlobalWorldbooks = names => worldbookRpc({ action: 'rebind-global', names: clone(names || []), expectedRevision: snapshot.variableRevisions?.workspace })
+      const getCharWorldbookNames = name => {
+        if (name !== undefined && name !== 'current' && name !== snapshot.character?.name && name !== snapshot.character?.nickname) throw new Error(`character '${String(name)}' is unavailable in the current DSH session`)
+        return clone(snapshot.characterWorldbooks?.[String(snapshot.cardRecord?.id || '')] || { primary: null, additional: [] })
+      }
+      const rebindCharWorldbooks = (name, worldbooks) => {
+        if (name !== 'current') throw new Error('only the current character can be rebound')
+        return worldbookRpc({ action: 'rebind-character', worldbooks: clone(worldbooks || {}), expectedRevision: snapshot.variableRevisions?.workspace })
+      }
+      const getChatWorldbookName = name => {
+        if (name !== 'current') throw new Error('only the current chat is available')
+        return snapshot.state?.binding?.worldbookExplicit === true ? snapshot.chatWorldbookName : null
+      }
+      const rebindChatWorldbook = (name, worldbookName) => {
+        if (name !== 'current') throw new Error('only the current chat is available')
+        return worldbookRpc({ action: 'rebind-chat', name: worldbookName, bindingRevision: snapshot.bindingRevision })
+      }
+      const getOrCreateChatWorldbook = (name, worldbookName) => {
+        if (name !== 'current') throw new Error('only the current chat is available')
+        return worldbookRpc({ action: 'get-or-create-chat', name: worldbookName })
+      }
+      const getLorebookSettings = () => clone(snapshot.lorebookSettings || {})
+      const setLorebookSettings = settings => {
+        snapshot.lorebookSettings = { ...(snapshot.lorebookSettings || {}), ...clone(settings || {}) }
+        syncContext()
+        void worldbookRpc({ action: 'set-lorebook-settings', settings: clone(settings || {}), expectedRevision: snapshot.variableRevisions?.workspace }).catch(reportWriteError)
+      }
+      const regexSources = () => ({
+        global: clone(snapshot.state?.globalRegexScripts || []),
+        preset: clone(snapshot.state?.presetRegexScripts || []),
+        character: clone((snapshot.cardRecord?.scripts || []).filter(script => script?.kind === 'regex')),
+      })
+      const toTavernRegex = (script, scope) => ({
+        id: String(script?.id || ''),
+        script_name: String(script?.name ?? script?.scriptName ?? ''),
+        enabled: script?.enabled === true && script?.disabled !== true,
+        find_regex: String(script?.findRegex ?? ''),
+        trim_strings: clone(Array.isArray(script?.trimStrings) ? script.trimStrings : []),
+        replace_string: String(script?.source ?? script?.replaceString ?? ''),
+        source: {
+          user_input: script?.placement?.includes(1) === true,
+          ai_output: script?.placement?.includes(2) === true,
+          slash_command: script?.placement?.includes(3) === true,
+          world_info: script?.placement?.includes(5) === true,
+          reasoning: script?.placement?.includes(6) === true,
+        },
+        destination: { display: script?.markdownOnly === true, prompt: script?.promptOnly === true },
+        run_on_edit: script?.runOnEdit === true,
+        min_depth: Number.isFinite(script?.minDepth) ? Number(script.minDepth) : null,
+        max_depth: Number.isFinite(script?.maxDepth) ? Number(script.maxDepth) : null,
+        ...(scope === undefined ? {} : { scope }),
+      })
+      const fromTavernRegex = (regex, index) => {
+        if (regex === null || typeof regex !== 'object' || Array.isArray(regex)) throw new TypeError(`regexes[${index}] must be an object`)
+        const source = regex.source || {}
+        const destination = regex.destination || {}
+        return {
+          id: String(regex.id || `regex-${Date.now()}-${index}`),
+          name: String(regex.script_name || `未命名-${regex.id || index}`),
+          kind: 'regex',
+          enabled: regex.enabled !== false,
+          source: String(regex.replace_string ?? ''),
+          findRegex: String(regex.find_regex ?? ''),
+          trimStrings: clone(Array.isArray(regex.trim_strings) ? regex.trim_strings : []),
+          placement: [source.user_input ? 1 : null, source.ai_output ? 2 : null, source.slash_command ? 3 : null, source.world_info ? 5 : null, source.reasoning ? 6 : null].filter(Number.isSafeInteger),
+          markdownOnly: destination.display === true,
+          promptOnly: destination.prompt === true,
+          runOnEdit: regex.run_on_edit === true,
+          substituteRegex: 0,
+          minDepth: Number.isFinite(regex.min_depth) ? Number(regex.min_depth) : null,
+          maxDepth: Number.isFinite(regex.max_depth) ? Number(regex.max_depth) : null,
+        }
+      }
+      const assertCurrentCharacter = name => {
+        if (name === undefined || name === 'current' || name === snapshot.character?.name || name === snapshot.character?.nickname) return
+        throw new Error(`character '${String(name)}' is unavailable in the current DSH session`)
+      }
+      const assertCurrentPreset = name => {
+        if (name === undefined || name === 'in_use') return
+        throw new Error(`preset '${String(name)}' is unavailable in the current DSH session`)
+      }
+      const getTavernRegexes = option => {
+        const sources = regexSources()
+        if (option?.type === undefined) {
+          const scope = option?.scope || 'all'
+          const enableState = option?.enable_state || 'all'
+          if (!['all', 'global', 'character'].includes(scope)) throw new Error(`invalid regex scope '${scope}'`)
+          if (!['all', 'enabled', 'disabled'].includes(enableState)) throw new Error(`invalid regex enable_state '${enableState}'`)
+          let values = [
+            ...(scope === 'all' || scope === 'global' ? sources.global.map(script => toTavernRegex(script, 'global')) : []),
+            ...(scope === 'all' || scope === 'character' ? sources.character.map(script => toTavernRegex(script, 'character')) : []),
+          ]
+          if (enableState !== 'all') values = values.filter(regex => regex.enabled === (enableState === 'enabled'))
+          return values
+        }
+        if (option.type === 'global') return sources.global.map(script => toTavernRegex(script))
+        if (option.type === 'preset') { assertCurrentPreset(option.name); return sources.preset.map(script => toTavernRegex(script)) }
+        if (option.type === 'character') { assertCurrentCharacter(option.name); return sources.character.map(script => toTavernRegex(script)) }
+        throw new TypeError(`unknown regex source '${String(option.type)}'`)
+      }
+      const replaceTavernRegexes = async (regexes, option) => {
+        if (!Array.isArray(regexes)) throw new TypeError('replaceTavernRegexes expects an array')
+        for (const regex of regexes) if (regex && regex.script_name === '') regex.script_name = `未命名-${regex.id}`
+        const changes = {}
+        if (option?.type === undefined) {
+          const scope = option?.scope || 'all'
+          if (!['all', 'global', 'character'].includes(scope)) throw new Error(`invalid regex scope '${scope}'`)
+          if (scope === 'all' || scope === 'global') changes.global = regexes.filter(regex => regex?.scope === 'global').map(fromTavernRegex)
+          if (scope === 'all' || scope === 'character') changes.character = regexes.filter(regex => regex?.scope !== 'global').map(fromTavernRegex)
+        } else if (option.type === 'global') changes.global = regexes.map(fromTavernRegex)
+        else if (option.type === 'preset') { assertCurrentPreset(option.name); changes.preset = regexes.map(fromTavernRegex) }
+        else if (option.type === 'character') { assertCurrentCharacter(option.name); changes.character = regexes.map(fromTavernRegex) }
+        else throw new TypeError(`unknown regex source '${String(option.type)}'`)
+        if (Object.hasOwn(changes, 'global')) { snapshot.state ||= {}; snapshot.state.globalRegexScripts = clone(changes.global) }
+        if (Object.hasOwn(changes, 'preset')) { snapshot.state ||= {}; snapshot.state.presetRegexScripts = clone(changes.preset) }
+        if (Object.hasOwn(changes, 'character') && snapshot.cardRecord) {
+          let index = 0
+          snapshot.cardRecord.scripts = (snapshot.cardRecord.scripts || []).flatMap(script => script?.kind === 'regex' ? index < changes.character.length ? [changes.character[index++]] : [] : [script])
+          snapshot.cardRecord.scripts.push(...changes.character.slice(index))
+        }
+        await rpc('replaceRegexes', { changes })
+      }
+      const updateTavernRegexesWith = async (updater, option) => {
+        if (typeof updater !== 'function') throw new TypeError('updateTavernRegexesWith expects an updater function')
+        const regexes = await updater(getTavernRegexes(option))
+        await replaceTavernRegexes(regexes, option)
+        return regexes
+      }
+      const regexFromString = value => {
+        const text = String(value ?? '')
+        if (!text.startsWith('/')) return null
+        let end = text.length - 1
+        while (end > 0 && /[dgimsuvy]/.test(text[end])) end -= 1
+        if (text[end] !== '/') return null
+        return new RegExp(text.slice(1, end), text.slice(end + 1))
+      }
+      const escapeRegexMacro = value => String(value).replace(/[\n\r\t\v\f\0.^$*+?{}[\]\\/|()]/gs, character => ({ '\n': '\\n', '\r': '\\r', '\t': '\\t', '\v': '\\v', '\f': '\\f', '\0': '\\0' })[character] || `\\${character}`)
+      const formatAsTavernRegexedString = (input, source, destination, options = {}) => {
+        const placement = { user_input: 1, ai_output: 2, slash_command: 3, world_info: 5, reasoning: 6 }[source]
+        if (placement === undefined) throw new TypeError(`unknown regex source '${String(source)}'`)
+        if (!['display', 'prompt'].includes(destination)) throw new TypeError(`unknown regex destination '${String(destination)}'`)
+        const original = String(input ?? '')
+        let text = original
+        for (const script of [...regexSources().global, ...regexSources().preset, ...regexSources().character]) {
+          if (script?.enabled !== true || script?.disabled === true || !script?.placement?.includes(placement)) continue
+          if (destination === 'display' ? script.markdownOnly !== true : script.promptOnly !== true) continue
+          const depth = options.depth
+          if (Number.isFinite(depth) && Number.isFinite(script.minDepth) && script.minDepth >= -1 && depth < script.minDepth) continue
+          if (Number.isFinite(depth) && Number.isFinite(script.maxDepth) && script.maxDepth >= 0 && depth > script.maxDepth) continue
+          let pattern = String(script.findRegex ?? '')
+          if (Number(script.substituteRegex) === 1) pattern = substituteParams(pattern, undefined, options.character_name)
+          else if (Number(script.substituteRegex) === 2) pattern = pattern.replace(/{{\s*([^{}]+?)\s*}}/g, token => escapeRegexMacro(substituteParams(token, undefined, options.character_name)))
+          const matcher = regexFromString(pattern)
+          if (!matcher || text === '') continue
+          const replacement = String(script.source ?? script.replaceString ?? '').replace(/{{match}}/gi, '$0')
+          text = text.replace(matcher, function () {
+            const args = [...arguments]
+            return substituteParams(replacement.replace(/\$(\d+)|\$<([^>]+)>/g, (_token, number, groupName) => {
+              const groups = args.at(-1)
+              const value = number ? args[Number(number)] : groups && typeof groups === 'object' ? groups[groupName] : undefined
+              if (!value) return ''
+              let trimmed = String(value)
+              for (const rawTrim of script.trimStrings || []) trimmed = trimmed.replaceAll(substituteParams(rawTrim, undefined, options.character_name), '')
+              return trimmed
+            }), undefined, options.character_name)
+          })
+        }
+        return substituteParams(text, undefined, options.character_name)
+      }
+      const isCharacterTavernRegexesEnabled = () => snapshot.cardRecord !== null && snapshot.cardRecord !== undefined
+      const getCompatibility = () => clone(snapshot.compatibility || {})
+      const dsh = Object.freeze({ getState, getCharacterCard, getCurrentWorldbook, memory: operation => rpc('memory', { operation }), flushWrites: () => rpc('flushWrites') })
+      const helper = {
+        compatibility: deepFreeze(clone(snapshot.compatibility || {})),
+        getCompatibility,
+        getTavernHelperVersion: () => '4.9.3',
+        getScriptId: () => metadata?.scriptId || channel,
+        getVariables, replaceVariables, updateVariablesWith, insertOrAssignVariables, insertVariables, deleteVariable, getAllVariables,
+        injectPrompts, uninjectPrompts,
+        eventOn, eventMakeFirst, eventMakeLast, eventOnce, eventEmit, eventEmitAndWait, eventRemoveListener, eventClearEvent, eventClearListener, eventClearAll,
+        getChatMessages, getLastMessageId, setChatMessages, createChatMessages, deleteChatMessages, rotateChatMessages, refreshOneMessage, triggerSlash, triggerSlashWithResult: triggerSlash,
+        getWorldbookNames, getGlobalWorldbookNames, rebindGlobalWorldbooks, getCharWorldbookNames, rebindCharWorldbooks, getChatWorldbookName, rebindChatWorldbook, getOrCreateChatWorldbook,
+        getWorldbook, createWorldbook, createOrReplaceWorldbook, deleteWorldbook, replaceWorldbook, updateWorldbookWith, createWorldbookEntries, deleteWorldbookEntries,
+        getLorebookSettings, setLorebookSettings, getLorebooks: getWorldbookNames, getLorebook: getWorldbook, createLorebook: name => createWorldbook(name), deleteLorebook: deleteWorldbook,
+        registerMacroLike, unregisterMacroLike, formatAsTavernRegexedString, getTavernRegexes, replaceTavernRegexes, updateTavernRegexesWith, isCharacterTavernRegexesEnabled,
+        playAudio, pauseAudio, getAudioList, replaceAudioList, appendAudioList, getAudioSettings, setAudioSettings, getCurrentAudio,
+        copyText, callGenericPopup, Popup, POPUP_TYPE, POPUP_RESULT,
+        generate, generateRaw, stopGenerationById, stopAllGeneration, getModelList, getProxyPresetNames: () => (snapshot.state?.templates || []).map(item => String(item.name || item.id)),
+        getState, getCharacterCard,
+        setVariables: variables => { replaceVariables(variables); return dsh.flushWrites() },
+        memory: dsh.memory,
+        dsh,
+      }
+      for (const name of ['executeSlashCommands', 'importRawCharacter', 'registerGlobalMacro']) helper[name] = unavailable(name, 'not implemented by the compatibility runtime')
+      const tavernEvents = Object.freeze({
+        APP_READY: 'app_ready', EXTRAS_CONNECTED: 'extras_connected', MESSAGE_SWIPED: 'message_swiped', MESSAGE_SENT: 'message_sent', MESSAGE_RECEIVED: 'message_received', MESSAGE_EDITED: 'message_edited', MESSAGE_DELETED: 'message_deleted', MESSAGE_UPDATED: 'message_updated', MESSAGE_FILE_EMBEDDED: 'message_file_embedded', MESSAGE_REASONING_EDITED: 'message_reasoning_edited', MESSAGE_REASONING_DELETED: 'message_reasoning_deleted', MESSAGE_SWIPE_DELETED: 'message_swipe_deleted', MORE_MESSAGES_LOADED: 'more_messages_loaded', IMPERSONATE_READY: 'impersonate_ready', CHAT_CHANGED: 'chat_id_changed', GENERATION_AFTER_COMMANDS: 'GENERATION_AFTER_COMMANDS', GENERATION_STARTED: 'generation_started', GENERATION_STOPPED: 'generation_stopped', GENERATION_ENDED: 'generation_ended', SD_PROMPT_PROCESSING: 'sd_prompt_processing', EXTENSIONS_FIRST_LOAD: 'extensions_first_load', EXTENSION_SETTINGS_LOADED: 'extension_settings_loaded', SETTINGS_LOADED: 'settings_loaded', SETTINGS_UPDATED: 'settings_updated', MOVABLE_PANELS_RESET: 'movable_panels_reset', SETTINGS_LOADED_BEFORE: 'settings_loaded_before', SETTINGS_LOADED_AFTER: 'settings_loaded_after', CHATCOMPLETION_SOURCE_CHANGED: 'chatcompletion_source_changed', CHATCOMPLETION_MODEL_CHANGED: 'chatcompletion_model_changed', OAI_PRESET_CHANGED_BEFORE: 'oai_preset_changed_before', OAI_PRESET_CHANGED_AFTER: 'oai_preset_changed_after', OAI_PRESET_EXPORT_READY: 'oai_preset_export_ready', OAI_PRESET_IMPORT_READY: 'oai_preset_import_ready', WORLDINFO_SETTINGS_UPDATED: 'worldinfo_settings_updated', WORLDINFO_UPDATED: 'worldinfo_updated', CHARACTER_EDITOR_OPENED: 'character_editor_opened', CHARACTER_EDITED: 'character_edited', CHARACTER_PAGE_LOADED: 'character_page_loaded', USER_MESSAGE_RENDERED: 'user_message_rendered', CHARACTER_MESSAGE_RENDERED: 'character_message_rendered', FORCE_SET_BACKGROUND: 'force_set_background', CHAT_DELETED: 'chat_deleted', CHAT_CREATED: 'chat_created', GENERATE_BEFORE_COMBINE_PROMPTS: 'generate_before_combine_prompts', GENERATE_AFTER_COMBINE_PROMPTS: 'generate_after_combine_prompts', GENERATE_AFTER_DATA: 'generate_after_data', WORLD_INFO_ACTIVATED: 'world_info_activated', TEXT_COMPLETION_SETTINGS_READY: 'text_completion_settings_ready', CHAT_COMPLETION_SETTINGS_READY: 'chat_completion_settings_ready', CHAT_COMPLETION_PROMPT_READY: 'chat_completion_prompt_ready', CHARACTER_FIRST_MESSAGE_SELECTED: 'character_first_message_selected', CHARACTER_DELETED: 'characterDeleted', CHARACTER_DUPLICATED: 'character_duplicated', CHARACTER_RENAMED: 'character_renamed', CHARACTER_RENAMED_IN_PAST_CHAT: 'character_renamed_in_past_chat', SMOOTH_STREAM_TOKEN_RECEIVED: 'stream_token_received', STREAM_TOKEN_RECEIVED: 'stream_token_received', STREAM_REASONING_DONE: 'stream_reasoning_done', FILE_ATTACHMENT_DELETED: 'file_attachment_deleted', WORLDINFO_FORCE_ACTIVATE: 'worldinfo_force_activate', OPEN_CHARACTER_LIBRARY: 'open_character_library', ONLINE_STATUS_CHANGED: 'online_status_changed', IMAGE_SWIPED: 'image_swiped', CONNECTION_PROFILE_LOADED: 'connection_profile_loaded', CONNECTION_PROFILE_CREATED: 'connection_profile_created', CONNECTION_PROFILE_DELETED: 'connection_profile_deleted', CONNECTION_PROFILE_UPDATED: 'connection_profile_updated', TOOL_CALLS_PERFORMED: 'tool_calls_performed', TOOL_CALLS_RENDERED: 'tool_calls_rendered', CHARACTER_MANAGEMENT_DROPDOWN: 'charManagementDropdown', SECRET_WRITTEN: 'secret_written', SECRET_DELETED: 'secret_deleted', SECRET_ROTATED: 'secret_rotated', SECRET_EDITED: 'secret_edited', PRESET_CHANGED: 'preset_changed', PRESET_DELETED: 'preset_deleted', PRESET_RENAMED: 'preset_renamed', PRESET_RENAMED_BEFORE: 'preset_renamed_before', MAIN_API_CHANGED: 'main_api_changed', WORLDINFO_ENTRIES_LOADED: 'worldinfo_entries_loaded', WORLDINFO_SCAN_DONE: 'worldinfo_scan_done', MEDIA_ATTACHMENT_DELETED: 'media_attachment_deleted',
+      })
+      const iframeEvents = Object.freeze({
+        MESSAGE_IFRAME_RENDER_STARTED: 'message_iframe_render_started', MESSAGE_IFRAME_RENDER_ENDED: 'message_iframe_render_ended', GENERATION_STARTED: 'js_generation_started', STREAM_TOKEN_RECEIVED_FULLY: 'js_stream_token_received_fully', STREAM_TOKEN_RECEIVED_INCREMENTALLY: 'js_stream_token_received_incrementally', GENERATION_ENDED: 'js_generation_ended',
+      })
+      context.eventTypes = tavernEvents
+      const sillyTavern = context
+      sillyTavern.getContext = () => sillyTavern
+      syncContext()
+      root.TavernHelper = helper
+      root.SillyTavern = sillyTavern
+      root.tavern_events = tavernEvents
+      root.event_types = tavernEvents
+      root.iframe_events = iframeEvents
+      root.eventSource = eventSource
+      root._ = lodash
+      root.$ = root.jQuery = jquery
+      root.toastr = toastr
+      root.copyText = copyText
+      root.substituteParams = root.substituteParamsExtended = substituteParams
+      root.extension_settings = extensionSettings
+      for (const name of ['getVariables', 'replaceVariables', 'updateVariablesWith', 'insertOrAssignVariables', 'insertVariables', 'deleteVariable', 'getAllVariables', 'setVariables', 'injectPrompts', 'uninjectPrompts', 'eventOn', 'eventMakeFirst', 'eventMakeLast', 'eventOnce', 'eventEmit', 'eventEmitAndWait', 'eventRemoveListener', 'eventClearEvent', 'eventClearListener', 'eventClearAll', 'getChatMessages', 'getLastMessageId', 'setChatMessages', 'createChatMessages', 'deleteChatMessages', 'rotateChatMessages', 'refreshOneMessage', 'triggerSlash', 'triggerSlashWithResult', 'generate', 'generateRaw', 'stopGenerationById', 'stopAllGeneration', 'getModelList', 'getProxyPresetNames', 'getWorldbookNames', 'getGlobalWorldbookNames', 'rebindGlobalWorldbooks', 'getCharWorldbookNames', 'rebindCharWorldbooks', 'getChatWorldbookName', 'rebindChatWorldbook', 'getOrCreateChatWorldbook', 'getWorldbook', 'createWorldbook', 'createOrReplaceWorldbook', 'deleteWorldbook', 'replaceWorldbook', 'updateWorldbookWith', 'createWorldbookEntries', 'deleteWorldbookEntries', 'getLorebookSettings', 'setLorebookSettings', 'getLorebooks', 'getLorebook', 'createLorebook', 'deleteLorebook', 'registerMacroLike', 'unregisterMacroLike', 'formatAsTavernRegexedString', 'getTavernRegexes', 'replaceTavernRegexes', 'updateTavernRegexesWith', 'isCharacterTavernRegexesEnabled', 'playAudio', 'pauseAudio', 'getAudioList', 'replaceAudioList', 'appendAudioList', 'getAudioSettings', 'setAudioSettings', 'getCurrentAudio', 'copyText', 'callGenericPopup']) root[name] = helper[name]
+      root.Popup = Popup
+      root.POPUP_TYPE = POPUP_TYPE
+      root.POPUP_RESULT = POPUP_RESULT
+      let composerDraft = ''
+      let composerRestore = []
+      let composerQueue = Promise.resolve()
+      const readComposerDraft = () => [...composerRestore, composerDraft].filter(value => value.trim() !== '').join('\n')
+      Object.defineProperty(root, '__dshComposerInput', { configurable: true, value: Object.freeze({
+        get value() { return readComposerDraft() },
+        set value(value) { composerRestore = []; composerDraft = String(value ?? '') },
+        dispatchEvent() {
+          const text = readComposerDraft().trim()
+          if (text === '') return true
+          composerDraft = ''; composerRestore = []
+          composerQueue = composerQueue.then(() => rpc('appendInput', { text })).catch(error => { composerRestore.push(text); console.error('SillyTavern composer bridge failed:', error) })
+          return true
+        },
+        focus() { return true },
+        click() { return this.dispatchEvent() },
+      }) })
+      Object.defineProperty(root, '__dshComposerSend', { configurable: true, value: Object.freeze({ click: () => root.__dshComposerInput.dispatchEvent(), dispatchEvent: () => root.__dshComposerInput.dispatchEvent(), focus: () => true }) })
+      Object.defineProperty(root, '__dshComposerJquery', { configurable: true, value: selector => {
+        const target = selector === '#send_but' ? root.__dshComposerSend : root.__dshComposerInput
+        const wrapper = {
+          0: target,
+          length: 1,
+          val(value) { if (arguments.length === 0) return root.__dshComposerInput.value; root.__dshComposerInput.value = value; return wrapper },
+          trigger() { target.dispatchEvent(); return wrapper },
+          click() { target.click(); return wrapper },
+          focus() { target.focus(); return wrapper },
+        }
+        return wrapper
+      } })
+      root.addEventListener('message', event => {
+        const message = event.data
+        if (event.source !== root.parent || !message || message.__dshSillyTavern !== true || message.channel !== channel) return
+        if (message.replyTo) {
+          const item = pending.get(message.replyTo)
+          if (!item) return
+          pending.delete(message.replyTo)
+          root.clearTimeout(item.timer)
+          message.ok ? item.resolve(message.value) : item.reject(Object.assign(new Error(message.error || 'RPC failed'), { code: message.code }))
+          return
+        }
+        if (message.event === 'compat-state') {
+          const next = message.payload
+          if (!next || Number(next.runtimeRevision) <= Number(snapshot.runtimeRevision || 0)) return
+          snapshot = clone(next)
+          syncContext()
+          return
+        }
+        if (message.event === 'compat-event') {
+          const name = String(message.payload?.name ?? '')
+          const args = Array.isArray(message.payload?.args) ? message.payload.args : []
+          if (name !== '') void dispatch(name, args).catch(error => console.error('[dsh-sillytavern] event listener failed', error))
+        }
+      })
+      root.addEventListener('pagehide', () => {
+        if (ownedInjectionIds.size > 0) {
+          try { root.parent.postMessage({ __dshSillyTavern: true, channel, id: ++seq, action: 'uninjectPrompts', args: { ids: [...ownedInjectionIds] } }, '*') } catch {}
+        }
+        if (activeGenerations.size > 0) {
+          try { root.parent.postMessage({ __dshSillyTavern: true, channel, id: ++seq, action: 'stopAllGeneration', args: {} }, '*') } catch {}
+        }
+        injectionFilters.clear(); ownedInjectionIds.clear(); activeGenerations.clear()
+        disposed = true
+        listeners.clear()
+        for (const item of pending.values()) { root.clearTimeout(item.timer); item.reject(new Error('SillyTavern frame was disposed')) }
+        pending.clear()
+      }, { once: true })
+      root.__dshTavernReady = () => {
+        if (disposed || root.__dshTavernDidReady) return
+        root.__dshTavernDidReady = true
+        if (metadata?.surface === 'message') void dispatch('message_iframe_render_ended', [String(metadata.scriptId || channel)]).catch(error => console.error(error))
+        void dispatch(tavernEvents.APP_READY, []).catch(error => console.error('[dsh-sillytavern] APP_READY listener failed', error))
+        root.parent.postMessage({ __dshSillyTavern: true, channel, event: 'frame-ready' }, '*')
+      }
+      return { dispatch, getSnapshot: () => clone(snapshot) }
+    }
+
+    function inlineJson(value) {
+      return JSON.stringify(value).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+    }
+
+    function compatibilityBootstrap(channel, initialSnapshot, metadata) {
+      return `<script>(${installCompatibilityRuntime.toString()})(window,${inlineJson(initialSnapshot)},${JSON.stringify(channel)},${inlineJson(metadata)})<\/script>`
+    }
+
+    function trustedDocument(script, channel, initialSnapshot, metadata) {
       script = executableScript(script)
-      const bootstrap = `
-<script>
-(() => {
-  const channel = ${JSON.stringify(channel)};
-  let seq = 0;
-  const pending = new Map();
-  const listeners = new Map();
-  let resizeFrame = 0;
-  let resizeObserver;
-  let resizeStarted = false;
-  let lastFrameHeight = -1;
-  const measureFrameHeight = () => {
-    resizeFrame = 0;
-    const root = document.documentElement;
-    const body = document.body;
-    const height = Math.ceil(Math.max(root?.offsetHeight || 0, body?.scrollHeight || 0, body?.offsetHeight || 0));
-    if (!Number.isFinite(height) || height <= 0 || height === lastFrameHeight) return;
-    lastFrameHeight = height;
-    parent.postMessage({ __dshSillyTavern: true, channel, event: 'frame-resize', payload: { height } }, '*');
-  };
-  const scheduleFrameResize = () => {
-    if (resizeFrame !== 0) return;
-    resizeFrame = requestAnimationFrame(measureFrameHeight);
-  };
-  const observeFrameSize = () => {
-    if (resizeStarted) return;
-    resizeStarted = true;
-    scheduleFrameResize();
-    addEventListener('load', scheduleFrameResize, { once: true });
-    document.fonts?.ready?.then(scheduleFrameResize, () => {});
-    if (resizeObserver !== undefined || typeof ResizeObserver !== 'function') return;
-    resizeObserver = new ResizeObserver(scheduleFrameResize);
-    resizeObserver.observe(document.documentElement);
-    if (document.body) resizeObserver.observe(document.body);
-  };
-  const rpc = (action, args = {}) => new Promise((resolve, reject) => {
-    const id = ++seq;
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error('SillyTavern script RPC timed out')); }, 5000);
-    pending.set(id, { resolve, reject, timer });
-    try { parent.postMessage({ __dshSillyTavern: true, channel, id, action, args }, '*'); }
-    catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
-  });
-  let composerDraft = '';
-  let composerRestore = [];
-  let composerQueue = Promise.resolve();
-  const readComposerDraft = () => [...composerRestore, composerDraft].filter(value => value.trim() !== '').join('\\n');
-  Object.defineProperty(window, '__dshComposerInput', { value: Object.freeze({
-    get value() { return readComposerDraft(); },
-    set value(value) { composerRestore = []; composerDraft = String(value ?? ''); },
-    dispatchEvent() {
-      const text = readComposerDraft().trim();
-      if (text === '') return true;
-      composerDraft = ''; composerRestore = [];
-      composerQueue = composerQueue.then(() => rpc('appendInput', { text })).catch(error => {
-        composerRestore.push(text);
-        console.error('SillyTavern composer bridge failed:', error);
-      });
-      return true;
-    },
-    focus() { return true; },
-  }) });
-  addEventListener('message', event => {
-    const msg = event.data;
-    if (event.source !== parent || !msg || msg.__dshSillyTavern !== true || msg.channel !== channel) return;
-    if (msg.replyTo) { const item = pending.get(msg.replyTo); if (!item) return; pending.delete(msg.replyTo); clearTimeout(item.timer); msg.ok ? item.resolve(msg.value) : item.reject(new Error(msg.error || 'RPC failed')); return; }
-    const set = listeners.get(msg.event); if (set) for (const fn of [...set]) fn(msg.payload);
-  });
-  const eventOn = (name, fn) => { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn); return () => listeners.get(name)?.delete(fn); };
-  const eventEmit = (name, payload) => { const set = listeners.get(name); if (set) for (const fn of [...set]) fn(payload); parent.postMessage({ __dshSillyTavern: true, channel, event: name, payload }, '*'); };
-  const getState = () => rpc('getState');
-  window.TavernHelper = {
-    getState,
-    getCharacterCard: async () => (await getState()).card?.card,
-    getWorldbook: () => rpc('getWorldbook'),
-    getVariables: async () => (await getState()).binding?.variables || {},
-    setVariables: variables => rpc('setVariables', { variables }),
-    injectPrompts: injections => rpc('injectPrompts', { injections }),
-    memory: operation => rpc('memory', { operation }),
-    eventOn, eventEmit,
-  };
-  window.getVariables = window.TavernHelper.getVariables;
-  window.setVariables = window.TavernHelper.setVariables;
-  window.injectPrompts = window.TavernHelper.injectPrompts;
-  window.eventOn = eventOn;
-  window.eventEmit = eventEmit;
-  window.tavern_events = { APP_READY: 'app_ready', MESSAGE_RECEIVED: 'message_received', CHARACTER_CHANGED: 'character_changed' };
-  window.__dshTavernReady = () => { observeFrameSize(); eventEmit('app_ready', { source: 'dsh-sillytavern' }); parent.postMessage({ __dshSillyTavern: true, channel, event: 'frame-ready' }, '*'); };
-})();
-<\/script>`
+      const bootstrap = compatibilityBootstrap(channel, initialSnapshot, { ...metadata, scriptId: script.id })
+      const sizing = `<script>(()=>{const bridgeChannel=${JSON.stringify(channel)};let frame=0,last=-1,observer;const measure=()=>{frame=0;const root=document.documentElement,body=document.body;const height=Math.ceil(Math.max(root?.offsetHeight||0,body?.scrollHeight||0,body?.offsetHeight||0));if(Number.isFinite(height)&&height>0&&height!==last){last=height;parent.postMessage({__dshSillyTavern:true,channel:bridgeChannel,event:'frame-resize',payload:{height}},'*')}};const schedule=()=>{if(frame===0)frame=requestAnimationFrame(measure)};addEventListener('load',schedule,{once:true});document.fonts?.ready?.then(schedule,()=>{});if(typeof ResizeObserver==='function'){observer=new ResizeObserver(schedule);observer.observe(document.documentElement);if(document.body)observer.observe(document.body)}schedule()})()<\/script>`
       const ready = `<script>window.__dshTavernReady?.()<\/script>`
       if (script.kind === 'html') {
         const source = compatibleHtmlSource(script.source)
         if (/^\s*(?:<!doctype\s+html|<html(?:\s|>))/i.test(source)) {
           const withBootstrap = /<head[\s>]/i.test(source)
-            ? source.replace(/<head([^>]*)>/i, `<head$1>${bootstrap}`)
-            : source.replace(/<html([^>]*)>/i, `<html$1><head>${bootstrap}</head>`)
+            ? source.replace(/<head([^>]*)>/i, `<head$1>${bootstrap}${sizing}`)
+            : source.replace(/<html([^>]*)>/i, `<html$1><head>${bootstrap}${sizing}</head>`)
           if (/<\/body>/i.test(withBootstrap)) return withBootstrap.replace(/<\/body>/i, `${ready}</body>`)
           if (/<\/html>/i.test(withBootstrap)) return withBootstrap.replace(/<\/html>/i, `${ready}</html>`)
           return `${withBootstrap}${ready}`
         }
-        return `<!doctype html><html><head>${bootstrap}</head><body>${source}${ready}</body></html>`
+        return `<!doctype html><html><head>${bootstrap}${sizing}</head><body>${source}${ready}</body></html>`
       }
       const encoded = btoa(unescape(encodeURIComponent(String(script.source))))
       const runner = `<script>(async()=>{const bytes=Uint8Array.from(atob(${JSON.stringify(encoded)}),c=>c.charCodeAt(0));const source=new TextDecoder().decode(bytes);const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));try{await import(url);window.__dshTavernReady?.()}finally{URL.revokeObjectURL(url)}})().catch(error=>{document.body.innerHTML='<pre style="color:#b91c1c;white-space:pre-wrap"></pre>';document.querySelector('pre').textContent=error.stack||String(error)})<\/script>`
-      return `<!doctype html><html><head><meta charset="utf-8">${bootstrap}<style>body{font:14px/1.5 system-ui;margin:12px;color:#172033}pre{white-space:pre-wrap}</style></head><body><div id="app"></div>${runner}</body></html>`
+      return `<!doctype html><html><head><meta charset="utf-8">${bootstrap}${sizing}<style>body{font:14px/1.5 system-ui;margin:12px;color:#172033}pre{white-space:pre-wrap}</style></head><body><div id="app"></div>${runner}</body></html>`
+    }
+
+    function mergeSessionEventState(previous, value) {
+      const bySeq = new Map([...(previous?.history || []), ...(value.history || [])].map(message => [message.seq, message]))
+      const history = [...bySeq.values()].sort((left, right) => left.seq - right.seq).slice(-100)
+      return {
+        card: value.card,
+        history,
+        messages: Array.isArray(value.messages) ? value.messages : previous?.messages,
+        cursor: Number.isSafeInteger(value.cursor) ? value.cursor : previous?.cursor,
+        compatChatRevision: Number.isSafeInteger(value.compatChatRevision) ? value.compatChatRevision : previous?.compatChatRevision,
+        unavailable: false,
+      }
     }
 
     function useSessionEventState(sessionId) {
@@ -1226,13 +2442,9 @@ self.onmessage = event => {
             const value = await api(`/event-state?sessionId=${encodeURIComponent(sessionId)}&after=${after}`, { signal: controller.signal })
             if (Number.isSafeInteger(value.cursor) && value.cursor > after) after = value.cursor
             catchUp = value.hasMore === true && after > previousCursor
-            if (!controller.signal.aborted) setState(previous => {
-              const bySeq = new Map([...(previous?.history || []), ...(value.history || [])].map(message => [message.seq, message]))
-              const history = [...bySeq.values()].sort((left, right) => left.seq - right.seq).slice(-100)
-              return { card: value.card, history, unavailable: false }
-            })
+            if (!controller.signal.aborted) setState(previous => mergeSessionEventState(previous, value))
           } catch {
-            if (!controller.signal.aborted) setState(previous => ({ card: previous?.card ?? null, history: previous?.history || [], unavailable: true }))
+            if (!controller.signal.aborted) setState(previous => ({ ...(previous || { card: null, history: [] }), unavailable: true }))
           } finally {
             running = false
             if (catchUp && !controller.signal.aborted) void poll()
@@ -1245,78 +2457,55 @@ self.onmessage = event => {
       return state
     }
 
-    function TrustedFrame({ sessionId, script, eventState }) {
+    function TrustedFrame({ sessionId, script, eventState, className = 'dst-trusted-frame', title, actions, hidden = false, initialSnapshotOverride = null }) {
       const channel = React.useMemo(() => `dst-${sessionId}-${script.id}-${Math.random().toString(36).slice(2)}`, [sessionId, script.id])
       const frame = React.useRef(null)
-      const cursor = React.useRef({ cardId: undefined, seq: -1, initialized: false })
-      const [ready, setReady] = React.useState(false)
+      const snapshot = useCompatSnapshot(sessionId)
+      const surface = script.id === 'opening-html' ? 'opening' : script.id.startsWith('conversation-') ? 'message' : hidden ? 'background' : 'preview'
+      const parsedSourceSeq = surface === 'message' ? Number(script.id.match(/^conversation-(\d+)-/)?.[1]) : null
+      const sourceSeq = Number.isSafeInteger(script.sourceSeq) ? script.sourceSeq : parsedSourceSeq
+      const currentMessageId = Number.isSafeInteger(sourceSeq) ? (snapshot?.messages || []).findIndex(message => message.sourceSeq === sourceSeq || message.event_seq === sourceSeq) : null
+      const messageReady = surface !== 'message' || !Number.isSafeInteger(sourceSeq) || currentMessageId >= 0
+      const boot = React.useRef({ channel: null, source: null, snapshot: null, currentMessageId: null })
+      if (boot.current.channel !== channel || boot.current.source !== script.source) boot.current = { channel, source: script.source, snapshot: null, currentMessageId: null }
+      if (boot.current.snapshot === null && messageReady && (snapshot !== null || initialSnapshotOverride !== null)) {
+        boot.current = { channel, source: script.source, snapshot: structuredClone(snapshot ?? initialSnapshotOverride), currentMessageId }
+      }
       const [height, setHeight] = React.useState(null)
-      React.useEffect(() => {
-        cursor.current = { cardId: undefined, seq: -1, initialized: false }
-        setReady(false)
+      const [armedChannel, setArmedChannel] = React.useState(null)
+      const actionsRef = React.useRef(actions)
+      actionsRef.current = actions
+      React.useLayoutEffect(() => {
         setHeight(null)
-        const listener = async event => {
-          const message = event.data
-          if (!message || message.__dshSillyTavern !== true || message.channel !== channel || event.source !== frame.current?.contentWindow) return
-          if (message.event === 'frame-resize') {
-            const next = Math.ceil(Number(message.payload?.height))
-            if (Number.isFinite(next) && next > 0) setHeight(previous => previous === next ? previous : next)
-            return
-          }
-          if (message.event === 'frame-ready') { setReady(true); return }
-          if (!message.id) return
-          try {
-            let value
-            if (message.action === 'getState') value = await api(`/session?sessionId=${encodeURIComponent(sessionId)}`)
-            else if (message.action === 'getWorldbook') {
-              const state = await api(`/session?sessionId=${encodeURIComponent(sessionId)}`)
-              const worldbookId = state.binding?.worldbookId || (state.binding?.worldbookExplicit === true ? null : state.card?.defaultWorldbookId)
-              value = worldbookId ? normalizeWorldbookRecord(await api(`/worldbook?sessionId=${encodeURIComponent(sessionId)}&id=${encodeURIComponent(worldbookId)}`)).book : null
-            }
-            else if (message.action === 'setVariables') value = await api('/session/update', { method: 'POST', body: JSON.stringify({ sessionId, patch: { variables: message.args.variables || {} } }) })
-            else if (message.action === 'injectPrompts') value = await api('/session/update', { method: 'POST', body: JSON.stringify({ sessionId, patch: { scriptInjections: message.args.injections || [] } }) })
-            else if (message.action === 'memory') value = await api('/memory', { method: 'POST', body: JSON.stringify({ sessionId, operation: message.args.operation || {} }) })
-            else if (message.action === 'appendInput') {
-              const appendInput = composerBridges.get(sessionId)
-              if (appendInput === undefined) throw new Error('conversation composer bridge is unavailable')
-              value = appendInput(message.args.text)
-            }
-            else throw new Error(`unsupported script API action ${message.action}`)
-            event.source.postMessage({ __dshSillyTavern: true, channel, replyTo: message.id, ok: true, value }, '*')
-          } catch (error) {
-            event.source.postMessage({ __dshSillyTavern: true, channel, replyTo: message.id, ok: false, error: error.message || String(error) }, '*')
-          }
-        }
-        window.addEventListener('message', listener)
-        return () => window.removeEventListener('message', listener)
+        const unregister = compatRuntime.register({
+          channel,
+          sessionId: sessionId ?? '__standalone__',
+          scriptId: script.id,
+          getWindow: () => frame.current?.contentWindow,
+          get actions() { return actionsRef.current },
+          onResize: next => setHeight(previous => previous === next ? previous : next),
+        })
+        setArmedChannel(channel)
+        return unregister
       }, [channel, sessionId])
-      React.useEffect(() => {
-        if (!ready || eventState === null) return
-        const current = cursor.current
-        const post = (event, payload) => frame.current?.contentWindow?.postMessage({ __dshSillyTavern: true, channel, event, payload }, '*')
-        const cardId = eventState.card?.id || null
-        if (!current.initialized || cardId !== current.cardId) post('character_changed', { cardId, name: eventState.card?.name || null })
-        const newer = (eventState.history || []).filter(message => message.seq > current.seq)
-        if (!current.initialized && newer.length > 0) post('message_received', { ...newer.at(-1), replay: true })
-        else for (const message of newer) post('message_received', { ...message, replay: false })
-        current.cardId = cardId
-        current.initialized = true
-        if (eventState.history?.length) current.seq = Math.max(current.seq, ...eventState.history.map(message => message.seq))
-      }, [channel, eventState, ready])
-      const srcDoc = React.useMemo(() => trustedDocument(script, channel), [channel, script.kind, script.source])
+      const runtimeReady = boot.current.snapshot !== null
+      const transportReady = typeof window.addEventListener !== 'function' || armedChannel === channel
+      const bootMessageId = boot.current.currentMessageId
+      const srcDoc = React.useMemo(() => runtimeReady && transportReady ? trustedDocument(script, channel, boot.current.snapshot, { surface, currentMessageId: bootMessageId, currentSourceSeq: sourceSeq }) : '', [channel, script.kind, script.source, runtimeReady, transportReady, surface, bootMessageId, sourceSeq])
+      if (!runtimeReady) return null
       return h('iframe', {
         ref: frame,
-        className: 'dst-trusted-frame',
-        title: script.name,
+        className,
+        title: title || script.name,
+        'aria-label': title || script.name,
         sandbox: 'allow-scripts allow-forms allow-popups allow-downloads allow-modals',
         srcDoc,
-        style: height === null ? undefined : { height, minHeight: 0 },
-        onLoad: () => setReady(true),
+        style: hidden ? { display: 'none' } : height === null ? undefined : { height, minHeight: 0 },
       })
     }
 
     function ScriptPreview({ sessionId, script, sample }) {
-      const eventState = useSessionEventState(sessionId)
+      const eventState = useSessionStore(scriptEvents, sessionId)
       const scope = useSessionStore(scriptScopes, sessionId)
       const [rendered, setRendered] = React.useState({ status: 'loading', text: '' })
       React.useEffect(() => {
@@ -1370,7 +2559,7 @@ self.onmessage = event => {
         : { id: crypto.randomUUID(), name: 'New Regex', kind: 'regex', enabled: false, approvedHash: null, source: '', findRegex: '', trimStrings: [], placement: [1, 2], markdownOnly: false, promptOnly: false, runOnEdit: false, substituteRegex: 0, minDepth: null, maxDepth: null }))
       return h('div', null,
         h('div', { className: 'dst-section-title' }, '执行脚本'),
-        h('p', { className: 'dst-warning' }, '导入脚本默认启用；“启用”只控制脚本是否在对应文本阶段运行，管理页不会自动执行。系统不审查或过滤替换内容，启用前请自行验证。编辑规则、源码或类型后会自动停用。'),
+        h('p', { className: 'dst-warning' }, '导入脚本默认启用；已确认的 JavaScript 会作为当前会话的后台脚本自动运行，Regex 在对应文本阶段运行，HTML 可在管理页预览。系统不审查或过滤替换内容与脚本源码，启用前请自行验证。编辑规则、源码或类型后会自动停用。'),
         h('div', { className: 'dst-actions' }, ...[['global', 'Global'], ['preset', 'Preset'], ['scoped', 'Scoped（角色卡）']].map(([id, label]) => h(Button, { key: id, className: `${scopeKind === id ? 'active' : 'secondary'} small`, onClick: () => { setRunningIds(new Set()); setScopeKind(id) } }, label))),
         scripts.map((script, index) => {
           const running = runningIds.has(script.id)
@@ -1397,7 +2586,7 @@ self.onmessage = event => {
                 approvalAttempts.current.set(script.id, attempt)
                 const enabled = event.target.checked
                 if (!enabled) { clearPendingApproval(script.id); stopPreview(script.id); patch(index, { enabled: false, approvedHash: null }); return }
-                if (!window.confirm(`确认启用脚本“${script.name}”？启用后只会在对话内容匹配时运行，管理页不会自动执行；修改内容后必须重新确认。`)) return
+                if (!window.confirm(script.kind === 'javascript' ? `确认启用脚本“${script.name}”？启用后会在当前会话中作为后台脚本运行；修改内容后必须重新确认。` : `确认启用脚本“${script.name}”？启用后会在对应文本阶段运行；修改内容后必须重新确认。`)) return
                 setPendingApprovals(previous => new Set(previous).add(script.id))
                 const material = scriptApprovalMaterial(script)
                 try {
@@ -1479,11 +2668,57 @@ self.onmessage = event => {
       return String(card?.nickname || card?.name || '未命名角色')
     }
 
+    function useCharacterSelectLayout(compact, label) {
+      const buttonRef = React.useRef(null)
+      const labelRef = React.useRef(null)
+      const [iconOnly, setIconOnly] = React.useState(true)
+      React.useLayoutEffect(() => {
+        const button = buttonRef.current
+        const text = labelRef.current
+        if (!compact || !button || !text) return undefined
+        // Find the wrapping toolbar without depending on the host's CSS module names.
+        let row = button.parentElement
+        while (row) {
+          const style = getComputedStyle(row)
+          if (style.display === 'flex' && style.flexWrap === 'wrap') break
+          row = row.parentElement
+        }
+        const measure = () => {
+          // Expanded chrome: 16px mug + 14px chevron + 16px padding + two 4px gaps.
+          // The hidden label keeps its natural width, so collapsing cannot cause a toggle loop.
+          const expandedWidth = text.getBoundingClientRect().width + 54
+          let fits = expandedWidth <= 180
+          if (fits && row) {
+            const style = getComputedStyle(row)
+            const number = value => parseFloat(value) || 0
+            const children = [...row.children].filter(child => getComputedStyle(child).display !== 'none')
+            // The host's trailing group uses margin-left:auto; its resolved margin is spare space.
+            const occupied = children.reduce((width, child) => width + child.getBoundingClientRect().width, 0)
+              + Math.max(0, children.length - 1) * number(style.columnGap)
+            const available = row.clientWidth - number(style.paddingLeft) - number(style.paddingRight)
+            const expandedRowWidth = occupied - button.getBoundingClientRect().width + expandedWidth
+            fits = expandedRowWidth <= available - 1
+          }
+          setIconOnly(!fits)
+        }
+        measure()
+        const observer = new ResizeObserver(measure)
+        observer.observe(text)
+        if (row) {
+          observer.observe(row)
+          for (const child of row.children) observer.observe(child)
+        }
+        return () => observer.disconnect()
+      }, [compact, label])
+      return { buttonRef, labelRef, iconOnly: compact && iconOnly }
+    }
+
     function CharacterSelect({ cards, value, busy, locked = false, onChange, onManage, compact = false }) {
       const [open, setOpen] = React.useState(false)
       const available = Array.isArray(cards) && cards.length > 0
       const selected = available ? cards.find(card => card.id === value) : undefined
       const label = selected === undefined ? '选择角色卡' : cardLabel(selected)
+      const { buttonRef, labelRef, iconOnly } = useCharacterSelectLayout(compact, label)
       const items = available
         ? [
           ...cards.map(card => ({ id: card.id, label: cardLabel(card), disabled: locked && card.id !== value })),
@@ -1508,9 +2743,11 @@ self.onmessage = event => {
         compact: true,
         className: 'dst-character-menu',
         anchor: h('button', {
+          ref: buttonRef,
           type: 'button',
-          className: `dst-character-seat${compact ? ' compact' : ''}`,
+          className: `dst-character-seat${compact ? ' compact' : ''}${iconOnly ? ' icon-only' : ''}`,
           'aria-label': '当前角色卡',
+          'aria-description': label,
           'aria-haspopup': 'menu',
           'aria-expanded': open,
           title: available ? `当前角色卡：${label}${locked ? '（对话已开始，不能更换）' : ''}` : '请先导入角色卡',
@@ -1518,7 +2755,7 @@ self.onmessage = event => {
           onClick: () => setOpen(previous => !previous),
         },
         h(TavernMugIcon, { className: 'dst-character-icon' }),
-        h('span', { className: 'dst-character-label' }, label),
+        h('span', { ref: labelRef, className: 'dst-character-label' }, label),
         h(IconChevronDownOutline14, { className: 'dst-character-chevron' }))
       })
     }
@@ -1676,11 +2913,11 @@ self.onmessage = event => {
         const block = data.blocks[index]
         if (block?.kind === 'text') {
           const replacement = replacements?.[index]
-          if (replacement !== undefined) rendered.push(h(ScriptConversationContent, { key: index, ...replacementBase, seq: `${replacementBase.seq}-${index}`, text: replacement, mentions }))
+          if (replacement !== undefined) rendered.push(h(ScriptConversationContent, { key: index, ...replacementBase, messageSeq: replacementBase.messageSeq ?? replacementBase.seq, seq: `${replacementBase.seq}-${index}`, text: replacement, mentions }))
           else rendered.push(h(TavernMarkdownContent, { key: index, text: block.text, streaming, fileMentions: mentions }))
         }
         else if (block?.kind === 'reasoning') rendered.push(h(StoryProcessReasoning, { key: index, hidden: reasoningHidden, reveal: revealProcess },
-          h('details', { className: 'dst-assistant-reasoning', open: streaming || undefined }, h('summary', null, streaming ? '思考中…' : '思考过程'), replacements?.[index] !== undefined ? h(ScriptConversationContent, { ...replacementBase, seq: `${replacementBase.seq}-reasoning-${index}`, text: replacements[index] }) : h('pre', null, block.text))))
+          h('details', { className: 'dst-assistant-reasoning', open: streaming || undefined }, h('summary', null, streaming ? '思考中…' : '思考过程'), replacements?.[index] !== undefined ? h(ScriptConversationContent, { ...replacementBase, messageSeq: replacementBase.messageSeq ?? replacementBase.seq, seq: `${replacementBase.seq}-reasoning-${index}`, text: replacements[index] }) : h('pre', null, block.text))))
         else if (block?.kind === 'image') {
           const start = index
           const images = [block]
@@ -1692,24 +2929,26 @@ self.onmessage = event => {
       return rendered.length === 0 ? null : h('div', { className: 'dst-assistant-message', 'data-streaming': streaming || undefined }, rendered)
     }
 
-    function RenderedScriptSegments({ sessionId, seq, text, mentions, eventState, label = '脚本渲染内容' }) {
+    function RenderedScriptSegments({ sessionId, seq, messageSeq = null, text, mentions, eventState, label = '脚本渲染内容' }) {
       const segments = greetingSegments(text, true, false)
       if (segments.length === 0) return null
       return h('article', { className: 'dst-script-conversation', 'aria-label': label }, segments.map((segment, index) => segment.type === 'html'
-        ? h(TrustedFrame, { key: `html-${index}`, sessionId, script: { id: `conversation-${seq}-${index}`, name: label, kind: 'html', source: segment.value }, eventState })
+        ? h(TrustedFrame, { key: `html-${seq}-${index}`, sessionId, script: { id: `conversation-${seq}-${index}`, name: label, kind: 'html', source: segment.value, sourceSeq: messageSeq }, eventState })
         : h(TavernMarkdownContent, { key: `markdown-${index}`, text: segment.value, fileMentions: mentions })))
     }
 
-    function ScriptConversationContent({ sessionId, seq, text, mentions }) {
+    function ScriptConversationContent({ sessionId, seq, messageSeq = null, text, mentions }) {
       const eventState = useSessionStore(scriptEvents, sessionId)
-      return h(RenderedScriptSegments, { sessionId, seq, text, mentions, eventState })
+      return h(RenderedScriptSegments, { sessionId, seq, messageSeq, text, mentions, eventState })
     }
 
     function TavernAssistantNode(props) {
       const { node, renderMessageImages, sessionId, useTurnData, openFile, fileMentions, turnProcess } = props
       const scripts = useSessionStore(scriptPolicies, sessionId)
       const scope = useSessionStore(scriptScopes, sessionId)
+      const compat = useCompatSnapshot(sessionId)
       const messageSeq = node.data.finalNode?.seq ?? node.seq ?? node.data.seq
+      const projected = React.useMemo(() => (compat?.messages || []).find(message => message.event_seq === messageSeq || message.sourceSeq === messageSeq), [compat, messageSeq])
       const depth = regexMessageDepth(scope, messageSeq)
       const turn = node.location.kind === 'turn' || node.location.kind === 'step' ? node.location.turn : undefined
       const tail = useTurnData('turn-tail')
@@ -1733,7 +2972,7 @@ self.onmessage = event => {
           setRendered({ status: 'native', message: '', replacements: {} })
           return () => controller.abort()
         }
-        setRendered({ status: 'loading', message: '', replacements: {} })
+        setRendered(previous => previous.status === 'rendered' ? previous : { status: 'loading', message: '', replacements: {} })
         Promise.all(regexBlocks.map(block => regexEngine.run(block.text, rules, controller.signal, { placement: block.placement, isMarkdown: true, depth }, scope))).then(values => {
           if (controller.signal.aborted) return
           const replacements = {}
@@ -1744,8 +2983,11 @@ self.onmessage = event => {
         })
         return () => controller.abort()
       }, [fingerprint, node.data.status, regexBlocks, depth, scope])
+      if (projected?.is_hidden === true) return null
+      const nativeText = regexBlocks.filter(block => block.placement === 2).map(block => block.text).join('\n')
+      if (projected && String(projected.message ?? projected.mes ?? projected.text ?? '') !== nativeText) return h(RenderedScriptSegments, { sessionId, seq: `compat-assistant-${messageSeq}`, messageSeq, text: String(projected.message ?? projected.mes ?? projected.text ?? ''), mentions, eventState: null, label: '兼容消息投影' })
       if (rendered.status === 'loading') return h('div', { className: 'dst-script-rendering', role: 'status' }, '正在渲染脚本…')
-      if (rendered.status === 'rendered') return h(AssistantFallback, { node, renderMessageImages, mentions, replacementBase: { sessionId, seq: node.data.finalNode?.seq ?? node.seq ?? 0 }, replacements: rendered.replacements, reasoningHidden, revealProcess })
+      if (rendered.status === 'rendered') return h(AssistantFallback, { node, renderMessageImages, mentions, replacementBase: { sessionId, seq: messageSeq, messageSeq }, replacements: rendered.replacements, reasoningHidden, revealProcess })
       return h(React.Fragment, null,
         h(AssistantFallback, { node, renderMessageImages, mentions, reasoningHidden, revealProcess }),
         rendered.status === 'error' ? h('p', { className: 'dst-script-render-error' }, `脚本渲染失败：${rendered.message}`) : null)
@@ -1755,6 +2997,7 @@ self.onmessage = event => {
       const scripts = useSessionStore(scriptPolicies, sessionId)
       const scope = useSessionStore(scriptScopes, sessionId)
       const eventState = useSessionStore(scriptEvents, sessionId)
+      const compat = useCompatSnapshot(sessionId)
       const depth = regexMessageDepth(scope, node.data.seq)
       const rules = React.useMemo(() => displayRegexRules(scripts), [scripts])
       const textBlocks = React.useMemo(() => (node.data.content || []).flatMap((block, index) => block?.type === 'text' ? [{ index, text: block.text }] : []), [node.data.content])
@@ -1771,13 +3014,17 @@ self.onmessage = event => {
         }).catch(() => { if (!controller.signal.aborted) setReplacements({}) })
         return () => controller.abort()
       }, [fingerprint, textBlocks, depth, scope])
+      const projected = (compat?.messages || []).find(message => message.event_seq === node.data.seq || message.sourceSeq === node.data.seq)
+      if (projected?.is_hidden === true) return null
+      const nativeText = textBlocks.map(block => block.text).join('\n')
+      if (projected && String(projected.message ?? projected.mes ?? projected.text ?? '') !== nativeText) return h('div', { className: 'dst-user-row' }, h('div', { className: 'dst-user-stack' }, h('div', { className: 'dst-user-message' }, h(RenderedScriptSegments, { sessionId, seq: `compat-user-${node.data.seq}`, messageSeq: node.data.seq, text: String(projected.message ?? projected.mes ?? projected.text ?? ''), eventState, label: '兼容用户消息投影' }))))
       const rendered = []
       const images = []
       const content = node.data.content || []
       for (let index = 0; index < content.length; index += 1) {
         const block = content[index]
         if (block?.type === 'text') rendered.push(replacements[index] !== undefined
-          ? h(ScriptConversationContent, { key: index, sessionId, seq: `user-${node.data.seq}-${index}`, text: replacements[index], eventState, label: '用户 Regex 替换' })
+          ? h(ScriptConversationContent, { key: index, sessionId, seq: `user-${node.data.seq}-${index}`, messageSeq: node.data.seq, text: replacements[index], eventState, label: '用户 Regex 替换' })
           : h(MarkdownText, { key: index, text: block.text, labels: SCRIPT_MARKDOWN_LABELS }))
         else if (block?.type === 'image') images.push({ attachment: block.attachment })
       }
@@ -1793,7 +3040,9 @@ self.onmessage = event => {
       const eventState = useSessionEventState(sessionId)
       const eventCardId = eventState?.card?.id || null
       const session = useAsync(signal => api(`/session?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version, eventCardId])
+      const compatibility = useAsync(signal => api(`/compat/runtime?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version, eventCardId])
       const library = useAsync(signal => api(`/library?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version])
+      const verifiedScripts = useSessionStore(scriptPolicies, sessionId)
       const [busy, setBusy] = React.useState(false)
       const ownedBlock = React.useRef(Object.freeze({ reason: '正在切换角色卡…' }))
       const previousBlock = React.useRef(undefined)
@@ -1801,6 +3050,8 @@ self.onmessage = event => {
       appendInputRef.current = appendInput
       const cardRecord = session.value?.card
       const eventTail = eventState?.history?.at(-1)?.seq ?? -1
+      const eventCursor = eventState?.cursor ?? -1
+      const compatChatRevision = eventState?.compatChatRevision ?? -1
       const globalVariablesToken = JSON.stringify(session.value?.globalVariables || {})
       const regexSourcesToken = [
         ...(session.value?.globalRegexScripts || []),
@@ -1810,9 +3061,13 @@ self.onmessage = event => {
       React.useEffect(() => typeof registerMessageRenderers === 'function' ? registerMessageRenderers() : undefined, [registerMessageRenderers])
       React.useEffect(() => {
         const bridge = value => appendInputRef.current(value)
-        composerBridges.set(sessionId, bridge)
-        return () => { if (composerBridges.get(sessionId) === bridge) composerBridges.delete(sessionId) }
+        return compatRuntime.setComposer(sessionId, bridge)
       }, [sessionId])
+      React.useEffect(() => {
+        if (compatibility.value === null) return
+        compatRuntime.set(sessionId, compatibility.value, `${compatibility.value.bindingRevision}:${compatibility.value.cardRecord?.id || 'none'}:${compatibility.value.chatRevision ?? -1}`)
+      }, [sessionId, compatibility.value])
+      React.useEffect(() => { compatRuntime.applyEventState(sessionId, eventState) }, [sessionId, eventState, eventTail, compatibility.value])
       React.useEffect(() => {
         if (session.loading) return undefined
         let active = true
@@ -1834,7 +3089,11 @@ self.onmessage = event => {
       }, [sessionId, session.loading, cardRecord?.id, cardRecord?.updatedAt, regexSourcesToken])
       React.useEffect(() => {
         const data = cardRecord?.card?.data || {}
-        const messages = (eventState?.history || []).map(message => ({ role: message.role, text: message.text, seq: message.seq }))
+        const messages = (eventState?.messages || eventState?.history || []).map(message => ({
+          role: message.role,
+          text: message.message ?? message.mes ?? message.text ?? '',
+          seq: message.sourceSeq ?? message.event_seq ?? message.seq ?? message.message_id,
+        }))
         const scope = {
           card: cardRecord?.card || null,
           character: data,
@@ -1846,18 +3105,17 @@ self.onmessage = event => {
           currentSwipeId: Number(session.value?.binding?.openingSwipeId || 0),
           messages,
         }
-        scriptScopes.set(sessionId, scope, `${cardRecord?.id || 'none'}:${session.value?.binding?.revision || 0}:${eventTail}:${globalVariablesToken}`)
-      }, [sessionId, cardRecord?.id, cardRecord?.updatedAt, session.value?.binding?.revision, eventTail, globalVariablesToken])
+        scriptScopes.set(sessionId, scope, `${cardRecord?.id || 'none'}:${session.value?.binding?.revision || 0}:${eventCursor}:${compatChatRevision}:${globalVariablesToken}`)
+      }, [sessionId, cardRecord?.id, cardRecord?.updatedAt, session.value?.binding?.revision, eventCursor, compatChatRevision, globalVariablesToken])
       React.useEffect(() => {
-        scriptEvents.set(sessionId, eventState, `${eventTail}:${eventState?.history?.length || 0}:${eventState?.unavailable === true}:${eventState?.card?.id || 'none'}`)
-      }, [sessionId, eventState, eventTail])
-      React.useEffect(() => () => { scriptPolicies.clear(sessionId); scriptScopes.clear(sessionId); scriptEvents.clear(sessionId) }, [sessionId])
+        scriptEvents.set(sessionId, eventState, `${eventCursor}:${compatChatRevision}:${eventTail}:${eventState?.history?.length || 0}:${eventState?.unavailable === true}:${eventState?.card?.id || 'none'}`)
+      }, [sessionId, eventState, eventCursor, compatChatRevision, eventTail])
       const releaseBlock = () => {
         if (blocks.storeFor(sessionId).getSnapshot() === ownedBlock.current) blocks.set(sessionId, previousBlock.current)
         previousBlock.current = undefined
       }
       React.useEffect(() => releaseBlock, [sessionId, blocks])
-      if (session.error || session.loading || library.error || library.loading) return null
+      if (session.error || session.loading || compatibility.error || compatibility.loading || library.error || library.loading) return null
       const currentId = session.value?.binding?.cardId || ''
       const locked = currentId !== '' && sessionHasStarted(session.value)
       const selectCard = async id => {
@@ -1879,6 +3137,8 @@ self.onmessage = event => {
           setBusy(false)
         }
       }
+      const currentScriptApprovals = new Set((cardRecord?.scripts || []).map(script => `${script.id}:${script.approvedHash || ''}`))
+      const backgroundScripts = verifiedScripts.filter(script => script?.kind === 'javascript' && script.enabled === true && typeof script.approvedHash === 'string' && currentScriptApprovals.has(`${script.id}:${script.approvedHash}`))
       return h('span', { className: 'dst-composer-character' },
         h(CharacterSelect, {
           cards: library.value.cards,
@@ -1888,7 +3148,8 @@ self.onmessage = event => {
           compact: true,
           onChange: id => { void selectCard(id) },
           onManage: () => overlay.open('manager', sessionId),
-        }))
+        }),
+        ...backgroundScripts.map(script => h(TrustedFrame, { key: `background:${cardRecord?.id || 'none'}:${script.id}:${script.approvedHash}`, sessionId, script, eventState, hidden: true, title: `${script.name} 后台脚本` })))
     }
 
     function sessionAgentPreset(summary) {
@@ -1897,8 +3158,8 @@ self.onmessage = event => {
 
     function ComposerCharacterSelect(props) {
       const agentPreset = props.useSessions(state => sessionAgentPreset(state.byId[props.sessionId]))
-      const draft = String(props.input?.draft ?? '')
-      const phase = props.input?.phase
+      const draft = String(props.useInput(state => state.draft) ?? '')
+      const phase = props.useInput(state => state.phase)
       const draftRef = React.useRef(draft)
       const phaseRef = React.useRef(phase)
       const inputActionsRef = React.useRef(props.inputActions)
@@ -1974,56 +3235,31 @@ self.onmessage = event => {
         .filter(segment => segment.type === 'html' || segment.value.trim() !== '')
     }
 
-    function greetingBridgeScript(channel) {
-      return `<script>(()=>{const channel=${JSON.stringify(channel)};let seq=0;const pending=new Map();const rpc=(action,args={})=>new Promise((resolve,reject)=>{const id=++seq;pending.set(id,{resolve,reject});parent.postMessage({__dshSillyTavernGreeting:true,channel,id,action,args},'*')});addEventListener('message',event=>{const message=event.data;if(event.source!==parent||!message||message.__dshSillyTavernGreeting!==true||message.channel!==channel||!message.replyTo)return;const item=pending.get(message.replyTo);if(!item)return;pending.delete(message.replyTo);message.ok?item.resolve(message.value):item.reject(new Error(message.error||'SillyTavern opening API failed'))});const setChatMessages=async messages=>{const selection=await rpc('setChatMessages',{messages});window.setTimeout(()=>{rpc('commitSwipe',{swipe_id:selection?.swipe_id}).catch(()=>{})},50);return selection};const triggerSlash=command=>rpc('triggerSlash',{command:String(command??'')});window.setChatMessages=setChatMessages;window.triggerSlash=triggerSlash;window.TavernHelper=Object.assign({},window.TavernHelper,{setChatMessages,triggerSlash})})()<\/script>`
+    const standaloneCompatibilitySnapshot = Object.freeze({ schemaVersion: 1, runtimeRevision: 0, sessionId: '__standalone__', state: { sessionId: '__standalone__', binding: null, card: null, history: [] }, bindingRevision: 0, cardRecord: null, characterCard: null, character: {}, worldbook: null, persona: { name: 'User', description: '' }, variables: {}, globalVariables: {}, scriptInjections: [], currentSwipeId: 0, messages: [], context: { chatId: '__standalone__', characterId: null, groupId: null, name1: 'User', name2: 'Character', chatMetadata: {} }, compatibility: {} })
+
+    function GreetingHtmlFrame({ sessionId, source, onSetChatMessages, onCommitSwipe, onTriggerSlash }) {
+      const script = React.useMemo(() => ({ id: 'opening-html', name: '角色开场 HTML', kind: 'html', source }), [source])
+      const actions = React.useMemo(() => ({
+        setChatMessages: (args, channel) => {
+          if (typeof onSetChatMessages !== 'function') throw new Error('opening swipe selection is unavailable after the conversation starts')
+          return onSetChatMessages(args?.messages, channel)
+        },
+        commitSwipe: (args, channel) => {
+          if (typeof onCommitSwipe !== 'function') throw new Error('opening swipe commit is unavailable after the conversation starts')
+          return onCommitSwipe(args?.swipe_id, channel)
+        },
+        triggerSlash: args => {
+          if (typeof onTriggerSlash !== 'function') throw new Error('opening slash bridge is unavailable in conversation history')
+          return onTriggerSlash(args?.command)
+        },
+      }), [onSetChatMessages, onCommitSwipe, onTriggerSlash])
+      return h(TrustedFrame, { sessionId, script, className: 'dst-opening-html', title: '角色开场 HTML', actions, initialSnapshotOverride: sessionId ? null : standaloneCompatibilitySnapshot })
     }
 
-    function greetingDocument(input, channel) {
-      const source = String(input ?? '')
-      const bootstrap = greetingBridgeScript(channel)
-      if (/^\s*(?:<!doctype\s+html|<html(?:\s|>))/i.test(source)) {
-        if (/<head[\s>]/i.test(source)) return source.replace(/<head([^>]*)>/i, `<head$1>${bootstrap}`)
-        if (/<html[\s>]/i.test(source)) return source.replace(/<html([^>]*)>/i, `<html$1><head>${bootstrap}</head>`)
-        return `${source}${bootstrap}`
-      }
-      return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${bootstrap}<style>html{color-scheme:light dark}body{box-sizing:border-box;margin:0;padding:12px;font:14px/1.55 system-ui,sans-serif;overflow-wrap:anywhere}</style></head><body>${source}</body></html>`
-    }
-
-    function GreetingHtmlFrame({ source, onSetChatMessages, onCommitSwipe, onTriggerSlash }) {
-      const frame = React.useRef(null)
-      const channel = React.useMemo(() => `dst-opening-${Math.random().toString(36).slice(2)}`, [source])
-      React.useEffect(() => {
-        const listener = async event => {
-          const message = event.data
-          if (!message || message.__dshSillyTavernGreeting !== true || message.channel !== channel || event.source !== frame.current?.contentWindow || !message.id) return
-          try {
-            let value
-            if (message.action === 'setChatMessages') { if (typeof onSetChatMessages !== 'function') throw new Error('opening swipe selection is unavailable after the conversation starts'); value = await onSetChatMessages(message.args?.messages, channel) }
-            else if (message.action === 'commitSwipe') { if (typeof onCommitSwipe !== 'function') throw new Error('opening swipe commit is unavailable after the conversation starts'); value = await onCommitSwipe(message.args?.swipe_id, channel) }
-            else if (message.action === 'triggerSlash') { if (typeof onTriggerSlash !== 'function') throw new Error('opening slash bridge is unavailable in conversation history'); value = await onTriggerSlash(message.args?.command) }
-            else throw new Error(`unsupported SillyTavern opening action ${message.action}`)
-            event.source.postMessage({ __dshSillyTavernGreeting: true, channel, replyTo: message.id, ok: true, value: value ?? null }, '*')
-          } catch (error) {
-            event.source.postMessage({ __dshSillyTavernGreeting: true, channel, replyTo: message.id, ok: false, error: error.message || String(error) }, '*')
-          }
-        }
-        window.addEventListener('message', listener)
-        return () => window.removeEventListener('message', listener)
-      }, [channel, onSetChatMessages, onCommitSwipe, onTriggerSlash])
-      return h('iframe', {
-        ref: frame,
-        className: 'dst-opening-html',
-        title: '角色开场 HTML',
-        'aria-label': '角色开场 HTML',
-        sandbox: 'allow-scripts allow-forms allow-popups allow-downloads allow-modals',
-        srcDoc: greetingDocument(source, channel),
-      })
-    }
-
-    function GreetingContent({ text, onSetChatMessages, onCommitSwipe, onTriggerSlash }) {
+    function GreetingContent({ sessionId, text, onSetChatMessages, onCommitSwipe, onTriggerSlash }) {
       const segments = greetingSegments(text, true)
       return h('div', { className: 'dst-opening-text' }, ...segments.map((segment, index) => segment.type === 'html'
-        ? h(GreetingHtmlFrame, { key: `html:${index}`, source: segment.value, onSetChatMessages, onCommitSwipe, onTriggerSlash })
+        ? h(GreetingHtmlFrame, { key: `html:${index}`, sessionId, source: segment.value, onSetChatMessages, onCommitSwipe, onTriggerSlash })
         : h(TavernMarkdownContent, { key: `markdown:${index}`, text: segment.value })))
     }
 
@@ -2046,7 +3282,7 @@ self.onmessage = event => {
         if (rules.length > 0 && String(text || '') !== '') regexEngine.run(text, rules, controller.signal, { placement: 2, isMarkdown: true, depth }, scope).then(value => { if (!controller.signal.aborted) setRendered(value.text) }).catch(() => undefined)
         return () => controller.abort()
       }, [text, fingerprint, scope, depth])
-      return h(GreetingContent, { ...props, text: rendered })
+      return h(GreetingContent, { ...props, sessionId, text: rendered })
     }
 
     function TavernOpeningGreetingContent({ sessionId, version }) {
@@ -2054,6 +3290,10 @@ self.onmessage = event => {
       const [notice, setNotice] = React.useState(null)
       const preparedSwipes = React.useRef(new Map())
       const greeting = useAsync(signal => api(`/greeting?sessionId=${encodeURIComponent(sessionId)}${swipeId === null ? '' : `&swipeId=${swipeId}`}`, { signal }), [sessionId, version, swipeId])
+      const openingRuntime = useAsync(signal => api(`/compat/runtime?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version, swipeId])
+      React.useEffect(() => {
+        if (openingRuntime.value) compatRuntime.set(sessionId, openingRuntime.value, `opening:${openingRuntime.value.bindingRevision}:${openingRuntime.value.cardRecord?.id || 'none'}:${openingRuntime.value.chatRevision ?? -1}`)
+      }, [sessionId, openingRuntime.value])
       React.useEffect(() => {
         preparedSwipes.current.clear()
         setSwipeId(null)
@@ -2140,7 +3380,7 @@ self.onmessage = event => {
 .dst-memory-context-form{margin-top:14px;padding:12px;border:1px solid #dce3ed;border-radius:10px}.dst-memory-context-form>.dst-section-title{font-size:14px;margin-bottom:4px}.dst-memory-context{display:flex;flex-wrap:wrap;gap:6px 14px;color:#475569;font-size:12px}.dst-memory-context>span{overflow-wrap:anywhere}
 .dst-overlay{position:fixed;inset:0;z-index:90;pointer-events:none;font:14px/1.45 system-ui,sans-serif;color:#182033}.dst-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.42);pointer-events:auto}.dst-dialog-wrap{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}.dst-dialog-card{width:min(520px,calc(100vw - 32px));background:var(--dsh-surface,#fff);border:1px solid #ccd5e3;border-radius:16px;padding:20px;box-shadow:0 24px 70px #0f172a55;pointer-events:auto}.dst-dialog-title{font-size:18px;font-weight:750;margin-bottom:8px}.dst-manager{position:absolute;inset:0;width:100vw;height:100dvh;box-sizing:border-box;background:var(--dsh-surface,#fff);border:0;border-radius:0;box-shadow:none;overflow:hidden;pointer-events:auto;display:flex;flex-direction:column}.dst-manager>header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #e2e8f0}.dst-manager>header strong{display:block;font-size:17px}.dst-manager>header span{display:block;color:#64748b;font-size:12px}.dst-manager-content{min-height:0;display:flex;flex-direction:column;flex:1}.dst-manager .dst-manager-content{overflow:hidden}.dst-settings .dst-manager-content{min-height:520px}.dst-current{padding:9px 16px;background:#eef6ff;color:#24548a}.dst-current.empty{background:#fff7db;color:#76520b}.dst-tabs{display:flex;gap:5px;padding:10px 12px;border-bottom:1px solid #e2e8f0;overflow-x:auto}.dst-tab-body{padding:16px;overflow:auto;flex:1}.dst-button{border:0;border-radius:9px;padding:8px 12px;background:#326fd1;color:white;cursor:pointer;font:inherit}.dst-button:disabled{opacity:.5;cursor:not-allowed}.dst-button.secondary,.dst-button.tab{background:#eef2f7;color:#334155}.dst-button.active,.dst-button.tab.active{background:#dcecff;color:#174c8d}.dst-button.small{padding:5px 9px;font-size:12px}.dst-button.danger{background:#fee2e2;color:#a51f2a}.dst-header-button{padding:5px 9px;background:#f3e8ff;color:#6b21a8;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-actions{display:flex;align-items:center;gap:8px;margin:10px 0;flex-wrap:wrap}.dst-field{display:flex;flex-direction:column;gap:5px;margin:9px 0;min-width:0;flex:1}.dst-field>span{font-size:12px;font-weight:650;color:#475569}.dst-field input,.dst-field textarea,.dst-field select{box-sizing:border-box;width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:8px;background:var(--dsh-surface,#fff);color:inherit;font:inherit}.dst-field textarea{resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.dst-inline-fields{display:flex;gap:10px}.dst-section-title{font-size:16px;font-weight:750;margin-bottom:10px}.dst-muted{color:#64748b;font-size:12px}.dst-warning{background:#fff4d6;border:1px solid #f0cb69;color:#744d00;padding:9px;border-radius:8px}.dst-status{min-height:20px}.dst-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}.dst-card{border:1px solid #dce3ed;border-radius:11px;padding:12px;display:flex;flex-direction:column;gap:6px}.dst-tags,.dst-memory-keywords{display:flex;gap:4px;flex-wrap:wrap}.dst-tags span,.dst-memory-keywords span{font-size:11px;background:#f1f5f9;padding:2px 6px;border-radius:999px}.dst-memory-table{display:flex;flex-direction:column;gap:7px;margin-top:12px}.dst-memory-row{display:flex;justify-content:space-between;gap:12px;border:1px solid #dce3ed;border-radius:9px;padding:9px}.dst-memory-row pre{margin:5px 0 0;white-space:pre-wrap;font-size:11px}.dst-script{border:1px solid #dce3ed;border-radius:10px;padding:12px;margin:12px 0}.dst-trusted-frame,.dst-turn-render iframe{width:100%;min-height:260px;border:1px solid #cbd5e1;border-radius:8px;background:white}.dst-template-list{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px}.dst-turn-render{margin:8px 0;padding:8px;border:1px solid #e2e8f0;border-radius:9px}.dst-turn-render summary{cursor:pointer;color:#6b21a8}.dst-settings{padding:8px 4px}.dst-settings h2{margin-top:0}.dst-loading,.dst-error{padding:20px}.dst-error{color:#b91c1c}.dst-confirm-layer{position:fixed;inset:0;z-index:8;display:grid;place-items:center;padding:16px;background:#0f172a66;pointer-events:auto}.dst-confirm-card{box-sizing:border-box;width:min(600px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;padding:20px;border:1px solid #ccd5e3;border-radius:14px;background:var(--dsh-surface,#fff);box-shadow:0 24px 70px #0f172a66}.dst-reference-list{margin:10px 0;padding:10px 12px;border:1px solid #dce3ed;border-radius:9px}.dst-reference-list ul{margin:6px 0 0;padding-left:20px}.dst-worldbook-controls{display:grid;grid-template-columns:minmax(260px,1fr) auto minmax(260px,1fr);align-items:end;gap:12px;margin-bottom:14px;padding:12px;border:1px solid #dce3ed;border-radius:11px}.dst-worldbook-controls>.dst-muted{grid-column:1/-1;margin:0}.dst-worldbook-resource-actions{align-self:end;margin:9px 0}.dst-worldbook-resource-actions .dst-button{white-space:nowrap}@media(max-width:900px){.dst-worldbook-controls{grid-template-columns:1fr}.dst-worldbook-controls>.dst-muted{grid-column:auto}}@media(max-width:640px){.dst-inline-fields{display:block}.dst-manager{inset:0;width:100vw;height:100dvh}.dst-card-grid{grid-template-columns:1fr}}
 .dst-worldbook-book{padding:10px 12px;border:1px solid #dce3ed;border-radius:11px;background:color-mix(in srgb,var(--dsh-surface,#fff) 96%,#326fd1 4%)}.dst-worldbook-check{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#475569;cursor:pointer}.dst-worldbook-check input{margin:0}.dst-worldbook-setting{align-self:center;min-height:36px;padding-top:16px;box-sizing:border-box}.dst-worldbook-list-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:18px 0 8px}.dst-worldbook-list{display:flex;flex-direction:column;gap:10px}.dst-worldbook-entry{content-visibility:auto;contain-intrinsic-size:92px 620px;border:1px solid #dce3ed;border-radius:11px;background:var(--dsh-surface,#fff);overflow:hidden}.dst-worldbook-entry.disabled{opacity:.72}.dst-worldbook-entry-head{display:flex;align-items:center;gap:9px;padding:10px 12px}.dst-worldbook-entry-head strong{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-worldbook-order{white-space:nowrap}.dst-worldbook-entry>details{border-top:1px solid #e2e8f0}.dst-worldbook-entry summary,.dst-worldbook-advanced summary{padding:8px 12px;color:#326fd1;cursor:pointer;user-select:none}.dst-worldbook-entry-body{padding:4px 12px 12px}.dst-worldbook-policies{display:inline-flex;flex:0 0 auto;gap:4px;padding:3px;border:1px solid #d7deea;border-radius:10px;background:#f4f7fb}.dst-worldbook-policy{border:0;border-radius:7px;padding:5px 8px;background:transparent;color:#475569;font:inherit;font-size:12px;cursor:pointer}.dst-worldbook-policy.active{background:var(--dsh-surface,#fff);box-shadow:0 1px 4px #0f172a22;color:#172033}.dst-worldbook-policy.constant>span{color:#3478dc}.dst-worldbook-policy.keyword>span{color:#28a35a}.dst-worldbook-policy.vectorized>span{filter:saturate(.7)}.dst-worldbook-vector-note{margin:6px 0;font-size:12px}.dst-worldbook-advanced{margin-top:10px;border:1px solid #e2e8f0;border-radius:9px}.dst-worldbook-advanced-body{padding:0 10px 10px}.dst-worldbook-save{position:sticky;bottom:-16px;z-index:2;margin:16px -16px -16px;padding:10px 16px;border-top:1px solid #dce3ed;background:color-mix(in srgb,var(--dsh-surface,#fff) 94%,transparent)}@media(max-width:640px){.dst-worldbook-entry-head{flex-wrap:wrap}.dst-worldbook-entry-head strong{flex-basis:45%}.dst-worldbook-policies-head{width:100%;box-sizing:border-box}.dst-worldbook-policy{flex:1}.dst-worldbook-setting{padding-top:4px}}
-.dst-opening-greeting{box-sizing:border-box;width:100%;height:max(320px,calc(100dvh - 260px));min-height:0;margin:0 0 8px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1,#dfe3ea);border-radius:16px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#182033);box-shadow:0 4px 18px rgba(15,23,42,.06);font:14px/1.55 system-ui,sans-serif;display:flex;flex:0 0 auto;flex-direction:column;overflow:hidden}.dst-opening-header{display:flex;flex:0 0 auto;align-items:center;gap:7px;margin-bottom:8px}.dst-opening-icon{flex:0 0 auto;color:var(--dsw-alias-brand-primary,#326fd1)}.dst-opening-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.dst-opening-text{display:flex;flex:1 1 auto;flex-direction:column;gap:10px;min-height:0;max-height:none;overflow:auto;white-space:normal;overflow-wrap:anywhere}.dst-opening-html{display:block;box-sizing:border-box;width:100%;height:auto;min-height:240px;flex:1 1 360px;border:0;border-radius:10px;background:var(--dsw-alias-bg-base,#fff)}.dst-opening-hint{flex:0 0 auto;margin-top:9px;color:var(--dsw-alias-label-secondary,#64748b);font-size:12px}.dst-opening-message{box-sizing:border-box;width:100%;padding:4px 16px 12px;color:var(--dsw-alias-label-primary,#182033);font:15px/1.65 system-ui,sans-serif}.dst-opening-message .dst-opening-text{display:flex;flex-direction:column;gap:10px;max-height:none;overflow:visible}.dst-opening-message .dst-opening-html{min-height:360px;flex:0 0 520px}@media(max-width:560px){.dst-opening-greeting{height:max(320px,calc(100dvh - 300px))}}.dst-composer-character{display:inline-flex;align-items:center;min-width:0;max-width:min(100%,220px);flex:0 1 auto}.dst-character-menu{min-width:0;max-width:100%;flex:0 1 auto}.dst-character-seat{display:inline-flex;align-items:center;gap:4px;box-sizing:border-box;max-width:min(100%,220px);min-width:0;min-height:28px;padding:0 8px;border:0;border-radius:16px;background:transparent;color:var(--dsw-alias-label-primary,var(--dsh-text,#182033));font:500 13px/20px system-ui,sans-serif;white-space:nowrap;overflow:hidden;cursor:pointer}.dst-character-seat:not(:disabled):hover,.dst-character-seat[aria-expanded='true']{background:var(--dsw-alias-interactive-bg-hover,#eef2f7)}.dst-character-seat:disabled{cursor:default;color:var(--dsw-alias-label-quaternary,#9aa1ad)}.dst-character-seat.compact{max-width:180px}.dst-character-icon,.dst-character-chevron{flex:0 0 auto;color:var(--dsw-alias-label-primary,#182033)}.dst-character-chevron{color:var(--dsw-alias-label-caption,#81858c)}.dst-character-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-character-seat:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#8fb5f5);outline-offset:2px}@container (max-width:780px){.dst-character-seat.compact{max-width:52px;padding:0 6px}.dst-character-label{display:none}}@container (max-width:560px){.dst-character-seat.compact{max-width:28px}.dst-character-chevron{display:none}}@media (max-width:900px){.dst-character-seat.compact{max-width:52px;padding:0 6px}.dst-character-label{display:none}}@media (max-width:520px){.dst-character-seat.compact{max-width:28px}.dst-character-chevron{display:none}}
+.dst-opening-greeting{box-sizing:border-box;width:100%;height:max(320px,calc(100dvh - 260px));min-height:0;margin:0 0 8px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1,#dfe3ea);border-radius:16px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#182033);box-shadow:0 4px 18px rgba(15,23,42,.06);font:14px/1.55 system-ui,sans-serif;display:flex;flex:0 0 auto;flex-direction:column;overflow:hidden}.dst-opening-header{display:flex;flex:0 0 auto;align-items:center;gap:7px;margin-bottom:8px}.dst-opening-icon{flex:0 0 auto;color:var(--dsw-alias-brand-primary,#326fd1)}.dst-opening-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.dst-opening-text{display:flex;flex:1 1 auto;flex-direction:column;gap:10px;min-height:0;max-height:none;overflow:auto;white-space:normal;overflow-wrap:anywhere}.dst-opening-html{display:block;box-sizing:border-box;width:100%;height:auto;min-height:0;flex:0 0 auto;border:0;border-radius:10px;background:var(--dsw-alias-bg-base,#fff)}.dst-opening-hint{flex:0 0 auto;margin-top:9px;color:var(--dsw-alias-label-secondary,#64748b);font-size:12px}.dst-opening-message{box-sizing:border-box;width:100%;padding:4px 16px 12px;color:var(--dsw-alias-label-primary,#182033);font:15px/1.65 system-ui,sans-serif}.dst-opening-message .dst-opening-text{display:flex;flex-direction:column;gap:10px;max-height:none;overflow:visible}.dst-opening-message .dst-opening-html{min-height:0;flex:0 0 auto}@media(max-width:560px){.dst-opening-greeting{height:max(320px,calc(100dvh - 300px))}}.dst-composer-character{display:inline-flex;align-items:center;min-width:0;max-width:min(100%,220px);flex:0 1 auto}.dst-character-menu{min-width:0;max-width:100%;flex:0 1 auto}.dst-character-seat{position:relative;display:inline-flex;align-items:center;gap:4px;box-sizing:border-box;max-width:min(100%,220px);min-width:0;min-height:28px;padding:0 8px;border:0;border-radius:16px;background:transparent;color:var(--dsw-alias-label-primary,var(--dsh-text,#182033));font:500 13px/20px system-ui,sans-serif;white-space:nowrap;overflow:hidden;cursor:pointer}.dst-character-seat:not(:disabled):hover,.dst-character-seat[aria-expanded='true']{background:var(--dsw-alias-interactive-bg-hover,#eef2f7)}.dst-character-seat:disabled{cursor:default;color:var(--dsw-alias-label-quaternary,#9aa1ad)}.dst-character-seat.compact{max-width:180px}.dst-character-icon,.dst-character-chevron{flex:0 0 auto;color:var(--dsw-alias-label-primary,#182033)}.dst-character-chevron{color:var(--dsw-alias-label-caption,#81858c)}.dst-character-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-character-seat.compact .dst-character-label{flex:0 0 auto;width:max-content}.dst-character-seat.compact.icon-only{width:28px;max-width:28px;flex:0 0 28px;justify-content:center;padding:0 6px}.dst-character-seat.compact.icon-only .dst-character-label{position:absolute;visibility:hidden;pointer-events:none}.dst-character-seat.compact.icon-only .dst-character-chevron{display:none}.dst-character-seat:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#8fb5f5);outline-offset:2px}
 `
     const RUNTIME_CSS = `
 .dst-memory-empty-state{margin:12px 0;padding:28px 16px;border:1px dashed #cbd5e1;border-radius:11px;color:#64748b;text-align:center}.dst-memory-table{gap:12px}.dst-memory-row{content-visibility:auto;contain-intrinsic-size:180px;display:flex;flex-direction:column;gap:12px;border-radius:12px;padding:14px;background:var(--dsh-surface,#fff)}.dst-memory-row-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dst-memory-identity{display:flex;min-width:0;align-items:center;gap:8px}.dst-memory-identity strong{overflow-wrap:anywhere}.dst-memory-table-name{flex:none;padding:2px 8px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:11px;font-weight:700}.dst-memory-meta{display:flex;flex:none;align-items:center;justify-content:flex-end;gap:8px;color:#64748b;font-size:11px}.dst-memory-value{min-width:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--dsh-surface,#fff) 94%,#326fd1 6%)}.dst-memory-fields{display:flex;flex-direction:column;margin:0}.dst-memory-field{display:grid;grid-template-columns:minmax(90px,25%) minmax(0,1fr);gap:12px;padding:7px 0;border-bottom:1px solid #dce3ed}.dst-memory-field:first-child{padding-top:0}.dst-memory-field:last-child{padding-bottom:0;border-bottom:0}.dst-memory-field dt{color:#64748b;font-size:12px;font-weight:650;overflow-wrap:anywhere}.dst-memory-field dd{min-width:0;margin:0;overflow-wrap:anywhere;white-space:pre-wrap}.dst-memory-array{display:flex;flex-direction:column;gap:5px;margin:0;padding-left:24px}.dst-memory-array>li{padding-left:3px}.dst-memory-scalar.number{color:#6b21a8;font-variant-numeric:tabular-nums}.dst-memory-scalar.boolean{display:inline-block;padding:1px 7px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:12px}.dst-memory-scalar.boolean.false{background:#f1f5f9;color:#64748b}.dst-memory-scalar.null,.dst-memory-scalar.empty,.dst-memory-empty{color:#94a3b8;font-style:italic}.dst-memory-nested{min-width:0;border:1px solid #dce3ed;border-radius:8px;background:var(--dsh-surface,#fff)}.dst-memory-nested>summary{padding:5px 8px;color:#326fd1;cursor:pointer;font-size:12px;user-select:none}.dst-memory-nested>.dst-memory-fields,.dst-memory-nested>.dst-memory-array{margin:0 8px 8px}.dst-memory-row-actions{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dst-memory-raw{min-width:0;color:#64748b;font-size:12px}.dst-memory-raw>summary{cursor:pointer;user-select:none}.dst-memory-raw pre{box-sizing:border-box;max-width:min(720px,calc(100vw - 96px));max-height:300px;margin:8px 0 0;padding:10px;overflow:auto;border-radius:8px;background:#0f172a;color:#e2e8f0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:640px){.dst-memory-row-head{flex-direction:column}.dst-memory-meta{flex-wrap:wrap;justify-content:flex-start}.dst-memory-field{grid-template-columns:1fr;gap:3px}.dst-memory-row-actions{align-items:flex-end}}
@@ -2159,7 +3399,8 @@ self.onmessage = event => {
       document.head.appendChild(style)
       ctx.effect(() => () => style.remove())
       ctx.effect(() => () => overlay.reset())
-      ctx.effect(() => () => { scriptPolicies.reset(); scriptScopes.reset(); scriptEvents.reset(); composerBridges.clear(); regexEngine.dispose() })
+      ctx.effect(() => compatRuntime.start())
+      ctx.effect(() => () => { scriptPolicies.reset(); scriptScopes.reset(); scriptEvents.reset(); compatRuntime.reset(); regexEngine.dispose() })
       const registerMessageRenderers = () => {
         const disposeAssistant = ctx.slots.register({ name: 'conversation.chat.node', key: 'assistant-step', priority: -20 }, TavernAssistantNode)
         const disposeUser = ctx.slots.register({ name: 'conversation.chat.node', key: 'user', priority: -20 }, TavernUserNode)

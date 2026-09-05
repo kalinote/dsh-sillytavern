@@ -5,8 +5,16 @@ import { basename, join, resolve } from 'node:path'
 import { hostname } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { parseCardBytes, validateCardV3 } from './card-v3.js'
+import { createChatMessages, createCompatChat, deleteChatMessages, getChatMessages, inspectCompatChat, mergeNativeMessages, rotateChatMessages, setChatMessages, switchSwipe } from './compat-chat.js'
+import { emptyCompatibilityWorkspace, normalizeCompatibilityWorkspace, readWorkspaceVariableScope, replaceWorkspaceVariableScope } from './compatibility-state.js'
 import { applyMemoryOperation, assertMemoryKeywordsInSource, emptyMemoryDocument, normalizeMemoryDocument, queryMemoryGraph } from './memory.js'
-import { sessionEvents } from './prompt.js'
+import { initialGreetingView, sessionEvents, sessionTranscriptMessages } from './prompt.js'
+import {
+  createWorldbookEntries as appendTavernWorldbookEntries,
+  deleteWorldbookEntries as removeTavernWorldbookEntries,
+  replaceWorldbookEntries as replaceTavernWorldbookEntries,
+  toTavernWorldbookEntries,
+} from './tavern-worldbook.js'
 
 const MAX_CARD_RECORD_BYTES = 12 * 1024 * 1024
 const MAX_CARD_READ_BYTES = 13 * 1024 * 1024
@@ -93,6 +101,25 @@ function normalizeScriptList(scripts, forceDisable = false) {
     used.add(id)
     return { ...normalized, id }
   })
+}
+
+function normalizeCompatibilityRegexList(scripts) {
+  if (!Array.isArray(scripts) || scripts.length > 32) throw new TypeError('regexes must be an array with at most 32 entries')
+  return normalizeScriptList(scripts.map((script, index) => {
+    if (script === null || typeof script !== 'object' || Array.isArray(script)) throw new TypeError(`regexes[${index}] must be an object`)
+    const regex = normalizeRegexMetadata(script)
+    const source = String(script.source ?? script.replaceString ?? '')
+    const enabled = script.enabled !== false && script.disabled !== true
+    return {
+      id: String(script.id ?? ''),
+      name: String(script.name ?? script.scriptName ?? `Regex ${index + 1}`),
+      kind: 'regex',
+      enabled,
+      approvedHash: enabled ? scriptHash('regex', source, regex) : null,
+      source,
+      ...regex,
+    }
+  }))
 }
 
 async function awaitWithSignal(promise, signal) {
@@ -308,11 +335,26 @@ function normalizeBinding(binding) {
   if (binding === null || typeof binding !== 'object' || Array.isArray(binding) || !/^[a-f0-9]{64}$/.test(String(binding.cardId ?? ''))) return null
   const persona = binding.userPersona !== null && typeof binding.userPersona === 'object' && !Array.isArray(binding.userPersona) ? binding.userPersona : {}
   const variables = binding.variables !== null && typeof binding.variables === 'object' && !Array.isArray(binding.variables) ? snapshot(binding.variables) : {}
-  const scriptInjections = Array.isArray(binding.scriptInjections) ? binding.scriptInjections.flatMap((item, index) => item !== null && typeof item === 'object' && !Array.isArray(item) ? [{
-    id: String(item.id ?? `injection-${index}`),
-    text: String(item.text ?? ''),
-    order: Number.isFinite(Number(item.order)) ? Number(item.order) : index,
-  }] : []) : []
+  const chatMetadata = binding.chatMetadata !== null && typeof binding.chatMetadata === 'object' && !Array.isArray(binding.chatMetadata) ? snapshot(binding.chatMetadata) : {}
+  const scriptInjections = Array.isArray(binding.scriptInjections) ? binding.scriptInjections.flatMap((item, index) => {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return []
+    const normalized = {
+      id: String(item.id ?? `injection-${index}`),
+      text: String(item.content ?? item.text ?? ''),
+      order: Number.isFinite(Number(item.order)) ? Number(item.order) : index,
+    }
+    if (['content', 'position', 'depth', 'role', 'should_scan'].some(key => Object.hasOwn(item, key))) Object.assign(normalized, {
+      content: String(item.content ?? item.text ?? ''),
+      position: item.position === 'none' ? 'none' : 'in_chat',
+      depth: Number.isFinite(Number(item.depth)) ? Number(item.depth) : 0,
+      role: ['system', 'assistant', 'user'].includes(item.role) ? item.role : 'system',
+      should_scan: item.should_scan === true,
+      once: item.once === true,
+      ownerFrameId: typeof item.ownerFrameId === 'string' ? item.ownerFrameId : null,
+      hasFilter: item.hasFilter === true,
+    })
+    return [normalized]
+  }) : []
   return {
     revision: Number.isSafeInteger(Number(binding.revision)) && Number(binding.revision) >= 0 ? Number(binding.revision) : 0,
     cardId: String(binding.cardId),
@@ -323,6 +365,7 @@ function normalizeBinding(binding) {
     userPersona: { name: String(persona.name ?? 'User'), description: String(persona.description ?? '') },
     templateIds: Array.isArray(binding.templateIds) ? binding.templateIds.map(value => String(value)) : [],
     variables,
+    chatMetadata,
     scriptInjections,
     openingSwipeId: Number.isSafeInteger(Number(binding.openingSwipeId)) && Number(binding.openingSwipeId) >= 0 ? Number(binding.openingSwipeId) : 0,
   }
@@ -345,9 +388,11 @@ function normalizeRegexSourcesDocument(document) {
   const variables = document?.schemaVersion === 1 && document.variables !== null && typeof document.variables === 'object' && !Array.isArray(document.variables) ? snapshot(document.variables) : {}
   return {
     schemaVersion: 1,
+    revision: Number.isSafeInteger(Number(document?.revision)) && Number(document.revision) >= 0 ? Number(document.revision) : 0,
     global: normalize(document?.schemaVersion === 1 ? document.global : []),
     preset: normalize(document?.schemaVersion === 1 ? document.preset : []),
     variables,
+    updatedAt: typeof document?.updatedAt === 'string' ? document.updatedAt : new Date(0).toISOString(),
   }
 }
 
@@ -362,6 +407,7 @@ function defaultBinding(cardId) {
     userPersona: { name: 'User', description: '' },
     templateIds: [],
     variables: {},
+    chatMetadata: {},
     scriptInjections: [],
     openingSwipeId: 0,
   }
@@ -381,8 +427,26 @@ function normalizeWorldbookBook(value, forcedName) {
 
 function worldbookNameKey(value) { return String(value).trim().toLocaleLowerCase() }
 
+function worldbookLibraryLockTarget(state) { return join(state.root, 'worldbooks', '.library') }
+
 function isAbortSignal(value) {
   return value !== null && typeof value === 'object' && typeof value.throwIfAborted === 'function' && typeof value.addEventListener === 'function'
+}
+
+function emptyCompatChatDocument(sessionId, nativeMessages = []) {
+  return { schemaVersion: 1, sessionId: String(sessionId), revision: 0, chat: inspectCompatChat(createCompatChat(nativeMessages)), updatedAt: new Date(0).toISOString() }
+}
+
+function normalizeCompatChatDocument(value, sessionId, nativeMessages = []) {
+  if (value?.schemaVersion !== 1 || value.sessionId !== String(sessionId) || value.chat === null || typeof value.chat !== 'object') return emptyCompatChatDocument(sessionId, nativeMessages)
+  const merged = mergeNativeMessages(value.chat, nativeMessages)
+  return {
+    schemaVersion: 1,
+    sessionId: String(sessionId),
+    revision: Number.isSafeInteger(Number(value.revision)) && Number(value.revision) >= 0 ? Number(value.revision) : 0,
+    chat: inspectCompatChat(merged),
+    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date(0).toISOString(),
+  }
 }
 
 // Every durable plugin resource is rooted below the workspace that owns it.
@@ -454,9 +518,32 @@ export class SillyTavernStore {
 
   async loadWorldbookRecord(path, expectedId) {
     const raw = await readJson(path, null, MAX_WORLDBOOK_RECORD_BYTES)
-    if (raw?.schemaVersion !== 1 || raw.id !== expectedId || typeof raw.name !== 'string' || raw.book === null || typeof raw.book !== 'object' || Array.isArray(raw.book)) return undefined
+    if (![1, 2].includes(Number(raw?.schemaVersion)) || raw.id !== expectedId || typeof raw.name !== 'string' || raw.book === null || typeof raw.book !== 'object' || Array.isArray(raw.book)) return undefined
     const book = normalizeWorldbookBook(raw.book, raw.name)
-    return { schemaVersion: 1, id: expectedId, name: book.name, book, createdAt: String(raw.createdAt ?? new Date(0).toISOString()), updatedAt: String(raw.updatedAt ?? raw.createdAt ?? new Date(0).toISOString()) }
+    return {
+      schemaVersion: 2,
+      id: expectedId,
+      revision: Number.isSafeInteger(Number(raw.revision)) && Number(raw.revision) >= 0 ? Number(raw.revision) : 0,
+      name: book.name,
+      book,
+      createdAt: String(raw.createdAt ?? new Date(0).toISOString()),
+      updatedAt: String(raw.updatedAt ?? raw.createdAt ?? new Date(0).toISOString()),
+    }
+  }
+
+  async refreshWorldbookLibrary(state) {
+    const files = await readdir(join(state.root, 'worldbooks'), { withFileTypes: true })
+    const records = new Map()
+    for (const file of files) {
+      if (!file.isFile() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json$/.test(file.name)) continue
+      const id = file.name.slice(0, -5)
+      try {
+        const record = await this.loadWorldbookRecord(join(state.root, 'worldbooks', file.name), id)
+        if (record !== undefined) records.set(id, record)
+      } catch { /* one malformed resource must not hide the rest of the library */ }
+    }
+    state.worldbooks = records
+    return records
   }
 
   async workspaceState(context) {
@@ -472,6 +559,7 @@ export class SillyTavernStore {
         mkdir(join(root, 'originals'), { recursive: true }),
         mkdir(join(root, 'worldbooks'), { recursive: true }),
         mkdir(join(root, 'memory'), { recursive: true }),
+        mkdir(join(root, 'compat-chats'), { recursive: true }),
       ])
       const state = {
         workspace,
@@ -483,6 +571,8 @@ export class SillyTavernStore {
         globalRegexScripts: [],
         presetRegexScripts: [],
         globalVariables: {},
+        regexRevision: 0,
+        compatibility: emptyCompatibilityWorkspace(),
         selectedCardId: null,
       }
       const [cardFiles, worldbookFiles] = await Promise.all([
@@ -508,10 +598,13 @@ export class SillyTavernStore {
       for (const card of state.cards.values()) if (card.defaultWorldbookId !== null && !state.worldbooks.has(card.defaultWorldbookId)) card.defaultWorldbookId = null
       const templates = await readJson(join(root, 'templates.json'), { schemaVersion: 1, templates: [] }, 4 * 1024 * 1024)
       state.templates = templates?.schemaVersion === 1 && Array.isArray(templates.templates) ? templates.templates.slice(0, 32) : []
-      const regex = normalizeRegexSourcesDocument(await readJson(join(root, 'regex-scripts.json'), { schemaVersion: 1, global: [], preset: [] }, 16 * 1024 * 1024))
+      const regex = normalizeRegexSourcesDocument(await readJson(join(root, 'regex-scripts.json'), { schemaVersion: 1, revision: 0, global: [], preset: [] }, 16 * 1024 * 1024))
       state.globalRegexScripts = regex.global
       state.presetRegexScripts = regex.preset
       state.globalVariables = regex.variables
+      state.regexRevision = regex.revision
+      state.compatibility = normalizeCompatibilityWorkspace(await readJson(join(root, 'compatibility.json'), emptyCompatibilityWorkspace(), 16 * 1024 * 1024))
+      if (Object.keys(state.compatibility.variables.global).length === 0 && Object.keys(state.globalVariables).length > 0) state.compatibility.variables.global = snapshot(state.globalVariables)
       const selection = await readJson(join(root, 'selection.json'), { schemaVersion: 1, selectedCardId: null }, 64 * 1024)
       state.selectedCardId = typeof selection?.selectedCardId === 'string' && state.cards.has(selection.selectedCardId) ? selection.selectedCardId : null
       this.workspaces.set(workspace, state)
@@ -539,10 +632,11 @@ export class SillyTavernStore {
     if (isAbortSignal(context)) { signal = context; context = undefined }
     const state = await this.stateFor(context)
     signal?.throwIfAborted()
-    const document = normalizeRegexSourcesDocument(await readJson(join(state.root, 'regex-scripts.json'), { schemaVersion: 1, global: [], preset: [] }, 16 * 1024 * 1024))
+    const document = normalizeRegexSourcesDocument(await readJson(join(state.root, 'regex-scripts.json'), { schemaVersion: 1, revision: 0, global: [], preset: [] }, 16 * 1024 * 1024))
     state.globalRegexScripts = document.global
     state.presetRegexScripts = document.preset
     state.globalVariables = document.variables
+    state.regexRevision = document.revision
     return snapshot(document)
   }
 
@@ -556,19 +650,302 @@ export class SillyTavernStore {
     if (Object.hasOwn(patch, 'variables') && (patch.variables === null || typeof patch.variables !== 'object' || Array.isArray(patch.variables))) throw new TypeError('global variables must be an object')
     const path = join(state.root, 'regex-scripts.json')
     return this.serial(`regex:${state.root}`, () => withFileLock(path, async () => {
-      const current = normalizeRegexSourcesDocument(await readJson(path, { schemaVersion: 1, global: [], preset: [] }, 16 * 1024 * 1024))
+      const current = normalizeRegexSourcesDocument(await readJson(path, { schemaVersion: 1, revision: 0, global: [], preset: [] }, 16 * 1024 * 1024))
+      if (Object.hasOwn(patch, 'expectedRevision')) {
+        const expectedRevision = Number(patch.expectedRevision)
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new TypeError('regex expectedRevision must be a non-negative safe integer')
+        if (expectedRevision !== current.revision) {
+          const error = new Error(`regex revision changed from ${expectedRevision} to ${current.revision}`)
+          error.code = 'regex-revision-conflict'
+          error.details = { currentRevision: current.revision }
+          throw error
+        }
+      }
       const next = {
         schemaVersion: 1,
+        revision: current.revision + 1,
         global: Object.hasOwn(patch, 'global') ? normalizeScriptList(patch.global).filter(script => script.kind === 'regex') : current.global,
         preset: Object.hasOwn(patch, 'preset') ? normalizeScriptList(patch.preset).filter(script => script.kind === 'regex') : current.preset,
         variables: Object.hasOwn(patch, 'variables') ? snapshot(patch.variables) : current.variables,
+        updatedAt: new Date().toISOString(),
       }
       assertSafeOwnedJson(next, 16 * 1024 * 1024, 'regex sources')
       await atomicJson(path, next, () => signal?.throwIfAborted())
       state.globalRegexScripts = next.global
       state.presetRegexScripts = next.preset
       state.globalVariables = next.variables
+      state.regexRevision = next.revision
+      state.compatibility.variables.global = snapshot(next.variables)
       return snapshot(next)
+    }, signal), signal)
+  }
+
+  async replaceCompatibilityRegexes(agent, changes, signal) {
+    if (changes === null || typeof changes !== 'object' || Array.isArray(changes)) throw new TypeError('regex changes must be an object')
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    const sourcePatch = {}
+    if (Object.hasOwn(changes, 'global')) sourcePatch.global = normalizeCompatibilityRegexList(changes.global)
+    if (Object.hasOwn(changes, 'preset')) sourcePatch.preset = normalizeCompatibilityRegexList(changes.preset)
+    if (Object.keys(sourcePatch).length > 0) {
+      await this.saveRegexSources({
+        ...sourcePatch,
+        ...(changes.expectedRevision === undefined ? {} : { expectedRevision: changes.expectedRevision }),
+      }, signal, agent)
+    }
+    if (Object.hasOwn(changes, 'character')) {
+      if (session.binding === null) throw new Error('current session has no selected character')
+      const record = session.state.cards.get(session.binding.cardId)
+      if (record === undefined) throw new Error(`card ${session.binding.cardId} was not found`)
+      const replacements = normalizeCompatibilityRegexList(changes.character)
+      let replacementIndex = 0
+      const scripts = record.scripts.flatMap(script => {
+        if (script.kind !== 'regex') return [script]
+        if (replacementIndex >= replacements.length) return []
+        const replacement = replacements[replacementIndex]
+        replacementIndex += 1
+        return [replacement]
+      })
+      scripts.push(...replacements.slice(replacementIndex))
+      await this.updateCard(record.id, { scripts }, signal, agent)
+    }
+    return this.sessionView(agent)
+  }
+
+  compatChatProjection(agent) {
+    const session = this.sessionSync(agent)
+    if (session === undefined) return { revision: 0, messages: [] }
+    const state = session.compatChat.chat
+    const messages = getChatMessages(state, '0-{{lastMessageId}}').map((message, index) => {
+      const internal = state.entries[index]
+      const isUser = message.role === 'user'
+      return {
+        ...message,
+        uid: internal.uid,
+        origin: internal.origin,
+        sourceSeq: internal.sourceSeq,
+        event_seq: internal.sourceSeq,
+        is_user: isUser,
+        is_system: message.role === 'system',
+        mes: message.message,
+        text: message.message,
+        swipe_id: internal.swipe_id,
+        swipes: snapshot(internal.swipes),
+        swipes_data: snapshot(internal.swipes_data),
+        swipes_info: snapshot(internal.swipes_info),
+      }
+    })
+    return { revision: session.compatChat.revision, messages }
+  }
+
+  async refreshCompatChat(agent, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    const path = session.compatChatPath
+    return this.serial(`compat-chat:${session.workspace}:${session.agentId}`, () => withFileLock(path, async () => {
+      let current
+      try {
+        current = normalizeCompatChatDocument(await readJson(path, emptyCompatChatDocument(session.agentId), 20 * 1024 * 1024), session.agentId, sessionTranscriptMessages(agent))
+      } catch {
+        current = emptyCompatChatDocument(session.agentId, sessionTranscriptMessages(agent))
+      }
+      if (current.chat.entries.length === 0 && session.binding !== null) {
+        const promptState = this.promptState(agent)
+        const greeting = promptState === undefined ? null : initialGreetingView(promptState, Number(session.binding.openingSwipeId ?? 0))
+        if (greeting !== null) {
+          const swipes = []
+          for (let swipeId = 0; swipeId < greeting.swipeCount; swipeId += 1) {
+            const item = initialGreetingView(promptState, swipeId)
+            swipes.push(item?.text ?? '')
+          }
+          let chat = createChatMessages(current.chat, [{ role: 'assistant', name: greeting.characterName, message: swipes[greeting.swipeId], data: {}, extra: { dsh_opening: true } }])
+          chat = setChatMessages(chat, [{ message_id: 0, swipes, swipe_id: greeting.swipeId, swipes_data: swipes.map(() => ({})), swipes_info: swipes.map(() => ({ dsh_opening: true })) }])
+          current.chat = inspectCompatChat(chat)
+        }
+      }
+      const previous = JSON.stringify(session.compatChat.chat)
+      if (JSON.stringify(current.chat) !== previous) {
+        current.revision = Math.max(current.revision, session.compatChat.revision) + 1
+        current.updatedAt = new Date().toISOString()
+        assertSafeOwnedJson(current, 20 * 1024 * 1024, 'compat chat')
+        await atomicJson(path, current, () => this.assertAgentActive(agent, session))
+      }
+      session.compatChat = current
+      return this.compatChatProjection(agent)
+    }, signal), signal)
+  }
+
+  async mutateCompatChat(agent, request, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    if (request === null || typeof request !== 'object' || Array.isArray(request)) throw new TypeError('compat chat mutation must be an object')
+    const path = session.compatChatPath
+    return this.serial(`compat-chat:${session.workspace}:${session.agentId}`, () => withFileLock(path, async () => {
+      let current = normalizeCompatChatDocument(await readJson(path, emptyCompatChatDocument(session.agentId), 20 * 1024 * 1024), session.agentId, sessionTranscriptMessages(agent))
+      if (Object.hasOwn(request, 'expectedRevision')) {
+        const expectedRevision = Number(request.expectedRevision)
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new TypeError('chat expectedRevision must be a non-negative safe integer')
+        if (expectedRevision !== current.revision) {
+          const error = new Error(`chat revision changed from ${expectedRevision} to ${current.revision}`)
+          error.code = 'chat-revision-conflict'
+          error.details = { currentRevision: current.revision }
+          throw error
+        }
+      }
+      const action = String(request.action ?? '')
+      let next
+      if (action === 'set') next = setChatMessages(current.chat, request.messages ?? [])
+      else if (action === 'create') next = createChatMessages(current.chat, request.messages ?? [], request.options ?? {})
+      else if (action === 'delete') next = deleteChatMessages(current.chat, request.messageIds ?? [])
+      else if (action === 'rotate') next = rotateChatMessages(current.chat, request.begin, request.middle, request.end)
+      else if (action === 'switch-swipe') next = switchSwipe(current.chat, request.messageId, request.swipeId)
+      else throw new TypeError(`unknown compat chat mutation ${action}`)
+      current = { ...current, revision: current.revision + 1, chat: inspectCompatChat(next), updatedAt: new Date().toISOString() }
+      assertSafeOwnedJson(current, 20 * 1024 * 1024, 'compat chat')
+      await atomicJson(path, current, () => this.assertAgentActive(agent, session))
+      session.compatChat = current
+      return this.compatChatProjection(agent)
+    }, signal), signal)
+  }
+
+  compatibilityVariableSnapshot(agent, metadata = {}) {
+    const session = this.sessionSync(agent)
+    if (session === undefined || session.binding === null) return {
+      revisions: { chat: 0, global: 0, workspace: 0, message: 0 },
+      scopes: { chat: {}, global: {}, preset: {}, character: {}, message: {}, script: {}, extension: {} },
+    }
+    const context = { binding: session.binding, cardId: session.binding.cardId, scriptId: metadata.scriptId }
+    const read = option => readWorkspaceVariableScope(session.state.compatibility, option, context)
+    return {
+      revisions: {
+        chat: Number(session.binding.revision ?? 0),
+        global: Number(session.state.regexRevision ?? 0),
+        workspace: Number(session.state.compatibility.revision ?? 0),
+        message: Number(session.compatChat?.revision ?? 0),
+      },
+      scopes: {
+        chat: snapshot(session.binding.variables),
+        global: snapshot(session.state.globalVariables),
+        preset: read({ type: 'preset' }),
+        character: read({ type: 'character' }),
+        message: {},
+        script: read({ type: 'script', script_id: metadata.scriptId }),
+        extension: metadata.extensionId ? read({ type: 'extension', extension_id: metadata.extensionId }) : {},
+      },
+    }
+  }
+
+  async replaceCompatibilityVariables(agent, option, variables, metadata = {}, signal) {
+    if (variables === null || typeof variables !== 'object' || Array.isArray(variables)) throw new TypeError('variables must be an object')
+    assertSafeOwnedJson(variables, 1024 * 1024, 'variables')
+    const type = String(option?.type || 'chat')
+    if (type === 'chat') {
+      const patch = { variables }
+      if (metadata.expectedRevision !== undefined) patch.expectedRevision = metadata.expectedRevision
+      await this.updateSession(agent, patch, signal)
+      return this.compatibilityVariableSnapshot(agent, metadata)
+    }
+    if (type === 'global') {
+      await this.saveRegexSources({ variables, ...(metadata.expectedRevision === undefined ? {} : { expectedRevision: metadata.expectedRevision }) }, signal, agent)
+      return this.compatibilityVariableSnapshot(agent, metadata)
+    }
+    if (type === 'message') {
+      await this.refreshCompatChat(agent, signal)
+      const projection = this.compatChatProjection(agent)
+      const rawId = option?.message_id ?? 'latest'
+      const number = rawId === 'latest' ? projection.messages.length - 1 : Number(rawId)
+      if (!Number.isSafeInteger(number)) throw new TypeError('message_id must be a safe integer or latest')
+      const messageId = number < 0 ? projection.messages.length + number : number
+      if (messageId < 0 || messageId >= projection.messages.length) throw new RangeError('message_id is outside the current chat')
+      await this.mutateCompatChat(agent, {
+        action: 'set',
+        expectedRevision: metadata.expectedRevision,
+        messages: [{ message_id: messageId, data: variables }],
+      }, signal)
+      const result = this.compatibilityVariableSnapshot(agent, metadata)
+      result.revisions.message = this.compatChatProjection(agent).revision
+      result.scopes.message = snapshot(variables)
+      return result
+    }
+    if (!['preset', 'character', 'script', 'extension'].includes(type)) throw new TypeError(`unsupported variable scope ${type}`)
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    if (session.binding === null) throw new Error('current session has no selected character')
+    const state = session.state
+    const path = join(state.root, 'compatibility.json')
+    return this.serial(`compatibility:${state.root}`, () => withFileLock(path, async () => {
+      const current = normalizeCompatibilityWorkspace(await readJson(path, emptyCompatibilityWorkspace(), 16 * 1024 * 1024))
+      if (metadata.expectedRevision !== undefined) {
+        const expectedRevision = Number(metadata.expectedRevision)
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new TypeError('compatibility expectedRevision must be a non-negative safe integer')
+        if (current.revision !== expectedRevision) {
+          const error = new Error(`compatibility revision changed from ${expectedRevision} to ${current.revision}`)
+          error.code = 'compatibility-revision-conflict'
+          error.details = { currentRevision: current.revision }
+          throw error
+        }
+      }
+      const next = replaceWorkspaceVariableScope(current, option, variables, {
+        binding: session.binding,
+        cardId: session.binding.cardId,
+        scriptId: metadata.scriptId,
+      })
+      assertSafeOwnedJson(next, 16 * 1024 * 1024, 'compatibility workspace state')
+      await atomicJson(path, next, () => this.assertAgentActive(agent, session))
+      state.compatibility = next
+      return this.compatibilityVariableSnapshot(agent, metadata)
+    }, signal), signal)
+  }
+
+  async updateCompatibilityState(agent, patch, metadata = {}, signal) {
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) throw new TypeError('compatibility state patch must be an object')
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    if (session.binding === null) throw new Error('current session has no selected character')
+    const state = session.state
+    const path = join(state.root, 'compatibility.json')
+    return this.serial(`compatibility:${state.root}`, () => withFileLock(path, async () => {
+      const current = normalizeCompatibilityWorkspace(await readJson(path, emptyCompatibilityWorkspace(), 16 * 1024 * 1024))
+      if (metadata.expectedRevision !== undefined) {
+        const expectedRevision = Number(metadata.expectedRevision)
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new TypeError('compatibility expectedRevision must be a non-negative safe integer')
+        if (current.revision !== expectedRevision) {
+          const error = new Error(`compatibility revision changed from ${expectedRevision} to ${current.revision}`)
+          error.code = 'compatibility-revision-conflict'
+          error.details = { currentRevision: current.revision }
+          throw error
+        }
+      }
+      const available = new Set(this.getWorldbookNames(state.workspace))
+      const names = (value, label) => {
+        if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`)
+        const result = [...new Set(value.map(String))]
+        const missing = result.filter(name => !available.has(name))
+        if (missing.length > 0) throw new Error(`${label} contains unknown worldbooks: ${missing.join(', ')}`)
+        return result
+      }
+      const next = normalizeCompatibilityWorkspace(current)
+      if (patch.extensionSettings !== undefined) {
+        if (patch.extensionSettings === null || typeof patch.extensionSettings !== 'object' || Array.isArray(patch.extensionSettings)) throw new TypeError('extensionSettings must be an object')
+        next.extensionSettings = snapshot(patch.extensionSettings)
+      }
+      if (patch.globalWorldbooks !== undefined) next.globalWorldbooks = names(patch.globalWorldbooks, 'globalWorldbooks')
+      if (patch.characterWorldbooks !== undefined) {
+        const value = patch.characterWorldbooks
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('characterWorldbooks must be an object')
+        const primary = value.primary === null || value.primary === undefined || value.primary === '' ? null : String(value.primary)
+        if (primary !== null && !available.has(primary)) throw new Error(`character primary worldbook "${primary}" was not found`)
+        next.characterWorldbooks[session.binding.cardId] = { primary, additional: names(value.additional ?? [], 'character additional worldbooks') }
+      }
+      if (patch.lorebookSettings !== undefined) {
+        if (patch.lorebookSettings === null || typeof patch.lorebookSettings !== 'object' || Array.isArray(patch.lorebookSettings)) throw new TypeError('lorebookSettings must be an object')
+        next.lorebookSettings = { ...next.lorebookSettings, ...snapshot(patch.lorebookSettings) }
+        if (Object.hasOwn(patch.lorebookSettings, 'selected_global_lorebooks')) {
+          next.lorebookSettings.selected_global_lorebooks = names(patch.lorebookSettings.selected_global_lorebooks, 'selected_global_lorebooks')
+          next.globalWorldbooks = snapshot(next.lorebookSettings.selected_global_lorebooks)
+        }
+      }
+      next.revision = current.revision + 1
+      next.updatedAt = new Date().toISOString()
+      assertSafeOwnedJson(next, 16 * 1024 * 1024, 'compatibility workspace state')
+      await atomicJson(path, next, () => this.assertAgentActive(agent, session))
+      state.compatibility = next
+      return this.sessionView(agent)
     }, signal), signal)
   }
 
@@ -696,6 +1073,7 @@ export class SillyTavernStore {
     return [...(state?.worldbooks.values() ?? [])].map(record => ({
       id: record.id,
       name: record.name,
+      revision: record.revision,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       entryCount: Array.isArray(record.book.entries) ? record.book.entries.length : 0,
@@ -713,11 +1091,57 @@ export class SillyTavernStore {
     return [...state.worldbooks.values()].find(record => worldbookNameKey(record.name) === key)
   }
 
+  exactWorldbookByName(state, name) {
+    return [...state.worldbooks.values()].find(record => record.name === String(name))
+  }
+
+  getWorldbookNames(context) {
+    const state = this.workspaces.get(this.workspaceFor(context))
+    return [...(state?.worldbooks.values() ?? [])].map(record => record.name).sort((left, right) => left.localeCompare(right))
+  }
+
+  getTavernWorldbookSnapshot(name, context) {
+    const state = this.workspaces.get(this.workspaceFor(context))
+    const record = state === undefined ? undefined : this.exactWorldbookByName(state, name)
+    if (record === undefined) throw new Error(`worldbook "${String(name)}" was not found`)
+    return {
+      id: record.id,
+      name: record.name,
+      revision: record.revision,
+      worldbook: toTavernWorldbookEntries(record.book),
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+    }
+  }
+
+  getTavernWorldbook(name, context) {
+    return this.getTavernWorldbookSnapshot(name, context).worldbook
+  }
+
   worldbookNameConflict(name, existing) {
     const error = new Error(`worldbook "${name}" already exists`)
     error.code = 'worldbook-name-conflict'
     error.details = { worldbookName: name, existingWorldbookId: existing.id }
     return error
+  }
+
+  worldbookRevisionConflict(existing, expectedRevision) {
+    const error = new Error(`worldbook "${existing.name}" revision changed`)
+    error.code = 'worldbook-revision-conflict'
+    error.details = {
+      worldbookId: existing.id,
+      worldbookName: existing.name,
+      expectedRevision,
+      actualRevision: existing.revision,
+    }
+    return error
+  }
+
+  assertWorldbookRevision(existing, expectedRevision) {
+    if (expectedRevision === undefined || expectedRevision === null) return
+    const expected = Number(expectedRevision)
+    if (!Number.isSafeInteger(expected) || expected < 0) throw new TypeError('expected worldbook revision must be a non-negative integer')
+    if (existing.revision !== expected) throw this.worldbookRevisionConflict(existing, expected)
   }
 
   async writeWorldbook(state, record, signal) {
@@ -737,7 +1161,8 @@ export class SillyTavernStore {
     if (!['error', 'overwrite', 'save-as'].includes(strategy)) throw new Error('worldbook conflict strategy must be error, overwrite, or save-as')
     const requestedName = strategy === 'save-as' ? options.saveAsName : options.name
     const book = normalizeWorldbookBook(bookValue, requestedName)
-    return this.serial(`resources:${state.root}`, async () => {
+    return this.serial(`resources:${state.root}`, () => withFileLock(worldbookLibraryLockTarget(state), async () => {
+      await this.refreshWorldbookLibrary(state)
       const sameName = this.worldbookByName(state, book.name)
       if (sameName !== undefined && strategy === 'error') throw this.worldbookNameConflict(book.name, sameName)
       if (strategy === 'save-as' && sameName !== undefined) throw this.worldbookNameConflict(book.name, sameName)
@@ -746,19 +1171,21 @@ export class SillyTavernStore {
         const overwriteId = options.overwriteId === undefined ? sameName?.id : safeWorldbookId(options.overwriteId)
         target = overwriteId === undefined ? undefined : state.worldbooks.get(overwriteId)
         if (target === undefined) throw new Error('overwrite target worldbook was not found')
+        this.assertWorldbookRevision(target, options.expectedRevision)
       }
       const timestamp = new Date().toISOString()
       const id = target?.id ?? randomUUID()
       const record = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         id,
+        revision: target === undefined ? 0 : target.revision + 1,
         name: book.name,
         book,
         createdAt: target?.createdAt ?? timestamp,
         updatedAt: timestamp,
       }
       return this.writeWorldbook(state, record, signal)
-    }, signal)
+    }, signal), signal)
   }
 
   async createWorldbook(book, options = {}) {
@@ -770,11 +1197,13 @@ export class SillyTavernStore {
     const state = await this.stateFor(options.context ?? options.workspace)
     const signal = options.signal
     if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) throw new TypeError('worldbook patch must be an object')
-    return this.serial(`resources:${state.root}`, async () => {
+    return this.serial(`resources:${state.root}`, () => withFileLock(worldbookLibraryLockTarget(state), async () => {
+      await this.refreshWorldbookLibrary(state)
       const path = join(state.root, 'worldbooks', `${worldbookId}.json`)
       return withFileLock(path, async () => {
         const existing = await this.loadWorldbookRecord(path, worldbookId)
         if (existing === undefined) throw new Error(`worldbook ${worldbookId} was not found`)
+        this.assertWorldbookRevision(existing, options.expectedRevision)
         const input = snapshot(Object.hasOwn(patch, 'book') ? patch.book : { ...existing.book, ...patch })
         if (input !== null && typeof input === 'object' && !Array.isArray(input)) delete input.id
         const book = normalizeWorldbookBook(input, patch.name ?? input.name ?? existing.name)
@@ -782,13 +1211,131 @@ export class SillyTavernStore {
         if (collision !== undefined && collision.id !== worldbookId) {
           throw this.worldbookNameConflict(book.name, collision)
         }
-        const record = { ...existing, name: book.name, book, updatedAt: new Date().toISOString() }
+        const record = { ...existing, schemaVersion: 2, revision: existing.revision + 1, name: book.name, book, updatedAt: new Date().toISOString() }
         assertSafeOwnedJson(record, MAX_WORLDBOOK_RECORD_BYTES, 'worldbook record')
         await atomicJson(path, record, () => signal?.throwIfAborted())
         state.worldbooks.set(worldbookId, record)
         return snapshot(record)
       }, signal)
-    }, signal)
+    }, signal), signal)
+  }
+
+  async createTavernWorldbook(name, entries = [], options = {}) {
+    if (!Array.isArray(entries)) throw new TypeError('worldbook entries must be an array')
+    const state = await this.stateFor(options.context ?? options.workspace)
+    const signal = options.signal
+    const worldbookName = normalizeWorldbookBook({ name, entries: [] }).name
+    return this.serial(`resources:${state.root}`, () => withFileLock(worldbookLibraryLockTarget(state), async () => {
+      await this.refreshWorldbookLibrary(state)
+      if (this.worldbookByName(state, worldbookName) !== undefined) return false
+      const timestamp = new Date().toISOString()
+      const converted = replaceTavernWorldbookEntries({ name: worldbookName, entries: [], extensions: {} }, entries)
+      const record = {
+        schemaVersion: 2,
+        id: randomUUID(),
+        revision: 0,
+        name: worldbookName,
+        book: normalizeWorldbookBook(converted.book, worldbookName),
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }
+      await this.writeWorldbook(state, record, signal)
+      return true
+    }, signal), signal)
+  }
+
+  async createOrReplaceTavernWorldbook(name, entries = [], options = {}) {
+    if (!Array.isArray(entries)) throw new TypeError('worldbook entries must be an array')
+    const state = await this.stateFor(options.context ?? options.workspace)
+    const signal = options.signal
+    const worldbookName = normalizeWorldbookBook({ name, entries: [] }).name
+    return this.serial(`resources:${state.root}`, () => withFileLock(worldbookLibraryLockTarget(state), async () => {
+      await this.refreshWorldbookLibrary(state)
+      const existing = this.worldbookByName(state, worldbookName)
+      if (existing !== undefined) this.assertWorldbookRevision(existing, options.expectedRevision)
+      else if (options.expectedRevision !== undefined && options.expectedRevision !== null) {
+        throw new Error(`worldbook "${worldbookName}" was not found`)
+      }
+      const converted = replaceTavernWorldbookEntries(existing?.book ?? { name: worldbookName, entries: [], extensions: {} }, entries)
+      const timestamp = new Date().toISOString()
+      const record = {
+        schemaVersion: 2,
+        id: existing?.id ?? randomUUID(),
+        revision: existing === undefined ? 0 : existing.revision + 1,
+        name: existing?.name ?? worldbookName,
+        book: normalizeWorldbookBook(converted.book, existing?.name ?? worldbookName),
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      }
+      await this.writeWorldbook(state, record, signal)
+      return existing === undefined
+    }, signal), signal)
+  }
+
+  async replaceTavernWorldbook(name, entries, options = {}) {
+    if (!Array.isArray(entries)) throw new TypeError('worldbook entries must be an array')
+    await this.mutateTavernWorldbook(name, options, existing => replaceTavernWorldbookEntries(existing.book, entries))
+  }
+
+  async createTavernWorldbookEntries(name, entries, options = {}) {
+    if (!Array.isArray(entries)) throw new TypeError('new worldbook entries must be an array')
+    const result = await this.mutateTavernWorldbook(name, options, existing => appendTavernWorldbookEntries(existing.book, entries))
+    return { worldbook: result.worldbook, new_entries: result.new_entries }
+  }
+
+  async deleteTavernWorldbookEntries(name, predicateOrUids, options = {}) {
+    const predicate = typeof predicateOrUids === 'function'
+      ? predicateOrUids
+      : (() => {
+          if (!Array.isArray(predicateOrUids)) throw new TypeError('worldbook entry deletion requires a predicate or uid array')
+          const uids = new Set(predicateOrUids.map(Number).filter(Number.isSafeInteger))
+          return entry => uids.has(entry.uid)
+        })()
+    const result = await this.mutateTavernWorldbook(name, options, existing => removeTavernWorldbookEntries(existing.book, predicate))
+    return { worldbook: result.worldbook, deleted_entries: result.deleted_entries }
+  }
+
+  async mutateTavernWorldbook(name, options, operation) {
+    const state = await this.stateFor(options.context ?? options.workspace)
+    const signal = options.signal
+    const worldbookName = String(name)
+    return this.serial(`resources:${state.root}`, () => withFileLock(worldbookLibraryLockTarget(state), async () => {
+      await this.refreshWorldbookLibrary(state)
+      const existing = this.exactWorldbookByName(state, worldbookName)
+      if (existing === undefined) throw new Error(`worldbook "${worldbookName}" was not found`)
+      this.assertWorldbookRevision(existing, options.expectedRevision)
+      const result = operation(snapshot(existing))
+      if (result === null || typeof result !== 'object' || result.book === null || typeof result.book !== 'object') throw new TypeError('worldbook mutation must return a book')
+      const record = {
+        ...existing,
+        schemaVersion: 2,
+        revision: existing.revision + 1,
+        book: normalizeWorldbookBook(result.book, existing.name),
+        updatedAt: new Date().toISOString(),
+      }
+      const path = join(state.root, 'worldbooks', `${existing.id}.json`)
+      assertSafeOwnedJson(record, MAX_WORLDBOOK_RECORD_BYTES, 'worldbook record')
+      await withFileLock(path, () => atomicJson(path, record, () => signal?.throwIfAborted()), signal)
+      state.worldbooks.set(existing.id, record)
+      return { ...snapshot(result), revision: record.revision }
+    }, signal), signal)
+  }
+
+  async deleteTavernWorldbook(name, options = {}) {
+    const state = await this.stateFor(options.context ?? options.workspace)
+    const signal = options.signal
+    const worldbookName = String(name)
+    return this.serial(`resources:${state.root}`, () => withFileLock(worldbookLibraryLockTarget(state), async () => {
+      await this.refreshWorldbookLibrary(state)
+      const existing = this.exactWorldbookByName(state, worldbookName)
+      if (existing === undefined) return false
+      this.assertWorldbookRevision(existing, options.expectedRevision)
+      const bindings = await this.currentBindings(state)
+      const references = this.worldbookReferencesFrom(state, bindings, existing.id)
+      if (options.rejectIfReferenced === true && (references.cards.length > 0 || references.sessions.length > 0)) throw this.referenceError('worldbook', existing.id, references)
+      await this.deleteWorldbookLocked(state, existing, bindings, signal)
+      return true
+    }, signal), signal)
   }
 
   async importCard(bytes, metadata = {}, signal, context) {
@@ -971,14 +1518,16 @@ export class SillyTavernStore {
     const worldbookId = safeWorldbookId(id)
     const state = await this.stateFor(options.context ?? options.workspace)
     const signal = options.signal
-    return this.serial(`resources:${state.root}`, async () => {
+    return this.serial(`resources:${state.root}`, () => withFileLock(worldbookLibraryLockTarget(state), async () => {
+      await this.refreshWorldbookLibrary(state)
       const existing = state.worldbooks.get(worldbookId) ?? await this.loadWorldbookRecord(join(state.root, 'worldbooks', `${worldbookId}.json`), worldbookId)
       if (existing === undefined) throw new Error(`worldbook ${worldbookId} was not found`)
+      this.assertWorldbookRevision(existing, options.expectedRevision)
       const bindings = await this.currentBindings(state)
       const references = this.worldbookReferencesFrom(state, bindings, worldbookId)
       if (options.rejectIfReferenced === true && (references.cards.length > 0 || references.sessions.length > 0)) throw this.referenceError('worldbook', worldbookId, references)
       return this.deleteWorldbookLocked(state, existing, bindings, signal)
-    }, signal)
+    }, signal), signal)
   }
 
   async deleteCard(id, options = {}) {
@@ -1050,7 +1599,14 @@ export class SillyTavernStore {
       const state = await this.stateFor(workspace)
       const memoryName = createHash('sha256').update(id).digest('hex')
       const memoryPath = join(state.root, 'memory', `${memoryName}.json`)
+      const compatChatPath = join(state.root, 'compat-chats', `${memoryName}.json`)
       let memory = normalizeMemoryDocument(await readJson(memoryPath, emptyMemoryDocument(id), 20 * 1024 * 1024), id)
+      let compatChat
+      try {
+        compatChat = normalizeCompatChatDocument(await readJson(compatChatPath, emptyCompatChatDocument(id), 20 * 1024 * 1024), id, sessionTranscriptMessages(agent))
+      } catch {
+        compatChat = emptyCompatChatDocument(id, sessionTranscriptMessages(agent))
+      }
       await Promise.all([this.refreshTemplates(workspace), this.refreshRegexSources(workspace)])
       return this.serial(`bindings:${state.root}`, async () => {
         const bindingsPath = join(state.root, 'bindings.json')
@@ -1082,7 +1638,7 @@ export class SillyTavernStore {
           const cached = this.sessions.get(key)
           if (cached?.memory.revision > memory.revision) memory = cached.memory
           if (this.disposedAgents.has(agent)) throw new Error(`agent ${id} was disposed`)
-          const session = { key, agentId: id, epoch, workspace, state, binding: binding === null ? null : snapshot(binding), memory, memoryPath }
+          const session = { key, agentId: id, epoch, workspace, state, binding: binding === null ? null : snapshot(binding), memory, memoryPath, compatChat, compatChatPath }
           if ((this.sessionEpoch.get(key) ?? 0) === epoch) this.sessions.set(key, session)
           return session
         })
@@ -1157,6 +1713,10 @@ export class SillyTavernStore {
       await atomicJson(path, bindings, () => this.assertAgentActive(agent, session))
       session.binding = next
       state.bindings = bindings
+      if (previous?.cardId !== id) {
+        session.compatChat = emptyCompatChatDocument(session.agentId, sessionTranscriptMessages(agent))
+        await atomicJson(session.compatChatPath, session.compatChat, () => this.assertAgentActive(agent, session))
+      }
       return this.sessionView(agent)
     }, signal), signal)
   }
@@ -1206,6 +1766,15 @@ export class SillyTavernStore {
       const bindings = normalizeBindingsDocument(await readJson(path, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
       const current = bindings.sessions[session.agentId] ?? null
       if (current === null) throw new Error('current session has no selected character')
+      if (Object.hasOwn(patch, 'expectedRevision')) {
+        const expectedRevision = Number(patch.expectedRevision)
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new TypeError('session expectedRevision must be a non-negative safe integer')
+        if (current.revision !== expectedRevision) {
+          const error = new Error(`session revision changed from ${expectedRevision} to ${current.revision}`)
+          error.code = 'session-revision-conflict'
+          throw error
+        }
+      }
       const next = snapshot(current)
       if (patch.userPersona !== undefined) {
         const name = String(patch.userPersona.name ?? 'User')
@@ -1222,9 +1791,26 @@ export class SillyTavernStore {
         assertSafeOwnedJson(patch.variables, 1024 * 1024, 'variables')
         next.variables = snapshot(patch.variables)
       }
+      if (patch.chatMetadata !== undefined) {
+        if (patch.chatMetadata === null || typeof patch.chatMetadata !== 'object' || Array.isArray(patch.chatMetadata)) throw new Error('chatMetadata must be an object')
+        assertSafeOwnedJson(patch.chatMetadata, 1024 * 1024, 'chatMetadata')
+        next.chatMetadata = snapshot(patch.chatMetadata)
+      }
       if (patch.scriptInjections !== undefined) {
         if (!Array.isArray(patch.scriptInjections) || patch.scriptInjections.length > 64) throw new Error('scriptInjections must contain at most 64 entries')
-        const injections = patch.scriptInjections.map(item => ({ id: String(item.id ?? randomUUID()), text: String(item.text ?? ''), order: Number(item.order ?? 0) }))
+        const injections = patch.scriptInjections.map(item => ({
+          id: String(item.id ?? randomUUID()),
+          text: String(item.content ?? item.text ?? ''),
+          content: String(item.content ?? item.text ?? ''),
+          order: Number(item.order ?? 0),
+          position: item.position === 'none' ? 'none' : 'in_chat',
+          depth: Number.isFinite(Number(item.depth)) ? Number(item.depth) : 0,
+          role: ['system', 'assistant', 'user'].includes(item.role) ? item.role : 'system',
+          should_scan: item.should_scan === true,
+          once: item.once === true,
+          ownerFrameId: typeof item.ownerFrameId === 'string' ? item.ownerFrameId : null,
+          hasFilter: item.hasFilter === true,
+        }))
         if (injections.some(item => Buffer.byteLength(item.text, 'utf8') > 16 * 1024) || Buffer.byteLength(JSON.stringify(injections), 'utf8') > 64 * 1024) throw new Error('scriptInjections exceed the size limit')
         next.scriptInjections = injections
       }
@@ -1255,6 +1841,41 @@ export class SillyTavernStore {
     if (binding === null || card === undefined) return null
     const id = binding.startedAt === null && binding.worldbookExplicit !== true ? card.defaultWorldbookId : binding.worldbookId
     return id === null ? null : state.worldbooks.get(id) ?? null
+  }
+
+  compatibilityPromptWorldbook(state, binding, card) {
+    const selected = this.effectiveWorldbook(state, binding, card)
+    const character = state.compatibility.characterWorldbooks[String(binding?.cardId ?? '')] ?? { primary: null, additional: [] }
+    const names = [
+      ...state.compatibility.globalWorldbooks,
+      character.primary,
+      ...character.additional,
+    ].filter(value => typeof value === 'string' && value !== '')
+    const records = []
+    const seen = new Set()
+    for (const name of names) {
+      const record = this.exactWorldbookByName(state, name)
+      if (record !== undefined && !seen.has(record.id)) { seen.add(record.id); records.push(record) }
+    }
+    if (selected !== null && !seen.has(selected.id)) records.push(selected)
+    if (records.length === 0) return null
+    if (records.length === 1) return records[0]
+    return {
+      schemaVersion: 2,
+      id: 'dsh-sillytavern-combined-worldbooks',
+      revision: Math.max(...records.map(record => Number(record.revision ?? 0))),
+      name: records.map(record => record.name).join(' + '),
+      book: {
+        name: records.map(record => record.name).join(' + '),
+        entries: records.flatMap(record => (record.book.entries ?? []).map((entry, index) => ({
+          ...snapshot(entry),
+          id: `${record.id}:${String(entry.id ?? entry.uid ?? index)}`,
+        }))),
+        extensions: { dsh_sillytavern_sources: records.map(record => ({ id: record.id, name: record.name, revision: record.revision })) },
+      },
+      createdAt: records[0].createdAt,
+      updatedAt: records.map(record => record.updatedAt).sort().at(-1),
+    }
   }
 
   async memory(agent, operation, signal) {
@@ -1304,7 +1925,7 @@ export class SillyTavernStore {
 
   sessionView(agent) {
     const session = this.sessionSync(agent)
-    if (session === undefined) return { sessionId: agent.id, ready: false, binding: null, card: null, worldbook: null, worldbookId: null, memory: emptyMemoryDocument(agent.id), templates: [], globalRegexScripts: [], presetRegexScripts: [], globalVariables: {} }
+    if (session === undefined) return { sessionId: agent.id, ready: false, binding: null, card: null, worldbook: null, worldbookId: null, memory: emptyMemoryDocument(agent.id), templates: [], globalRegexScripts: [], presetRegexScripts: [], globalVariables: {}, compatibilityVariables: { revisions: { chat: 0, global: 0, workspace: 0 }, scopes: { chat: {}, global: {}, preset: {}, character: {}, message: {}, script: {}, extension: {} } } }
     const card = session.binding === null ? null : session.state.cards.get(session.binding.cardId) ?? null
     const worldbook = card === null ? null : this.effectiveWorldbook(session.state, session.binding, card)
     return {
@@ -1319,7 +1940,16 @@ export class SillyTavernStore {
       templates: snapshot(session.state.templates),
       globalRegexScripts: snapshot(session.state.globalRegexScripts),
       presetRegexScripts: snapshot(session.state.presetRegexScripts),
+      regexRevision: Number(session.state.regexRevision ?? 0),
       globalVariables: snapshot(session.state.globalVariables),
+      compatibilityVariables: this.compatibilityVariableSnapshot(agent),
+      compatibilityVariableMaps: snapshot(session.state.compatibility.variables),
+      extensionSettings: snapshot(session.state.compatibility.extensionSettings),
+      globalWorldbooks: snapshot(session.state.compatibility.globalWorldbooks),
+      characterWorldbooks: snapshot(session.state.compatibility.characterWorldbooks),
+      lorebookSettings: snapshot(session.state.compatibility.lorebookSettings),
+      worldbookNames: this.getWorldbookNames(session.workspace),
+      compatChat: this.compatChatProjection(agent),
     }
   }
 
@@ -1331,7 +1961,7 @@ export class SillyTavernStore {
     const selected = session.binding.templateIds.length === 0
       ? session.state.templates.filter(template => template.enabled !== false)
       : session.state.templates.filter(template => session.binding.templateIds.includes(template.id) && template.enabled !== false)
-    return { record, binding: session.binding, worldbook: this.effectiveWorldbook(session.state, session.binding, record), memory: session.memory, templates: selected, globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables }
+    return { record, binding: session.binding, worldbook: this.compatibilityPromptWorldbook(session.state, session.binding, record), memory: session.memory, templates: selected, globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables, compatMessages: this.compatChatProjection(agent).messages, lorebookSettings: session.state.compatibility.lorebookSettings }
   }
 
   regexEntries(agent) {

@@ -230,6 +230,32 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.equal(libraryAfterImport.body.value.selectedCard.name, 'Alice')
   const previewOnly = fakeAgent(join(root, 'workspace'), 'session-http-preview-only')
   agents.set(previewOnly.id, previewOnly)
+  const compatibility = await invoke(route, 'GET', '/api/dsh-sillytavern/compatibility')
+  assert.equal(compatibility.status, 200)
+  assert.equal(compatibility.body.value.schemaVersion, 1)
+  assert.match(compatibility.body.value.upstream.tavernHelper.revision, /^[a-f0-9]{40}$/)
+  const compatWorldbookCreate = await invoke(route, 'POST', '/api/dsh-sillytavern/compat/worldbook', {
+    sessionId: live.id,
+    action: 'create',
+    name: 'Compatibility Route Lore',
+    entries: [{ name: 'route', content: 'route-compatible lore', strategy: { type: 'constant' } }],
+  })
+  assert.equal(compatWorldbookCreate.status, 200)
+  const compatWorldbookRead = await invoke(route, 'POST', '/api/dsh-sillytavern/compat/worldbook', { sessionId: live.id, action: 'get', name: 'Compatibility Route Lore' })
+  assert.equal(compatWorldbookRead.body.value.worldbook[0].content, 'route-compatible lore')
+  const compatRegexWrite = await invoke(route, 'POST', '/api/dsh-sillytavern/compat/regex', {
+    sessionId: live.id,
+    changes: { global: [{ id: 'compat-route', name: 'Compatibility Route', enabled: true, findRegex: '/never-match-this/', source: 'unchanged', placement: [2], markdownOnly: true }] },
+  })
+  assert.equal(compatRegexWrite.status, 200)
+  const compatRuntime = await invoke(route, 'GET', `/api/dsh-sillytavern/compat/runtime?sessionId=${live.id}`)
+  assert.equal(compatRuntime.body.value.state.globalRegexScripts[0].id, 'compat-route')
+  assert.equal(compatRuntime.body.value.regexRevision > 0, true)
+  const openingRuntime = await invoke(route, 'GET', `/api/dsh-sillytavern/compat/runtime?sessionId=${previewOnly.id}`)
+  assert.equal(openingRuntime.status, 200)
+  assert.equal(openingRuntime.body.value.sessionId, previewOnly.id)
+  assert.equal(openingRuntime.body.value.cardRecord.id, imported.body.value.record.id, 'blank sessions receive the same selected greeting candidate in their bootstrap snapshot')
+  assert.equal(openingRuntime.body.value.state.binding.cardId, imported.body.value.record.id)
   const preview = await invoke(route, 'GET', `/api/dsh-sillytavern/greeting?sessionId=${previewOnly.id}`)
   assert.equal(preview.status, 200)
   assert.deepEqual(preview.body.value, { characterName: 'Alice', text: 'Welcome User — Alice keeps .', swipeId: 0, swipeCount: 2 })
@@ -251,6 +277,9 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.equal(selectedOpening.status, 200)
   assert.deepEqual(selectedOpening.body.value, { swipeId: 1 })
   assert.equal(ctx.sillyTavern.sessionView(previewOnly).binding.openingSwipeId, 1)
+  const staleSessionWrite = await invoke(route, 'POST', '/api/dsh-sillytavern/session/update', { sessionId: previewOnly.id, patch: { expectedRevision: 0, variables: { stale: true } } })
+  assert.equal(staleSessionWrite.status, 409)
+  assert.equal(staleSessionWrite.body.code, 'session-revision-conflict')
   const reopenedStore = new SillyTavernStore({ fallbackWorkspace: join(root, 'workspace') })
   await reopenedStore.ready
   const reopenedAgent = fakeAgent(join(root, 'workspace'), previewOnly.id)
@@ -397,7 +426,8 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   const eventState = await invoke(route, 'GET', `/api/dsh-sillytavern/event-state?sessionId=${live.id}&after=-1`)
   assert.equal(eventState.status, 200)
   assert.deepEqual(eventState.body.value.card, { id: imported.body.value.record.id, name: 'Alice' })
-  assert.equal(eventState.body.value.history[0].text, 'archive')
+  assert.equal(eventState.body.value.history.find(message => message.role === 'user')?.text, 'archive')
+  assert.equal(eventState.body.value.history[0].role, 'assistant', 'the selected opening is a durable projected floor before the first user message')
   assert.equal('memory' in eventState.body.value, false)
   assert.ok(JSON.stringify(eventState.body).length < 2048, 'event polling response stays lightweight')
   const traversal = await invoke(route, 'POST', '/api/dsh-sillytavern/card/update', { sessionId: live.id, cardId: '../escape', patch: { cardData: { name: 'x' } } })

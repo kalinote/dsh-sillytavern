@@ -6,7 +6,7 @@
 
 - **Host 根插件 `dsh-sillytavern`**：由 `dsh.bundle.patch` 加入 Host composition，拥有当前工作区内跨会话的角色库、独立世界书库、Web API 路由、工作区持久化缓存和异步记忆维护队列，并提供 `sillyTavern` Cordis Service。插件没有 DSH 级数据目录，也不跨工作区共享数据。
 - **Agent consumer `dsh-sillytavern/agent`**：由 `sillytavern` Agent preset 挂载。它不提供 Service，只向当前 preset 的 scoped registries 注册 Prompt、两个只读记忆 Tool 和人类 Commands。主 Agent 不执行记忆写入、纠错或去重。
-- **Client `dsh-sillytavern/client`**：随 Host bundle 被 `dsh.client` 自动发现，只使用官方 Slots 和 `commandUi.decorate`，不查询或改写 Harness DOM。角色卡快捷菜单与内置管理项注册在 `conversation.input.left`；空白会话的 `first_mes` 预览注册在全宽 `conversation.input.dock`，以 `ConversationSnapshot.blank` 控制生命周期；它用 `100dvh` 在自身组件内计算纵向剩余空间、窄屏采用独立开销，并以禁止 flex shrink 的自有根元素让 Logo、预览和原生 Composer 共同填满可视区，不查询或改写产品 DOM。管理器以全屏弹窗显示。普通助手正文、开场与未命中 HTML 的 Regex 结果由 DSH 0.1.2 `MarkdownText` 以完整 labels 渲染 GFM；兼容层只把围栏/缩进代码以外、独占 Markdown 行的传统 `<font color>` 投影为 React 颜色容器；状态栏等自定义标签只由角色卡或 Global/Preset/Scoped 来源实际定义且命中的 Regex 处理，未命中的 `<status>` 不获得插件内建语义。行内代码、链接标签、正文内联标签、未闭合或嵌套 `<font>` 均保持字面 Markdown，不执行模型输出中的任意 raw HTML。角色卡 Regex 生成的 HTML 围栏/文档则不经过属性、标签、URL 或 CSS 清理，也不注入 CSP；前端在授予脚本/表单/弹窗/下载/modal、但不授予 `allow-same-origin` 的 opaque-origin iframe 中运行；运行时在文档 head 注入独立 API 环境脚本，通过受 channel/source 校验的 `postMessage` 向父 Client 提供 `setChatMessages` message-0 swipe 与 `triggerSlash('/echo')` 子集，角色卡存储源不改写；刷新仅由当前插件的本地 mutation 触发，不做轮询或焦点刷新，刷新期间保持现有预览挂载。首轮完成后，持久 `st-opening` command node 通过 keyed `conversation.chat.commandview` Slot 渲染为顶部开场；overlay 与设置页分别注册在各自 list Slot；不占用 `conversation.hero.agentPreset`，不替换原生 Agent 预设或 Composer UI。酒馆会话的角色选择组件挂载后，以 priority -20 和 `chat` locale 临时注册 `conversation.chat.node:assistant-step`、`user`、`steering`、`turn-process` 与 `system-prompt` keyed renderer；这些 renderer 仅存活于当前酒馆会话组件，切换到其他预设/会话即释放并恢复内置 renderer。插件直接复用 DSH 提供的 `turnProcess.open/setOpen`，只把该折叠标题替换为“剧情推进”，不复制状态、不重排原生节点，因而工具调用、递归工具调用和思考过程仍保持原有嵌套层级。`system-prompt` renderer 在酒馆对话中返回隐藏标记，并以限定 CSS 收起完整节点，只隐藏呈现而不改变模型提示词；最终正文及其媒体、Regex/HTML 结果保持可见。
+- **Client `dsh-sillytavern/client`**：随 Host bundle 被 `dsh.client` 自动发现，只使用官方 Slots 和 `commandUi.decorate`，不查询或改写 Harness DOM。角色卡快捷菜单与内置管理项注册在 `conversation.input.left`；空白会话的 `first_mes` 预览注册在全宽 `conversation.input.dock`，以 `ConversationSnapshot.blank` 控制生命周期；它用 `100dvh` 在自身组件内计算纵向剩余空间、窄屏采用独立开销，并以禁止 flex shrink 的自有根元素让 Logo、预览和原生 Composer 共同填满可视区，不查询或改写产品 DOM。管理器以全屏弹窗显示。普通助手正文、开场与未命中 HTML 的 Regex 结果由 DSH 0.1.2 `MarkdownText` 以完整 labels 渲染 GFM；兼容层只把围栏/缩进代码以外、独占 Markdown 行的传统 `<font color>` 投影为 React 颜色容器；状态栏等自定义标签只由角色卡或 Global/Preset/Scoped 来源实际定义且命中的 Regex 处理，未命中的 `<status>` 不获得插件内建语义。行内代码、链接标签、正文内联标签、未闭合或嵌套 `<font>` 均保持字面 Markdown，不执行模型输出中的任意 raw HTML。角色卡 Regex 生成的 HTML 围栏/文档则不经过属性、标签、URL 或 CSS 清理，也不注入 CSP；前端在授予脚本/表单/弹窗/下载/modal、但不授予 `allow-same-origin` 的 opaque-origin iframe 中运行；运行时在文档 head、任何角色代码之前注入共享 TavernHelper/SillyTavern 环境，通过受 channel/source 校验的 `postMessage` 与 Session runtime 同步状态、事件和写入，开场特有操作作为同一协议的 action override，角色卡存储源不改写。首轮完成后，持久 `st-opening` command node 通过 keyed `conversation.chat.commandview` Slot 渲染为顶部开场；overlay 与设置页分别注册在各自 list Slot；不占用 `conversation.hero.agentPreset`，不替换原生 Agent 预设或 Composer UI。酒馆会话的角色选择组件挂载后，以 priority -20 和 `chat` locale 临时注册 `conversation.chat.node:assistant-step`、`user`、`steering`、`turn-process` 与 `system-prompt` keyed renderer；这些 renderer 仅存活于当前酒馆会话组件，切换到其他预设/会话即释放并恢复内置 renderer。插件直接复用 DSH 提供的 `turnProcess.open/setOpen`，只把该折叠标题替换为“剧情推进”，不复制状态、不重排原生节点，因而工具调用、递归工具调用和思考过程仍保持原有嵌套层级。`system-prompt` renderer 在酒馆对话中返回隐藏标记，并以限定 CSS 收起完整节点，只隐藏呈现而不改变模型提示词；最终正文及其媒体、Regex/HTML 结果保持可见。
 
 Agent preset 是 standing scope，不是一会话一实例。因此 Prompt provider 从 `AssembleContext.agent`、Tool 从 `exec.agent`、Command 从 invocation.agent 获取真实 Agent；不在 preset apply 闭包中缓存某个 Session。
 
@@ -61,7 +61,7 @@ Host 监听父会话成功的 `turn/end`，先通过 `sessions.flush(session)` �
 
 队列保证每 Session FIFO，并以共享信号量限制全局并发；任务失败最多重试三次。维护 Agent 返回最多 100 个 row/edge 操作。Host 合并来源、丢弃已失效的删除目标，按“删边→写行→写边→删行”排序；若生成期间 revision 改变则整任务重跑，最终提交仍带 `expectedRevision` 锁内复核。任务 ID 与 patch 原子写入 `appliedMaintenanceJobs`，因此即使进程恰在记忆提交后、队列完成状态落盘前退出，恢复也会跳过重复模型调用与重复提交。进程或父 Agent 中断时 running 任务恢复为 pending；恢复错误会记录，并在 idle 转换及下一次 Prompt 装配前重试。若 pending/failed 任务的来源已经 compact，Prompt 暂时注入任务中保存的原始正文，直到结构化记忆提交完成。
 
-世界书只在 Prompt 组装阶段执行，不在导入阶段改写；运行时只读取当前 Session `binding.worldbookId` 指向的独立资源，不读取角色卡内置 `character_book`。角色卡的 `defaultWorldbookId` 仅在 Session 首条真实用户消息时用于初始化该引用。`constant`、关键词、四种 selective secondary logic、概率、正则、全词匹配与 Order 均由运行时处理。启用 `recursive_scanning` 后，已接纳条目的宏/Regex 最终内容会加入下一轮扫描，支持 per-entry `scan_depth`、`exclude_recursion`、`prevent_recursion` 和 `delay_until_recursion`，并由有界最大步数终止；即使中间没有新 frontier，也会推进到仍待处理的显式延迟层级。候选先按 constant、再按高 Order 进入预算评估；首个普通条目达到预算后不再回填普通条目，但仍可扫描并接纳 `ignore_budget`；最终每个区段按低到高 Order 构建，使高 Order 靠近区段末尾。内容先展开宏并执行 WORLD_INFO Regex，再按模型路由使用与 SillyTavern 同系的 tiktoken、HF tokenizer JSON 或 SentencePiece 计数；预算默认是当前模型真实上下文窗口的 25%，可配置比例与 cap，未知/资源故障才警告并回退字节估算。卡片自己的 `token_budget` 作为附加上限取更小值，缺失表示不额外限制，显式 0 阻止普通条目而不影响 `ignore_budget` 条目。
+世界书只在 Prompt 组装阶段执行，不在导入阶段改写；运行时读取独立世界书资源，不读取角色卡内置 `character_book`。默认管理路径由 Session `binding.worldbookId` 指向一套书，角色卡的 `defaultWorldbookId` 仅在 Session 首条真实用户消息时初始化该引用；TavernHelper 绑定另外按工作区全局、当前角色 primary/additional、当前 Session 的顺序合并，重复资源按 ID 去重，组合条目获得带来源 ID 的稳定复合 ID。`constant`、关键词、四种 selective secondary logic、概率、正则、全词匹配与 Order 均由运行时处理。启用 `recursive_scanning` 后，已接纳条目的宏/Regex 最终内容会加入下一轮扫描，支持 per-entry `scan_depth`、`exclude_recursion`、`prevent_recursion` 和 `delay_until_recursion`，并由有界最大步数终止；即使中间没有新 frontier，也会推进到仍待处理的显式延迟层级。候选先按 constant、再按高 Order 进入预算评估；首个普通条目达到预算后不再回填普通条目，但仍可扫描并接纳 `ignore_budget`；最终每个区段按低到高 Order 构建，使高 Order 靠近区段末尾。内容先展开宏并执行 WORLD_INFO Regex，再按模型路由使用与 SillyTavern 同系的 tiktoken、HF tokenizer JSON 或 SentencePiece 计数；预算默认是当前模型真实上下文窗口的 25%，可配置比例与 cap，未知/资源故障才警告并回退字节估算。卡片自己的 `token_budget` 作为附加上限取更小值，缺失表示不额外限制，显式 0 阻止普通条目而不影响 `ignore_budget` 条目。
 
 V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同名字段只作兼容回退；缺省 position 按 After Char 处理。Before/After Character、AN Top/Bottom 和 EM Top/Bottom 分别落到独立 Prompt 锚点；命名 Outlet 只由 `{{outlet::Name}}` 在宏感知模板中消费，并兼容 `outlet_name`、`outletName`、`outlet`；at-depth 内容经 Host 的 `llm/stream` 投影插入当次不可变请求副本，保持指定 system/user/assistant role 与相对历史 depth，不追加 Session 事件。仅当本轮存在 `@depth` 投影时才生成请求绑定 ID，只有携带该私有 marker 的确切系统提示请求可以取得对应投影；没有 `@depth` 条目时系统提示保持原样，避免随机 marker 造成无意义的提示词缓存失效。Host 在重派发/adapter 前移除 marker，路由不一致则跳过并告警。未知 position 与空名称 Outlet 均跳过并告警，未知 decorator/content 原样保留。最近一次成功组装的活动条目、预算和警告保存在 Host 的会话级弱引用诊断快照，通过 `/session` 显示，但不写入 Session 事件，也不返回 Prompt 或扫描原文。扫描文本/深度、角色卡输入和最终 Prompt 仍受各自的通用数据预算约束；在这些通用边界内，世界书正则直接使用原生 JavaScript RegExp，不再施加正则专用长度上限，也不限制分组、交替、量词、前后查找、反向引用或 flags，不设置执行 deadline，数据与执行安全性由用户负责。EJS 模板在独立 resource-limited Worker 的禁用字符串代码生成 VM 中执行，50 ms VM timeout + 500 ms Worker deadline 后强制终止；本轮 AbortSignal 会立即 terminate Worker 并停止后续模板。模板只收到受预算的最小 scope。
 
@@ -75,7 +75,9 @@ V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同
   templates.json
   selection.json
   regex-scripts.json
+  compatibility.json
   bindings.json
+  compat-chats/<sha256(sessionId)>.json
   memory/<sha256(sessionId)>.json
   memory-maintenance/<sha256(sessionId)>.json
 ```
@@ -84,7 +86,7 @@ V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同
 
 隔离边界分为资源与引用两层：角色卡内容和其 Scoped 脚本、独立世界书内容、模板定义、Global/Preset Regex 与全局变量是工作区资源；Session binding 中的角色卡 ID、`worldbookId`、persona、会话变量、模板 ID 选择、prompt script injections 与开场 swipe，以及按 Session ID 哈希保存的记忆表格，是会话隔离数据。因此两个 Session 可以引用同一角色卡但使用不同世界书、persona、变量、模板选择、prompt injections 和记忆；修改共享角色卡、同一本世界书或工作区脚本/模板定义仍会同时影响引用者。当前管理器的“脚本”页编辑的是工作区或角色卡脚本，不是 Session 私有脚本副本；Session 私有 `scriptInjections` 由兼容 API 写入。
 
-角色卡中的 `character_book` 仅在角色导入时转换成独立世界书资源。角色记录保存 `defaultWorldbookId`，Session binding 保存 `worldbookId` 和 `startedAt`。一个角色卡和一个 Session 当前均只可关联一套世界书；这是刻意的单书限制，数据模型将来可扩展为 ID 列表。修改某独立世界书会实时影响所有仍引用它的角色与 Session；更新角色 `defaultWorldbookId` 不回写已有 Session。管理页的“编辑世界书”下拉框只决定编辑目标，默认跟随当前 Session 的 `worldbookId`；“Session 世界书”下拉框才修改该 Session 引用，两者独立。
+角色卡中的 `character_book` 仅在角色导入时转换成独立世界书资源。角色记录保存 `defaultWorldbookId`，Session binding 保存 `worldbookId` 和 `startedAt`；管理 UI 仍以这一套当前书作为简单路径。兼容 API 在 `compatibility.json` 保存全局书列表和每个角色的 primary/additional 列表，可形成多书 Prompt。修改某独立世界书会实时影响所有仍引用它的角色与 Session；更新角色 `defaultWorldbookId` 不回写已有 Session。管理页的“编辑世界书”下拉框只决定编辑目标，默认跟随当前 Session 的 `worldbookId`；“Session 世界书”下拉框才修改该 Session 引用，两者独立。
 
 角色卡导入时，如内置世界书与现有资源同名，用户必须选择“覆盖”或“另存为”。覆盖将以导入内容整本替换同名世界书，不进行条目级合并；另存为创建另一份独立资源。删除世界书前必须列出所有引用它的角色与 Session；确认删除后清空这些 `defaultWorldbookId`/`worldbookId` 引用。删除角色卡前必须检查引用它的未删除、未归档 Session；任何此类 Session 存在即拒绝删除并返回清单。无阻塞时可以勾选同时删除其默认世界书，未勾选则世界书作为独立资源保留。
 
@@ -94,25 +96,33 @@ V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同
 
 角色记录 schema 4 延续 schema 3 的 Regex 规则模型，将 `extensions.regex_scripts` 的每个对象保存为一条原子 Scoped 规则：`id/scriptName/findRegex/replaceString/trimStrings/placement/markdownOnly/promptOnly/runOnEdit/substituteRegex/minDepth/maxDepth` 不再被递归拆成伪脚本；Global 和 Preset 来源及 `{{globalvar::key}}` 变量保存在当前工作区的 `regex-scripts.json`。执行顺序固定为 Global → Preset → Scoped，每个来源内部保持管理列表顺序。0.5.3 schema 2 的已拆分记录在启动时从原卡恢复；schema 1 的旧授权禁用。授权 SHA-256 绑定规则类型、匹配式、替换内容和全部执行阶段元数据，修改任一受信字段都撤销授权，digest 代次避免等待期间的取消/编辑竞态。
 
-“启用”是持久的管线资格，不等于管理页运行。Scripts tab 只有“运行预览”显式挂载预览，停止、编辑、禁用、删除、切页或关闭管理器都会卸载。共享执行语义对齐 SillyTavern：JavaScript RegExp parser、placement 1/2/3/5/6、Markdown/Prompt/原始/Edit 阶段、min/max depth、NONE/RAW/ESCAPED findRegex 宏、`{{match}}`、数字/命名捕获、宏化 trimStrings 与最终替换宏。引擎与 Worker 接受 `isEdit` 并按 `runOnEdit` 门控；当前 DSH 尚无原生持久消息编辑事件，故会话 UI 没有可接入的编辑阶段触发器。替换回调只展开 SillyTavern 支持的捕获 token，因此 `$$`、`$&` 等保持字面量。系统不审查或清洗 replaceString，不拒绝嵌套重复/alternation，不施加 pattern/规则/trim 数量上限或 deadline；用户负责在启用前验证代码与正则。
+“启用”是持久的执行资格。已确认的 JavaScript 由当前 Session 的角色选择组件持续挂载为隐藏后台 iframe；角色、源码或授权 hash 变化才会更换实例。Scripts tab 的“运行预览”另外挂载临时预览，停止、编辑、禁用、删除、切页或关闭管理器会卸载该预览。Regex 的共享执行语义对齐 SillyTavern：JavaScript RegExp parser、placement 1/2/3/5/6、Markdown/Prompt/原始/Edit 阶段、min/max depth、NONE/RAW/ESCAPED findRegex 宏、`{{match}}`、数字/命名捕获、宏化 trimStrings 与最终替换宏。引擎与 Worker 接受 `isEdit` 并按 `runOnEdit` 门控；当前 DSH 尚无原生持久消息编辑事件，故会话 UI 没有可接入的编辑阶段触发器。替换回调只展开 SillyTavern 支持的捕获 token，因此 `$$`、`$&` 等保持字面量。系统不审查或清洗 replaceString，不拒绝嵌套重复/alternation，不施加 pattern/规则/trim 数量上限或 deadline；用户负责在启用前验证代码与正则。
 
-Host 的 `agent/pre-step` 在原生 UserMessage 入日志前执行原始 User Input 规则；`llm/stream` 先验证 Agent-loop 原请求，再以公共 LLM Service 单次重派发一个 promptOnly 消息投影视图，持久 Session 日志保持原文，返回流在入日志前按完整 block 执行原始 AI Output/Reasoning 规则。世界书在激活并展开宏后执行 WORLD_INFO prompt 阶段。Client 对 assistant/user/steering 的已完成 text/reasoning block 执行 Markdown 阶段；按次 Blob Worker 不设置超时，组件卸载时才取消。HTML 替换结果在不授予 `allow-same-origin` 的 opaque-origin iframe 中原样运行。父页面只通过 source/channel 校验的脚本 JSON API 暴露插件数据。针对 SillyTavern HTML 对 `window.parent.document.querySelector('#send_textarea')` 的既有调用，运行副本映射到 `__dshComposerInput` 代理，最终只调用官方 `inputActions.setDraft`，不开放父 DOM。
+Host 的 `agent/pre-step` 在原生 UserMessage 入日志前执行原始 User Input 规则；`llm/stream` 先验证 Agent-loop 原请求，再以公共 LLM Service 单次重派发一个 promptOnly 消息投影视图，持久 Session 日志保持原文，返回流在入日志前按完整 block 执行原始 AI Output/Reasoning 规则。世界书在激活并展开宏后执行 WORLD_INFO prompt 阶段。Client 对 assistant/user/steering 的已完成 text/reasoning block 执行 Markdown 阶段；按次 Blob Worker 不设置超时，组件卸载时才取消。HTML 替换结果在不授予 `allow-same-origin` 的 opaque-origin iframe 中原样运行。父页面只通过 source/channel 校验的脚本 JSON API 暴露插件数据。针对 SillyTavern HTML 对 parent `querySelector`、`getElementById` 或 jQuery `#send_textarea/#send_but` 的既有调用，运行副本映射到 `__dshComposerInput/__dshComposerSend` 代理，最终只调用官方 `inputActions.setDraft`，不开放父 DOM。
 
-脚本 API facade：
+## TavernHelper 阶段 0–5 契约
 
-- `getState/getCharacterCard/getWorldbook`
-- `getVariables/setVariables`
-- `injectPrompts`
-- `memory`
-- `eventOn/eventEmit`
-- `tavern_events`（`app_ready`、`message_received`、`character_changed`）
+兼容目标固定为 TavernHelper 4.9.3 commit `e559c5a13f6337b2ac1a1086c69587793beb3823` 与 SillyTavern 1.18.0 release commit `8172dcd0ee672d3cd9a5e5f7af134f91a45cd2b8`。`src/compatibility.js` 是机器可读能力清单和 Host snapshot normalizer；`GET /compatibility` 返回构建能力，`GET /compat/runtime` 返回当前 Session 的完整首屏快照。空白 Session 使用与 `/greeting` 相同的工作区候选角色，不会因尚未提交 binding 而给开场脚本返回空卡。
 
-依赖 SillyTavern 私有 DOM 或未实现后端 API 的脚本仍可能不兼容；插件不会自动修改这些脚本。
+Client 的 `compatRuntime` 按 Session 保存一份可见快照、串行写入队列、composer bridge、frame 注册表与订阅者；整个 Bundle 只注册一个父窗口 `message` listener，并继续校验 channel 和 `event.source`。iframe 首次挂载分为注册 transport 与加载 `srcDoc` 两步，确保角色脚本第一行执行前已经获得内联 snapshot；后续更新以 `runtimeRevision` 推送，旧 revision 被忽略，不把 revision 加入 `srcDoc` 依赖，因而状态变化不会重载并重复执行角色脚本。
+
+每个子 frame 建立稳定的 `SillyTavern` context、`chat` 数组、`chatMetadata` 与 `extensionSettings` 对象，状态更新时原位更新集合。阶段 0–5 提供：
+
+- `getVariables/replaceVariables/updateVariablesWith/insertOrAssignVariables/insertVariables/deleteVariable/getAllVariables` 的 chat/global/preset/character/message/script/extension 作用域；读取同步返回深拷贝，同步写 API 先更新镜像，再经串行队列和 revision CAS 持久化；
+- 持久兼容消息账本及 `get/set/create/delete/rotateChatMessages`、swipe、hidden/role/data/extra；Host 在生成前投影账本，但不改写 DSH append-only 事件。账本中的原生消息只有对应 Session 事件仍存活时才进入提示词，避免已压缩或移除的旧正文继续触发世界书/记忆；
+- `injectPrompts/uninjectPrompts` 的 position/depth/role/scan、iframe-local `filter` 与 generation-admission `once`；返回同步、幂等 disposer；
+- `eventOn/eventOnce/eventMakeFirst/eventMakeLast/eventEmit/eventEmitAndWait/eventRemoveListener/eventClearEvent/eventClearListener/eventClearAll` 与 `eventSource`；自定义事件只跨同 Session 的已注册 frame；
+- 表驱动 STScript 常用命令、独立 `generate/generateRaw` 任务、流事件、按 ID/全局停止和模型列表；生成经 DSH 公共 LLM Service 执行，不占用或覆盖宿主当前生成单例；
+- 命名世界书 CRUD、条目增删、global/current-character/current-chat 绑定、Lorebook 旧别名与设置；命名库写入在锁内执行 revision CAS，全部有效绑定在 Prompt 阶段合并；
+- Tavern Regex 查询、替换、更新与显示/Prompt 格式化；兼容写入由 Host 生成授权 hash，并进入现有 Global → Preset → Character 执行管线；
+- `TavernHelper`、全局函数别名、`SillyTavern.getContext()`、`tavern_events/event_types/iframe_events`、宏、音频、剪贴板、浏览器弹窗以及常用 lodash/jQuery/toastr facade；另保留 `TavernHelper.dsh.getState/getCharacterCard/getCurrentWorldbook/memory/flushWrites`。
+
+能力清单把 API 分为 `exact/emulated/degraded/unavailable`。`degraded` 代表契约可用但受 DSH 宿主边界影响，例如非当前角色世界书绑定、原生弹窗样式、浏览器自动播放或 SillyTavern 私有生成参数；`unavailable` 用于角色/预设/persona 完整 CRUD、扩展安装、脚本树 UI 等没有可靠宿主等价物的能力。兼容层已经占用的不可用入口会显式抛出 `CompatibilityUnavailableError`，其余未投影的上游专用入口保持不存在；两种情况都不会用成功空值掩盖能力缺失。
 
 ## 生命周期
 
 - Host 启动先通过 `agentPresets.copy()` 探测部署的可写用户根，再以隐藏 staging 目录原子安装包内 `sillytavern` 预设。不能在同一 Host Fiber 的 `apply()` 返回前调用 `standingKeyFor()`：该阶段 `sillyTavern` Service 尚未完成激活；预设由 DSH 在正常选择/创建会话路径中挂载。托管 fingerprint 只允许升级未被用户修改的副本。
 - Host route、Service、Prompt、Tool、Command、Slot 和样式均由 Cordis fiber/effect 所有。
 - Client overlay/controller 是 module-local，但所有可见组件随 Slot 卸载；样式通过 effect 删除。
-- iframe 事件监听器由 React effect 清理；管理页只有显式预览挂载时才创建自己的 cursor poll；当前酒馆会话由角色选择组件持有一个共享 cursor poll，并向该会话全部对话 iframe 分发快照；组件卸载会清空规则、宏 scope、事件 Store，取消进行中的 Worker，并释放 assistant/user/steering renderer。
+- iframe 内监听器随 frame `pagehide` 清理；父 Client 只有一个全局 `postMessage` hub。当前酒馆会话由角色选择组件持有一个共享 cursor poll，并把官方形状的消息事件和版本化快照分发给该 Session 的普通消息、开场、预览与后台脚本 frame；插件卸载会统一清除 runtime、规则、宏 scope、事件 Store、Worker 和 assistant/user/steering renderer。
 - Host 重启从当前工作区的 cards/worldbooks/templates/selection/regex、bindings/memory 与未完成 memory-maintenance 队列恢复。

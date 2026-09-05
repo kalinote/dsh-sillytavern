@@ -2,8 +2,17 @@
 
 ## Unreleased
 
+- 输入框角色卡选择器在名称超长或工具栏空间不足时收起为单个图标，保留完整名称提示和菜单；宽度恢复后自动显示可容纳的短名称。
+- 新增 TavernHelper 4.9.3 / SillyTavern 1.18.0 固定基线的机器可读能力清单与 `/compatibility`、`/compat/runtime` 接口；未实现能力以 `degraded`/`unavailable` 和原因显式登记。
+- 新增 Session 级 iframe 兼容运行时：角色代码执行前即安装同步状态快照、`TavernHelper`、`SillyTavern.getContext()`、变量 API、注入 disposer、完整监听器管理 facade 和同 Session 自定义事件总线；后续状态使用单调 revision 推送。
+- 开场、对话 HTML、管理预览和后台 JavaScript 统一使用同一 bridge；已确认的 JavaScript 会按 Session 持续挂载。开场现在也兼容 parent `querySelector`、`getElementById` 与 jQuery 形式的 `#send_textarea/#send_but` 调用。
+- Session 变量写入增加 binding revision CAS；同步 facade 先更新镜像，再串行持久化，冲突或失败时重新读取权威快照。Prompt injection 保存基础 TavernHelper 字段并支持按 ID 幂等解除。
+- 移除消息历史 HTML 固定 520px 的 flex basis；opaque-origin iframe 统一按受认证 resize 消息设置实际高度，避免短选项块后出现大段空白。
+- 修复 SillyTavern `#send_textarea` 兼容桥错误读取不存在的 Slot `input` 属性：现在通过 DSH 正式 `useInput` 契约订阅草稿与输入阶段，并继续使用 `inputActions.setDraft` 写入，使角色卡/脚本选项可以填充当前用户输入框。
 - 修复新会话首条真实用户消息自动绑定角色卡后，Client 仍持有未绑定 `/session` 快照，导致第一次助手输出缺少 Regex 脚本而显示原文的问题；事件状态中的角色 ID 变化现在会重新加载完整 Session。
 - 对话中的 Regex HTML iframe 现在通过受 channel/source 校验的消息桥同步实际内容高度，不再为每个短 HTML 片段固定保留 520px 空白。
+- 完成兼容阶段 2–5：全部变量作用域、持久消息 CRUD/swipe、Prompt injection `filter/once`、常用 STScript、独立生成/停止、命名世界书 CRUD/条目操作与三类绑定、Lorebook 别名、Tavern Regex 查询/写入/格式化，以及宏、音频、剪贴板、弹窗、lodash/jQuery/toastr facade。
+- 新增工作区 `compatibility.json` 和 Session `compat-chat` 账本；所有兼容写入使用串行队列、资源锁与 revision CAS。生成提示词只读取仍存在于当前 Session 的原生账本消息，同时保留脚本创建消息，避免压缩或移除的历史正文误触发长期记忆召回。
 
 ## 0.9.0
 

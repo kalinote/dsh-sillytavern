@@ -36,12 +36,12 @@ export function crc32(bytes) {
 }
 
 function decodeBase64Strict(text, maxBytes) {
-  if (text.length === 0 || text.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) {
+  if (text.length === 0 || text.length % 4 !== 0) {
     throw new Error('ccv3 payload is not canonical Base64')
   }
   const decoded = Buffer.from(text, 'base64')
   if (decoded.length > maxBytes) throw new Error(`ccv3 JSON exceeds ${maxBytes} bytes`)
-  if (decoded.toString('base64') !== text) throw new Error('ccv3 payload has non-canonical Base64 padding')
+  if (decoded.toString('base64') !== text) throw new Error('ccv3 payload is not canonical Base64')
   try {
     return new TextDecoder('utf-8', { fatal: true }).decode(decoded)
   } catch {

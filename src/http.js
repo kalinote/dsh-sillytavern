@@ -49,9 +49,9 @@ export async function readJsonBody(req, maxBytes = 96 * 1024 * 1024) {
 }
 
 export function decodeBase64(value, maxBytes = 64 * 1024 * 1024) {
-  if (typeof value !== 'string' || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) throw new Error('file data is not canonical Base64')
+  if (typeof value !== 'string' || value.length % 4 !== 0) throw new Error('file data is not canonical Base64')
   const bytes = Buffer.from(value, 'base64')
   if (bytes.length > maxBytes) throw new Error(`decoded file exceeds ${maxBytes} bytes`)
-  if (bytes.toString('base64') !== value) throw new Error('file data has invalid Base64 padding')
+  if (bytes.toString('base64') !== value) throw new Error('file data is not canonical Base64')
   return bytes
 }
