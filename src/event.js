@@ -18,20 +18,20 @@ function now() { return Date.now() }
 function snapshot(value) { return structuredClone(value) }
 function bytes(value) { return Buffer.byteLength(JSON.stringify(value), 'utf8') }
 
-export function emptyMemoryDocument(sessionId) {
+export function emptyEventDocument(sessionId) {
   return { schemaVersion: SCHEMA_VERSION, sessionId, revision: 0, rows: [], eventEdges: [], appliedMaintenanceJobs: [] }
 }
 
 function normalizedMaintenanceJobId(value) {
   if (typeof value !== 'string' || value.trim() === '' || Buffer.byteLength(value, 'utf8') > MAX_NAME_BYTES) {
-    throw new Error('memory maintenanceJobId must be a non-empty bounded string')
+    throw new Error('event maintenanceJobId must be a non-empty bounded string')
   }
   return value.trim()
 }
 
 function normalizedAppliedMaintenanceJobs(value) {
   if (value === undefined) return []
-  if (!Array.isArray(value) || value.length > MAX_APPLIED_MAINTENANCE_JOBS) throw new Error('memory appliedMaintenanceJobs is invalid')
+  if (!Array.isArray(value) || value.length > MAX_APPLIED_MAINTENANCE_JOBS) throw new Error('event appliedMaintenanceJobs is invalid')
   return [...new Set(value.map(normalizedMaintenanceJobId))].slice(-MAX_APPLIED_MAINTENANCE_JOBS)
 }
 
@@ -144,8 +144,8 @@ function normalizedStoredEventEdge(edge) {
     return {
       id: edge.id,
       kind: 'precedes',
-      predecessorEventId: normalizedEventId(edge.predecessorEventId, 'memory edge predecessorEventId'),
-      successorEventId: normalizedEventId(edge.successorEventId, 'memory edge successorEventId'),
+      predecessorEventId: normalizedEventId(edge.predecessorEventId, 'event edge predecessorEventId'),
+      successorEventId: normalizedEventId(edge.successorEventId, 'event edge successorEventId'),
       reason: edge.reason,
       sourceRefs: normalizedSourceRefs(edge.sourceRefs),
       createdAt: edge.createdAt,
@@ -162,12 +162,12 @@ function assertEventGraph(document) {
   const outgoing = new Map([...eventIds].map(eventId => [eventId, []]))
   const indegree = new Map([...eventIds].map(eventId => [eventId, 0]))
   for (const edge of document.eventEdges) {
-    if (edge.predecessorEventId === edge.successorEventId) throw new Error('memory event graph may not contain a self-edge')
+    if (edge.predecessorEventId === edge.successorEventId) throw new Error('event graph may not contain a self-edge')
     if (!eventIds.has(edge.predecessorEventId) || !eventIds.has(edge.successorEventId)) {
-      throw new Error('memory event edge endpoints must exist in at least one memory row')
+      throw new Error('event edge endpoints must exist in at least one memory row')
     }
     const triple = JSON.stringify([edge.kind, edge.predecessorEventId, edge.successorEventId])
-    if (triples.has(triple)) throw new Error('memory event graph may not contain duplicate edge triples')
+    if (triples.has(triple)) throw new Error('event graph may not contain duplicate edge triples')
     triples.add(triple)
     outgoing.get(edge.predecessorEventId).push(edge.successorEventId)
     indegree.set(edge.successorEventId, indegree.get(edge.successorEventId) + 1)
@@ -183,12 +183,12 @@ function assertEventGraph(document) {
       if (remaining === 0) ready.push(successor)
     }
   }
-  if (visited !== eventIds.size) throw new Error('memory precedes edges may not form a directed cycle')
+  if (visited !== eventIds.size) throw new Error('event precedes edges may not form a directed cycle')
 }
 
 function assertDocumentConstraints(document) {
   if (document.rows.length > MAX_ROWS) throw new Error(`memory rows exceed ${MAX_ROWS}`)
-  if (document.eventEdges.length > MAX_EVENT_EDGES) throw new Error(`memory event edges exceed ${MAX_EVENT_EDGES}`)
+  if (document.eventEdges.length > MAX_EVENT_EDGES) throw new Error(`event edges exceed ${MAX_EVENT_EDGES}`)
   const rowIds = new Set()
   const rowKeys = new Set()
   for (const row of document.rows) {
@@ -199,20 +199,20 @@ function assertDocumentConstraints(document) {
     rowKeys.add(identity)
   }
   assertEventGraph(document)
-  if (bytes(document) > MAX_DOCUMENT_BYTES) throw new Error(`memory document exceeds ${MAX_DOCUMENT_BYTES} bytes`)
+  if (bytes(document) > MAX_DOCUMENT_BYTES) throw new Error(`event document exceeds ${MAX_DOCUMENT_BYTES} bytes`)
 }
 
-export function normalizeMemoryDocument(input, sessionId) {
-  if (input === null || typeof input !== 'object') return emptyMemoryDocument(sessionId)
+export function normalizeEventDocument(input, sessionId) {
+  if (input === null || typeof input !== 'object') return emptyEventDocument(sessionId)
   if (input.schemaVersion !== SCHEMA_VERSION) {
-    throw new Error(`memory schema version ${String(input.schemaVersion)} is unsupported; expected ${SCHEMA_VERSION}. Delete the existing memory file manually`)
+    throw new Error(`event schema version ${String(input.schemaVersion)} is unsupported; expected ${SCHEMA_VERSION}. Delete the existing event file manually`)
   }
-  if (!Array.isArray(input.rows) || !Array.isArray(input.eventEdges)) return emptyMemoryDocument(sessionId)
+  if (!Array.isArray(input.rows) || !Array.isArray(input.eventEdges)) return emptyEventDocument(sessionId)
   try {
-    if (input.rows.length > MAX_ROWS || input.eventEdges.length > MAX_EVENT_EDGES) return emptyMemoryDocument(sessionId)
+    if (input.rows.length > MAX_ROWS || input.eventEdges.length > MAX_EVENT_EDGES) return emptyEventDocument(sessionId)
     const rows = input.rows.map(normalizedStoredRow)
     const eventEdges = input.eventEdges.map(normalizedStoredEventEdge)
-    if (rows.some(row => row === false) || eventEdges.some(edge => edge === false)) return emptyMemoryDocument(sessionId)
+    if (rows.some(row => row === false) || eventEdges.some(edge => edge === false)) return emptyEventDocument(sessionId)
     const document = {
       schemaVersion: SCHEMA_VERSION,
       sessionId,
@@ -224,7 +224,7 @@ export function normalizeMemoryDocument(input, sessionId) {
     assertDocumentConstraints(document)
     return document
   } catch {
-    return emptyMemoryDocument(sessionId)
+    return emptyEventDocument(sessionId)
   }
 }
 
@@ -281,11 +281,11 @@ function normalizedRow(input, existing) {
 function normalizedEventEdge(input, existing) {
   const timestamp = now()
   const kind = input.kind ?? existing?.kind ?? 'precedes'
-  if (kind !== 'precedes') throw new Error('memory event edge kind must be precedes')
-  const predecessorEventId = normalizedEventId(input.predecessorEventId ?? existing?.predecessorEventId, 'memory edge predecessorEventId')
-  const successorEventId = normalizedEventId(input.successorEventId ?? existing?.successorEventId, 'memory edge successorEventId')
+  if (kind !== 'precedes') throw new Error('event edge kind must be precedes')
+  const predecessorEventId = normalizedEventId(input.predecessorEventId ?? existing?.predecessorEventId, 'event edge predecessorEventId')
+  const successorEventId = normalizedEventId(input.successorEventId ?? existing?.successorEventId, 'event edge successorEventId')
   const reason = Object.hasOwn(input, 'reason') ? input.reason : existing?.reason ?? null
-  if (reason !== null && typeof reason !== 'string') throw new Error('memory event edge reason must be a string or null')
+  if (reason !== null && typeof reason !== 'string') throw new Error('event edge reason must be a string or null')
   const sourceRefs = Object.hasOwn(input, 'sourceRefs')
     ? normalizedSourceRefs(input.sourceRefs)
     : existing === undefined ? [] : snapshot(existing.sourceRefs)
@@ -367,7 +367,7 @@ export function queryMemory(document, request = {}) {
     .map(snapshot)
 }
 
-export function queryMemoryGraph(document, request = {}) {
+export function queryEventGraph(document, request = {}) {
   const limit = Math.max(1, Math.min(200, Number.isSafeInteger(request.limit) ? request.limit : 40))
   let seedEventIds
   if (Object.hasOwn(request, 'eventId')) {
@@ -401,7 +401,7 @@ export function queryMemoryGraph(document, request = {}) {
   return { seedEventIds: snapshot(seedEventIds), events, incomingEdges, outgoingEdges }
 }
 
-function mutateMemoryDocument(document, operation) {
+function mutateEventDocument(document, operation) {
   const action = operation.action
   if (action === 'upsert') {
     const identity = normalizedRowIdentity(operation)
@@ -426,13 +426,13 @@ function mutateMemoryDocument(document, operation) {
   }
   if (action === 'event_edge_upsert') {
     const kind = operation.kind ?? 'precedes'
-    if (kind !== 'precedes') throw new Error('memory event edge kind must be precedes')
-    const predecessorEventId = normalizedEventId(operation.predecessorEventId, 'memory edge predecessorEventId')
-    const successorEventId = normalizedEventId(operation.successorEventId, 'memory edge successorEventId')
+    if (kind !== 'precedes') throw new Error('event edge kind must be precedes')
+    const predecessorEventId = normalizedEventId(operation.predecessorEventId, 'event edge predecessorEventId')
+    const successorEventId = normalizedEventId(operation.successorEventId, 'event edge successorEventId')
     const index = document.eventEdges.findIndex(edge => edge.kind === kind
       && edge.predecessorEventId === predecessorEventId
       && edge.successorEventId === successorEventId)
-    if (index === -1 && document.eventEdges.length >= MAX_EVENT_EDGES) throw new Error(`memory event edges exceed ${MAX_EVENT_EDGES}`)
+    if (index === -1 && document.eventEdges.length >= MAX_EVENT_EDGES) throw new Error(`event edges exceed ${MAX_EVENT_EDGES}`)
     const edge = normalizedEventEdge({ ...operation, kind, predecessorEventId, successorEventId }, index === -1 ? undefined : document.eventEdges[index])
     if (index === -1) document.eventEdges.push(edge)
     else document.eventEdges[index] = edge
@@ -440,30 +440,30 @@ function mutateMemoryDocument(document, operation) {
   }
   if (action === 'event_edge_delete') {
     const index = document.eventEdges.findIndex(edge => edge.id === operation.id)
-    if (index === -1) throw new Error(`memory event edge ${operation.id} was not found`)
+    if (index === -1) throw new Error(`event edge ${operation.id} was not found`)
     return document.eventEdges.splice(index, 1)[0]
   }
-  throw new Error(`unknown memory action ${String(action)}`)
+  throw new Error(`unknown event action ${String(action)}`)
 }
 
-export function applyMemoryOperation(document, operation) {
-  const next = normalizeMemoryDocument(document, document.sessionId)
+export function applyEventOperation(document, operation) {
+  const next = normalizeEventDocument(document, document.sessionId)
   const maintenanceJobId = Object.hasOwn(operation, 'maintenanceJobId')
     ? normalizedMaintenanceJobId(operation.maintenanceJobId)
     : undefined
-  if (maintenanceJobId !== undefined && operation.action !== 'batch') throw new Error('memory maintenanceJobId is only valid for batch operations')
+  if (maintenanceJobId !== undefined && operation.action !== 'batch') throw new Error('event maintenanceJobId is only valid for batch operations')
   if (maintenanceJobId !== undefined && next.appliedMaintenanceJobs.includes(maintenanceJobId)) {
     return { document: next, result: [], changed: false, duplicate: true }
   }
   if (operation.action === 'query') return { document: next, result: queryMemory(next, operation), changed: false }
   let result
   if (operation.action === 'batch') {
-    if (!Array.isArray(operation.operations) || operation.operations.length > 100) throw new Error('memory batch must contain at most 100 operations')
+    if (!Array.isArray(operation.operations) || operation.operations.length > 100) throw new Error('event batch must contain at most 100 operations')
     result = operation.operations.map(item => {
       if (item.action === 'batch' || item.action === 'query') throw new Error('nested batch/query operations are not allowed')
-      return mutateMemoryDocument(next, item)
+      return mutateEventDocument(next, item)
     })
-  } else result = mutateMemoryDocument(next, operation)
+  } else result = mutateEventDocument(next, operation)
   if (maintenanceJobId !== undefined) {
     next.appliedMaintenanceJobs.push(maintenanceJobId)
     next.appliedMaintenanceJobs = next.appliedMaintenanceJobs.slice(-MAX_APPLIED_MAINTENANCE_JOBS)
@@ -507,7 +507,7 @@ export function assertMemoryKeywordsInSource(document, events) {
   }
 }
 
-export const memoryLimits = Object.freeze({
+export const eventLimits = Object.freeze({
   MAX_ROWS,
   MAX_EVENT_EDGES,
   MAX_DOCUMENT_BYTES,

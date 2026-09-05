@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { emptyMemoryDocument } from '../src/memory.js'
+import { emptyEventDocument } from '../src/event.js'
 import { assembleSillyTavernPrompt, initialGreetingView, sessionMessages } from '../src/prompt.js'
 import { minimalCard } from './helpers.js'
 
@@ -14,7 +14,7 @@ function greetingState(firstMes, variables = {}, alternateGreetings = []) {
       scriptInjections: [],
       openingSwipeId: 0,
     },
-    memory: emptyMemoryDocument('greeting-test'),
+    event: emptyEventDocument('greeting-test'),
     templates: [],
   }
 }

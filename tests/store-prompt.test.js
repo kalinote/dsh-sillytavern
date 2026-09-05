@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
@@ -36,7 +36,7 @@ function agent(workspace, id = 'session-test') {
   }
 }
 
-test('persists workspace-scoped cards, worldbooks, bindings, and memory', async t => {
+test('persists workspace-scoped cards, worldbooks, bindings, and events', async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-sillytavern-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const workspace = join(root, 'workspace')
@@ -73,8 +73,8 @@ test('persists workspace-scoped cards, worldbooks, bindings, and memory', async 
     extensions: {},
   } })
   await first.updateSession(live, { userPersona: { name: 'Morgan', description: 'A visitor.' }, variables: { secret: 'the amber seal' } })
-  await first.memory(live, { action: 'upsert', table: 'items', key: 'archive key', value: { owner: 'Morgan' }, importance: 0.9, ...unknownMemoryContext })
-  await first.saveTemplate({ name: 'Style', content: '<% if (char) { %>Use close third person for <%= char %>.<% } %>', position: 'after' })
+  await first.event(live, { action: 'upsert', table: 'items', key: 'archive key', value: { owner: 'Morgan' }, importance: 0.9, ...unknownMemoryContext })
+  await first.saveTemplate({ name: 'Style', content: '<% if (char) { %>Use close third person for <%= char %>.<% } %> Recalled event memories: <%= event.length %>.', position: 'after' })
   await first.selectCard(record.id)
   const autoBound = agent(workspace, 'session-auto-selected')
   await observer.ensureSelectedSession(autoBound)
@@ -93,13 +93,20 @@ test('persists workspace-scoped cards, worldbooks, bindings, and memory', async 
   assert.match(prompt.system, /archive key/)
   assert.match(prompt.system, /Morgan/)
   assert.match(prompt.system, /close third person/)
+  assert.match(prompt.system, /Recalled event memories: 1/)
   assert.equal(prompt.system.includes('{{'), false)
 
-  await Promise.all(Array.from({ length: 12 }, (_value, index) => first.memory(live, {
+  await Promise.all(Array.from({ length: 12 }, (_value, index) => first.event(live, {
     action: 'upsert', table: 'events', key: `event-${index}`, value: { index }, importance: 0.5, ...unknownMemoryContext,
   })))
-  assert.equal(first.sessionView(live).memory.revision, 13)
-  assert.equal(first.sessionView(live).memory.rows.length, 13)
+  assert.equal(first.sessionView(live).event.revision, 13)
+  assert.equal(first.sessionView(live).event.rows.length, 13)
+  assert.equal(Object.hasOwn(first.sessionView(live), 'memory'), false)
+  const eventPath = join(stateRoot, 'event', `${createHash('sha256').update(live.id).digest('hex')}.json`)
+  const persistedEvent = JSON.parse(await readFile(eventPath, 'utf8'))
+  assert.deepEqual(persistedEvent, first.sessionView(live).event)
+  assert.equal(persistedEvent.schemaVersion, 5)
+  assert.equal((await readdir(stateRoot)).includes('memory'), false)
 
   const bob = await first.importCard(Buffer.from(JSON.stringify(minimalCard({ name: 'Bob' }))), { fileName: 'bob.json' })
   const observedBob = agent(workspace, 'session-observer-bob')
@@ -134,12 +141,12 @@ test('persists workspace-scoped cards, worldbooks, bindings, and memory', async 
   const restored = second.sessionView(live)
   assert.equal(restored.card.card.data.name, 'Alice')
   assert.equal(restored.binding.userPersona.name, 'Morgan')
-  assert.equal(restored.memory.rows.length, 13)
-  assert.equal(restored.memory.revision, 13)
-  await Promise.all(Array.from({ length: 10 }, (_value, index) => (index % 2 === 0 ? first : second).memory(live, {
+  assert.equal(restored.event.rows.length, 13)
+  assert.equal(restored.event.revision, 13)
+  await Promise.all(Array.from({ length: 10 }, (_value, index) => (index % 2 === 0 ? first : second).event(live, {
     action: 'upsert', table: 'multi-process', key: `key-${index}`, value: { index }, importance: 0.4, ...unknownMemoryContext,
   })))
-  const synchronized = await second.memory(live, { action: 'query', table: 'multi-process', limit: 20 })
+  const synchronized = await second.event(live, { action: 'query', table: 'multi-process', limit: 20 })
   assert.equal(synchronized.revision, 23)
   assert.equal(synchronized.result.length, 10)
   const bindings = JSON.parse(await readFile(join(workspace, '.dsh', 'sillytavern', 'bindings.json'), 'utf8'))

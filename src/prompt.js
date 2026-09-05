@@ -1,4 +1,4 @@
-import { isMemoryAutoRecallEligible, memoryLimits } from './memory.js'
+import { isMemoryAutoRecallEligible, eventLimits } from './event.js'
 import { neutralizeDshTemplates, renderMacros, renderPromptTemplate } from './template.js'
 import { activateWorldbook } from './worldbook.js'
 import { projectInjectionDescriptors } from './compat-injections.js'
@@ -14,8 +14,8 @@ const MAX_MESSAGE_CHARS = 32 * 1024
 const MAX_SECTION_CHARS = 32 * 1024
 const MAX_PROMPT_CHARS = 200 * 1024
 const MAX_AUTO_RECALL_ROWS = 24
-const MAX_MEMORY_TEXT_CHARS = 28 * 1024
-const MAX_PENDING_MEMORY_TEXT_CHARS = 24 * 1024
+const MAX_EVENT_TEXT_CHARS = 28 * 1024
+const MAX_PENDING_EVENT_TEXT_CHARS = 24 * 1024
 
 export function sessionEvents(session) {
   const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : session?.events
@@ -162,7 +162,7 @@ export function selectAutoRecallRows(document, messages, compactedSeqs = new Set
     const text = recallSearchText(row, row.eventId === undefined ? '' : relations.get(row.eventId))
     let matches = 0
     for (const term of terms) if (text.includes(term)) matches += 1
-    const high = row.importance >= memoryLimits.DEFAULT_IMPORTANCE_THRESHOLD || row.recallPolicy === 'always'
+    const high = row.importance >= eventLimits.DEFAULT_IMPORTANCE_THRESHOLD || row.recallPolicy === 'always'
     const group = groups.get(groupId)
     if (group === undefined) {
       groups.set(groupId, { id: groupId, eventId: row.eventId, rows: [row], high, matches, importance: row.importance, updatedAt: row.updatedAt })
@@ -198,7 +198,7 @@ function memoryRowText(row, indentation = '- ') {
   return `${indentation}[${row.table}] ${row.key}: time=${memoryStoryTimeText(row.storyTime)}; location=${location}; characters=[${characters}]; ${value} (importance ${row.importance})`
 }
 
-function memoryText(document, messages, compactedSeqs) {
+function eventText(document, messages, compactedSeqs) {
   const rows = selectAutoRecallRows(document, messages, compactedSeqs)
   if (rows.length === 0) return ''
   const selectedEvents = new Set(rows.map(row => row.eventId).filter(Boolean))
@@ -212,7 +212,7 @@ function memoryText(document, messages, compactedSeqs) {
   const lines = []
   let used = 0
   const add = line => {
-    if (used + line.length + 1 > MAX_MEMORY_TEXT_CHARS) return false
+    if (used + line.length + 1 > MAX_EVENT_TEXT_CHARS) return false
     lines.push(line)
     used += line.length + 1
     return true
@@ -236,21 +236,21 @@ function memoryText(document, messages, compactedSeqs) {
   return lines.join('\n')
 }
 
-function pendingMemoryText(jobs) {
+function pendingEventText(jobs) {
   if (!Array.isArray(jobs) || jobs.length === 0) return ''
   const lines = [
-    'The following persisted source turns were compacted before background memory maintenance finished. Treat them as narrative context; do not maintain memory yourself.',
+    'The following persisted source turns were compacted before background event maintenance finished. Treat them as narrative context; do not maintain events or their memory rows yourself.',
   ]
   let used = lines[0].length + 1
   for (const job of jobs) {
     const heading = `- Pending source turn ${job.turn}:`
-    if (used + heading.length + 1 > MAX_PENDING_MEMORY_TEXT_CHARS) break
+    if (used + heading.length + 1 > MAX_PENDING_EVENT_TEXT_CHARS) break
     lines.push(heading)
     used += heading.length + 1
     for (const message of Array.isArray(job.turnMessages) ? job.turnMessages : []) {
       const text = String(message.text ?? '').slice(-8192)
       const line = `  - ${message.role === 'assistant' ? 'assistant' : 'user'}: ${text}`
-      if (used + line.length + 1 > MAX_PENDING_MEMORY_TEXT_CHARS) return lines.join('\n')
+      if (used + line.length + 1 > MAX_PENDING_EVENT_TEXT_CHARS) return lines.join('\n')
       lines.push(line)
       used += line.length + 1
     }
@@ -312,7 +312,7 @@ function scopeFor(state, messages, compactedSeqs = new Set()) {
     variables: state.binding.variables,
     globalVariables: state.globalVariables ?? {},
     currentSwipeId: Number(state.binding.openingSwipeId ?? 0),
-    memory: boundedObjects(selectAutoRecallRows(state.memory, messages, compactedSeqs), 256 * 1024),
+    event: boundedObjects(selectAutoRecallRows(state.event, messages, compactedSeqs), 256 * 1024),
     messages: scopedMessages,
     history: scopedMessages.map(message => `${message.role}: ${message.text}`).join('\n').slice(-256 * 1024),
   }
@@ -433,8 +433,8 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     ...renderedWorld.exampleTop,
     section('Example dialogue', render(card.data.mes_example)),
     ...renderedWorld.exampleBottom,
-    section('Automatically recalled long-term memory', memoryText(state.memory, messages, compactedSeqs)),
-    section('Compacted source awaiting background memory maintenance', pendingMemoryText(options.pendingMemoryFallback)),
+    section('Automatically recalled events', eventText(state.event, messages, compactedSeqs)),
+    section('Compacted source awaiting background event maintenance', pendingEventText(options.pendingEventFallback)),
     ...afterTemplates,
     ...renderedWorld.authorNoteTop,
     section('Post-history instructions', [render(card.data.post_history_instructions), ...postTemplates].filter(value => value.trim() !== '').join('\n\n')),

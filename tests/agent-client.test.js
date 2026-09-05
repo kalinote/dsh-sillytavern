@@ -20,11 +20,11 @@ test('agent face registers validated tools and loads session state inside prompt
     promptFor: async (_agent, signal, route) => { promptSignal = signal; promptRoute = route; return { system: 'role', postHistory: '' } },
     bindPromptToRequest: (_agent, prompt) => `${prompt.system}\n\n<!-- request-bound -->`,
     store: { promptState: () => undefined },
-    sessionView: agent => ({ card: null, memory: { rows: [], eventEdges: [], revision: 0 }, sessionId: agent.id }),
-    memory: async (_agent, operation, signal) => { calls.push(operation); assert.equal(signal.aborted, false); return { revision: 1, result: [] } },
-    memoryGraph: async (_agent, request, signal) => { calls.push(['graph', request]); assert.equal(signal.aborted, false); return { revision: 1, result: { events: [] } } },
-    consolidateMemory: async (agent, signal) => {
-      calls.push(['consolidateMemory', agent.id])
+    sessionView: agent => ({ card: null, event: { rows: [], eventEdges: [], revision: 0 }, sessionId: agent.id }),
+    event: async (_agent, operation, signal) => { calls.push(operation); assert.equal(signal.aborted, false); return { revision: 1, result: [] } },
+    eventGraph: async (_agent, request, signal) => { calls.push(['graph', request]); assert.equal(signal.aborted, false); return { revision: 1, result: { events: [] } } },
+    consolidateEvent: async (agent, signal) => {
+      calls.push(['consolidateEvent', agent.id])
       assert.equal(signal.aborted, false)
       return { queued: true, startTurn: 1, endTurn: 2, chunks: 1 }
     },
@@ -46,8 +46,8 @@ test('agent face registers validated tools and loads session state inside prompt
   assert.equal(sections.length, 2)
   assert.equal(contexts.length, 0)
   assert.equal(variables.length, 2)
-  assert.deepEqual(tools.map(tool => tool.name), ['st_memory_query', 'st_memory_graph_query'])
-  assert.deepEqual(commands.map(command => command.name), ['st-import', 'st-character', 'st-memory', 'st-memory-consolidate', 'narrator', 'regex', 'regex-state', 'regex-toggle'])
+  assert.deepEqual(tools.map(tool => tool.name), ['st_event_query', 'st_event_graph_query'])
+  assert.deepEqual(commands.map(command => command.name), ['st-import', 'st-character', 'st-event', 'st-event-consolidate', 'narrator', 'regex', 'regex-state', 'regex-toggle'])
   const querySchema = tools[0].parameters
   assert.deepEqual(querySchema.properties.characterMatch.enum, ['any', 'all'])
   assert.deepEqual(querySchema.properties.order.enum, ['time_asc', 'time_desc', 'relevance'])
@@ -61,14 +61,15 @@ test('agent face registers validated tools and loads session state inside prompt
   assert.match(tools[1].description, /incoming\/outgoing/)
   assert.match(sections[1].text, /maintained by separate background Agents/)
   assert.match(sections[1].text, /periodic consolidation/)
-  assert.match(sections[1].text, /Never add, update, delete, deduplicate, or correct memory/)
-  assert.match(sections[1].text, /st_memory_graph_query/)
+  assert.match(sections[1].text, /Each event groups multiple memory rows under one eventId/)
+  assert.match(sections[1].text, /Never add, update, delete, deduplicate, or correct events or their memory rows/)
+  assert.match(sections[1].text, /st_event_graph_query/)
 
   const preStepAgent = { id: 's1' }
   const preStep = await events.get('agent/pre-step')({ agent: preStepAgent, messages: [], signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [{ source: { kind: 'user' }, content: [] }] }))
   assert.equal(preStep.messages[0].transformed, true)
   const commandSignal = new AbortController().signal
-  assert.deepEqual(await commands[3].handler({ agent: preStepAgent, signal: commandSignal }), { kind: 'success', text: '已排队定期记忆整理：第 1–2 轮，共 1 个连续任务。' })
+  assert.deepEqual(await commands[3].handler({ agent: preStepAgent, signal: commandSignal }), { kind: 'success', text: '已排队定期事件整理：第 1–2 轮，共 1 个连续任务。' })
   assert.deepEqual(await commands[4].handler({ agent: preStepAgent, rawInput: ' scene ', signal: commandSignal }), { kind: 'success', text: 'narrator:scene' })
   assert.deepEqual(await commands[5].handler({ agent: preStepAgent, rawInput: ' name="选项" <opinion>x</opinion>', signal: commandSignal }), { kind: 'success', text: '选项:<opinion>x</opinion>' })
   assert.deepEqual(await commands[6].handler({ agent: preStepAgent, rawInput: '选项', signal: commandSignal }), { kind: 'success', text: 'true' })
@@ -102,7 +103,7 @@ test('agent face registers validated tools and loads session state inside prompt
   const childAssembly = await events.get('system-prompt/assemble')(
     assembly,
     { agent: child, signal: controller.signal },
-    async () => ({ ...assembly, sections: [...assembly.sections, { name: 'dsh-sillytavern:memory-guidance', text: 'hidden' }, { name: 'other', text: 'kept' }] }),
+    async () => ({ ...assembly, sections: [...assembly.sections, { name: 'dsh-sillytavern:event-guidance', text: 'hidden' }, { name: 'other', text: 'kept' }] }),
   )
   assert.deepEqual(childAssembly.sections.map(section => section.name), ['other'])
   await assert.rejects(tools[0].execute({}, { agent: child, signal: controller.signal }), /unavailable outside/)
@@ -116,32 +117,32 @@ test('0.9.0 manifest targets the DSH 0.1.2 Client dependency graph', async () =>
   assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-client-ui-chat'], '^0.1.2-alpha.1')
 })
 
-test('memory management UI supports schema 5 keywords, recall provenance, and event relationships', async () => {
+test('event management UI supports schema 5 keywords, recall provenance, and event relationships', async () => {
   const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
-  const memoryTabSource = source.slice(source.indexOf('function MemoryScalar'), source.indexOf('function executableScript'))
-  assert.match(memoryTabSource, /MEMORY_RECALL_POLICY_LABELS/)
-  assert.match(memoryTabSource, /React\.useState\('after_compaction'\)/)
-  assert.match(memoryTabSource, /value: 'always'/)
-  assert.match(memoryTabSource, /value: 'after_compaction'/)
-  assert.match(memoryTabSource, /value: 'query_only'/)
-  assert.match(memoryTabSource, /keywords: memoryKeywords\(keywords\)/)
-  assert.match(memoryTabSource, /2–10 个/)
-  assert.match(memoryTabSource, /importance: 0\.6, recallPolicy, sourceRefs: \[\]/)
-  assert.match(memoryTabSource, /session\.memory\?\.eventEdges \|\| \[\]/)
-  assert.match(memoryTabSource, /function MemoryEventGraph/)
-  assert.match(memoryTabSource, /直接前置事件/)
-  assert.match(memoryTabSource, /直接后续事件/)
-  assert.match(memoryTabSource, /relation\.edge\?\.reason/)
-  assert.match(memoryTabSource, /relation\.edge\?\.sourceRefs/)
-  assert.match(memoryTabSource, /未关联事件的记忆/)
-  assert.match(memoryTabSource, /action: 'event_edge_delete'/)
-  assert.match(memoryTabSource, /removesEventNode/)
-  assert.match(memoryTabSource, /expectedRevision: session\.memory\?\.revision \?\? 0/)
-  assert.match(source, /\.dst-memory-event-node\{content-visibility:auto/)
+  const eventTabSource = source.slice(source.indexOf('function MemoryScalar'), source.indexOf('function executableScript'))
+  assert.match(eventTabSource, /MEMORY_RECALL_POLICY_LABELS/)
+  assert.match(eventTabSource, /React\.useState\('after_compaction'\)/)
+  assert.match(eventTabSource, /value: 'always'/)
+  assert.match(eventTabSource, /value: 'after_compaction'/)
+  assert.match(eventTabSource, /value: 'query_only'/)
+  assert.match(eventTabSource, /keywords: memoryKeywords\(keywords\)/)
+  assert.match(eventTabSource, /2–10 个/)
+  assert.match(eventTabSource, /importance: 0\.6, recallPolicy, sourceRefs: \[\]/)
+  assert.match(eventTabSource, /session\.event\?\.eventEdges \|\| \[\]/)
+  assert.match(eventTabSource, /function EventGraph/)
+  assert.match(eventTabSource, /直接前置事件/)
+  assert.match(eventTabSource, /直接后续事件/)
+  assert.match(eventTabSource, /relation\.edge\?\.reason/)
+  assert.match(eventTabSource, /relation\.edge\?\.sourceRefs/)
+  assert.match(eventTabSource, /未关联事件的记忆/)
+  assert.match(eventTabSource, /action: 'event_edge_delete'/)
+  assert.match(eventTabSource, /removesEventNode/)
+  assert.match(eventTabSource, /expectedRevision: session\.event\?\.revision \?\? 0/)
+  assert.match(source, /\.dst-event-node\{content-visibility:auto/)
   assert.match(source, /\.dst-memory-row\{content-visibility:auto/)
 
   const helperSource = source.slice(source.indexOf('const MEMORY_STORY_TIME_STATUS_LABELS'), source.indexOf('function MemoryRow'))
-  const helpers = vm.runInNewContext(`(() => { ${helperSource}; return { memoryEventGraph, memoryRecallPolicyText, memorySourceRefsText } })()`, { Object, Array, Number, String, Set, Map })
+  const helpers = vm.runInNewContext(`(() => { ${helperSource}; return { eventGraph, memoryRecallPolicyText, memorySourceRefsText } })()`, { Object, Array, Number, String, Set, Map })
   assert.equal(helpers.memoryRecallPolicyText('always'), '始终自动召回')
   assert.equal(helpers.memoryRecallPolicyText('after_compaction'), '剧情折叠后自动召回')
   assert.equal(helpers.memoryRecallPolicyText('query_only'), '仅显式查询')
@@ -155,7 +156,7 @@ test('memory management UI supports schema 5 keywords, recall provenance, and ev
 
   const edgeBefore = { id: 'edge-before', kind: 'precedes', predecessorEventId: 'event-before', successorEventId: 'event-a', reason: '铺垫', sourceRefs: [{ eventSeq: 10, turn: 1, role: 'assistant' }] }
   const edgeAfter = { id: 'edge-after', kind: 'precedes', predecessorEventId: 'event-a', successorEventId: 'event-after', reason: null, sourceRefs: [] }
-  const graph = helpers.memoryEventGraph([
+  const graph = helpers.eventGraph([
     { id: 'memory-a1', eventId: 'event-a' },
     { id: 'memory-a2', eventId: 'event-a' },
     { id: 'memory-free', eventId: null },
@@ -682,7 +683,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.match(source, /function TavernNarratorMessage/)
     assert.match(source, /用户 Regex 替换/)
     assert.match(source, /reasoning-\$\{index\}/)
-    const worldbookTabSource = source.slice(source.indexOf('const WORLDBOOK_POSITIONS'), source.indexOf('function MemoryTab'))
+    const worldbookTabSource = source.slice(source.indexOf('const WORLDBOOK_POSITIONS'), source.indexOf('function EventTab'))
     assert.match(worldbookTabSource, /label: '扫描深度'.*max: 100/)
     assert.match(worldbookTabSource, /label: '条目扫描深度（留空继承）'.*max: 100/)
     assert.match(worldbookTabSource, /const depthValue = .*\? 4 : numericDepth/)
@@ -702,30 +703,30 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.match(worldbookTabSource, /最近一次生成诊断/)
     assert.match(worldbookTabSource, /运行时警告/)
     assert.match(worldbookTabSource, /尚无生成诊断/)
-    const memoryTabSource = source.slice(source.indexOf('function MemoryScalar'), source.indexOf('function executableScript'))
-    assert.match(memoryTabSource, /function MemoryValue/)
-    assert.match(memoryTabSource, /h\(MemoryValue, \{ value: row\.value \}\)/)
-    assert.match(memoryTabSource, /查看原始 JSON/)
-    assert.match(memoryTabSource, /重要度/)
-    assert.match(memoryTabSource, /row\.keywords\.map/)
-    assert.doesNotMatch(memoryTabSource, /row\.tags/)
-    assert.match(memoryTabSource, /storyTimeStatus/)
-    assert.match(memoryTabSource, /value: 'label-only'/)
-    assert.match(memoryTabSource, /value: 'normalized'/)
-    assert.match(memoryTabSource, /state: 'unknown'/)
-    assert.match(memoryTabSource, /state: 'label-only'/)
-    assert.match(memoryTabSource, /state: 'normalized'/)
-    assert.match(memoryTabSource, /storyTime: storyTime/)
-    assert.match(memoryTabSource, /function memoryLocation/)
-    assert.match(memoryTabSource, /text\.split\('\/'\)/)
-    assert.match(memoryTabSource, /location: memoryLocation\(location\)/)
-    assert.match(memoryTabSource, /地点路径（从大到小，以 \/ 分隔，可留空）/)
-    assert.match(memoryTabSource, /location\.join\(' \/ '\)/)
-    assert.match(memoryTabSource, /characters: memoryCharacters\(characters\)/)
-    assert.match(memoryTabSource, /row\.storyTime/)
-    assert.match(memoryTabSource, /row\.location/)
-    assert.match(memoryTabSource, /row\.characters/)
-    assert.match(memoryTabSource, /eventId: eventId\.trim\(\) \|\| undefined/)
+    const eventTabSource = source.slice(source.indexOf('function MemoryScalar'), source.indexOf('function executableScript'))
+    assert.match(eventTabSource, /function MemoryValue/)
+    assert.match(eventTabSource, /h\(MemoryValue, \{ value: row\.value \}\)/)
+    assert.match(eventTabSource, /查看原始 JSON/)
+    assert.match(eventTabSource, /重要度/)
+    assert.match(eventTabSource, /row\.keywords\.map/)
+    assert.doesNotMatch(eventTabSource, /row\.tags/)
+    assert.match(eventTabSource, /storyTimeStatus/)
+    assert.match(eventTabSource, /value: 'label-only'/)
+    assert.match(eventTabSource, /value: 'normalized'/)
+    assert.match(eventTabSource, /state: 'unknown'/)
+    assert.match(eventTabSource, /state: 'label-only'/)
+    assert.match(eventTabSource, /state: 'normalized'/)
+    assert.match(eventTabSource, /storyTime: storyTime/)
+    assert.match(eventTabSource, /function memoryLocation/)
+    assert.match(eventTabSource, /text\.split\('\/'\)/)
+    assert.match(eventTabSource, /location: memoryLocation\(location\)/)
+    assert.match(eventTabSource, /地点路径（从大到小，以 \/ 分隔，可留空）/)
+    assert.match(eventTabSource, /location\.join\(' \/ '\)/)
+    assert.match(eventTabSource, /characters: memoryCharacters\(characters\)/)
+    assert.match(eventTabSource, /row\.storyTime/)
+    assert.match(eventTabSource, /row\.location/)
+    assert.match(eventTabSource, /row\.characters/)
+    assert.match(eventTabSource, /eventId: eventId\.trim\(\) \|\| undefined/)
     assert.match(source, /\.dst-memory-field\{display:grid/)
     assert.match(source, /\.dst-memory-row\{content-visibility:auto/)
     const worldbookHelperSource = source.slice(source.indexOf('function worldbookExtension'), source.indexOf('function worldbookPolicy'))

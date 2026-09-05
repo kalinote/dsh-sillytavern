@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { parseCardBytes, validateCardV3 } from './card-v3.js'
 import { createChatMessages, createCompatChat, deleteChatMessages, getChatMessages, inspectCompatChat, mergeNativeMessages, rotateChatMessages, setChatMessages, switchSwipe } from './compat-chat.js'
 import { emptyCompatibilityWorkspace, normalizeCompatibilityWorkspace, readWorkspaceVariableScope, replaceWorkspaceVariableScope } from './compatibility-state.js'
-import { applyMemoryOperation, assertMemoryKeywordsInSource, emptyMemoryDocument, normalizeMemoryDocument, queryMemoryGraph } from './memory.js'
+import { applyEventOperation, assertMemoryKeywordsInSource, emptyEventDocument, normalizeEventDocument, queryEventGraph } from './event.js'
 import { initialGreetingView, sessionEvents, sessionTranscriptMessages } from './prompt.js'
 import {
   createWorldbookEntries as appendTavernWorldbookEntries,
@@ -558,7 +558,7 @@ export class SillyTavernStore {
         mkdir(join(root, 'cards'), { recursive: true }),
         mkdir(join(root, 'originals'), { recursive: true }),
         mkdir(join(root, 'worldbooks'), { recursive: true }),
-        mkdir(join(root, 'memory'), { recursive: true }),
+        mkdir(join(root, 'event'), { recursive: true }),
         mkdir(join(root, 'compat-chats'), { recursive: true }),
       ])
       const state = {
@@ -1597,10 +1597,10 @@ export class SillyTavernStore {
     const epoch = this.sessionEpoch.get(key) ?? 0
     const load = (async () => {
       const state = await this.stateFor(workspace)
-      const memoryName = createHash('sha256').update(id).digest('hex')
-      const memoryPath = join(state.root, 'memory', `${memoryName}.json`)
-      const compatChatPath = join(state.root, 'compat-chats', `${memoryName}.json`)
-      let memory = normalizeMemoryDocument(await readJson(memoryPath, emptyMemoryDocument(id), 20 * 1024 * 1024), id)
+      const sessionFileName = createHash('sha256').update(id).digest('hex')
+      const eventPath = join(state.root, 'event', `${sessionFileName}.json`)
+      const compatChatPath = join(state.root, 'compat-chats', `${sessionFileName}.json`)
+      let event = normalizeEventDocument(await readJson(eventPath, emptyEventDocument(id), 20 * 1024 * 1024), id)
       let compatChat
       try {
         compatChat = normalizeCompatChatDocument(await readJson(compatChatPath, emptyCompatChatDocument(id), 20 * 1024 * 1024), id, sessionTranscriptMessages(agent))
@@ -1636,9 +1636,9 @@ export class SillyTavernStore {
           if (binding !== null && binding.worldbookId !== null && !state.worldbooks.has(binding.worldbookId)) binding.worldbookId = null
           state.bindings = bindings
           const cached = this.sessions.get(key)
-          if (cached?.memory.revision > memory.revision) memory = cached.memory
+          if (cached?.event.revision > event.revision) event = cached.event
           if (this.disposedAgents.has(agent)) throw new Error(`agent ${id} was disposed`)
-          const session = { key, agentId: id, epoch, workspace, state, binding: binding === null ? null : snapshot(binding), memory, memoryPath, compatChat, compatChatPath }
+          const session = { key, agentId: id, epoch, workspace, state, binding: binding === null ? null : snapshot(binding), event, eventPath, compatChat, compatChatPath }
           if ((this.sessionEpoch.get(key) ?? 0) === epoch) this.sessions.set(key, session)
           return session
         })
@@ -1684,6 +1684,10 @@ export class SillyTavernStore {
     return this.serial(`bindings:${state.root}`, () => withFileLock(path, async () => {
       const bindings = normalizeBindingsDocument(await readJson(path, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
       const previous = bindings.sessions[session.agentId] ?? null
+      // Another Store may have committed after ensureSession loaded our cache.
+      // Keep that committed state visible even when this bind is rejected.
+      session.binding = previous === null ? null : snapshot(previous)
+      state.bindings = snapshot(bindings)
       if (expectedCardId !== undefined && (previous?.cardId ?? null) !== expectedCardId) {
         const error = new Error('current session binding changed before replacement')
         error.code = 'binding-changed'
@@ -1700,8 +1704,6 @@ export class SillyTavernStore {
         throw error
       }
       if (previous?.cardId === id) {
-        session.binding = snapshot(previous)
-        state.bindings = bindings
         return this.sessionView(agent)
       }
       const next = previous === null
@@ -1878,41 +1880,41 @@ export class SillyTavernStore {
     }
   }
 
-  async memory(agent, operation, signal) {
+  async event(agent, operation, signal) {
     const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
-    return this.serial(`memory:${session.workspace}:${session.agentId}`, () => withFileLock(session.memoryPath, async () => {
-      const current = normalizeMemoryDocument(await readJson(session.memoryPath, emptyMemoryDocument(session.agentId), 20 * 1024 * 1024), session.agentId)
+    return this.serial(`event:${session.workspace}:${session.agentId}`, () => withFileLock(session.eventPath, async () => {
+      const current = normalizeEventDocument(await readJson(session.eventPath, emptyEventDocument(session.agentId), 20 * 1024 * 1024), session.agentId)
       if (Object.hasOwn(operation, 'expectedRevision')) {
-        if (!Number.isSafeInteger(operation.expectedRevision) || operation.expectedRevision < 0) throw new Error('memory expectedRevision must be a non-negative safe integer')
+        if (!Number.isSafeInteger(operation.expectedRevision) || operation.expectedRevision < 0) throw new Error('event expectedRevision must be a non-negative safe integer')
         if (current.revision !== operation.expectedRevision) {
-          const error = new Error(`memory revision changed from ${operation.expectedRevision} to ${current.revision}`)
-          error.code = 'memory-revision-conflict'
+          const error = new Error(`event revision changed from ${operation.expectedRevision} to ${current.revision}`)
+          error.code = 'event-revision-conflict'
           throw error
         }
       }
-      const applied = applyMemoryOperation(current, operation)
+      const applied = applyEventOperation(current, operation)
       if (applied.changed) {
         assertMemoryKeywordsInSource(applied.document, sessionEvents(agent.session))
-        await atomicJson(session.memoryPath, applied.document, () => this.assertAgentActive(agent, session))
+        await atomicJson(session.eventPath, applied.document, () => this.assertAgentActive(agent, session))
       }
-      session.memory = applied.document
-      return { result: applied.result, revision: session.memory.revision, rows: operation.action === 'query' ? applied.result : undefined }
+      session.event = applied.document
+      return { result: applied.result, revision: session.event.revision, rows: operation.action === 'query' ? applied.result : undefined }
     }, signal), signal)
   }
 
-  async memorySnapshot(agent, signal) {
+  async eventSnapshot(agent, signal) {
     const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
-    return this.serial(`memory:${session.workspace}:${session.agentId}`, () => withFileLock(session.memoryPath, async () => {
-      const current = normalizeMemoryDocument(await readJson(session.memoryPath, emptyMemoryDocument(session.agentId), 20 * 1024 * 1024), session.agentId)
+    return this.serial(`event:${session.workspace}:${session.agentId}`, () => withFileLock(session.eventPath, async () => {
+      const current = normalizeEventDocument(await readJson(session.eventPath, emptyEventDocument(session.agentId), 20 * 1024 * 1024), session.agentId)
       this.assertAgentActive(agent, session)
-      session.memory = current
+      session.event = current
       return snapshot(current)
     }, signal), signal)
   }
 
-  async memoryGraph(agent, request, signal) {
-    const document = await this.memorySnapshot(agent, signal)
-    return { result: queryMemoryGraph(document, request), revision: document.revision }
+  async eventGraph(agent, request, signal) {
+    const document = await this.eventSnapshot(agent, signal)
+    return { result: queryEventGraph(document, request), revision: document.revision }
   }
 
   disposeSession(agent) {
@@ -1925,7 +1927,7 @@ export class SillyTavernStore {
 
   sessionView(agent) {
     const session = this.sessionSync(agent)
-    if (session === undefined) return { sessionId: agent.id, ready: false, binding: null, card: null, worldbook: null, worldbookId: null, memory: emptyMemoryDocument(agent.id), templates: [], globalRegexScripts: [], presetRegexScripts: [], globalVariables: {}, compatibilityVariables: { revisions: { chat: 0, global: 0, workspace: 0 }, scopes: { chat: {}, global: {}, preset: {}, character: {}, message: {}, script: {}, extension: {} } } }
+    if (session === undefined) return { sessionId: agent.id, ready: false, binding: null, card: null, worldbook: null, worldbookId: null, event: emptyEventDocument(agent.id), templates: [], globalRegexScripts: [], presetRegexScripts: [], globalVariables: {}, compatibilityVariables: { revisions: { chat: 0, global: 0, workspace: 0 }, scopes: { chat: {}, global: {}, preset: {}, character: {}, message: {}, script: {}, extension: {} } } }
     const card = session.binding === null ? null : session.state.cards.get(session.binding.cardId) ?? null
     const worldbook = card === null ? null : this.effectiveWorldbook(session.state, session.binding, card)
     return {
@@ -1936,7 +1938,7 @@ export class SillyTavernStore {
       card: card === null ? null : snapshot(card),
       worldbook: worldbook === null ? null : snapshot(worldbook),
       worldbookId: worldbook?.id ?? null,
-      memory: snapshot(session.memory),
+      event: snapshot(session.event),
       templates: snapshot(session.state.templates),
       globalRegexScripts: snapshot(session.state.globalRegexScripts),
       presetRegexScripts: snapshot(session.state.presetRegexScripts),
@@ -1961,7 +1963,7 @@ export class SillyTavernStore {
     const selected = session.binding.templateIds.length === 0
       ? session.state.templates.filter(template => template.enabled !== false)
       : session.state.templates.filter(template => session.binding.templateIds.includes(template.id) && template.enabled !== false)
-    return { record, binding: session.binding, worldbook: this.compatibilityPromptWorldbook(session.state, session.binding, record), memory: session.memory, templates: selected, globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables, compatMessages: this.compatChatProjection(agent).messages, lorebookSettings: session.state.compatibility.lorebookSettings }
+    return { record, binding: session.binding, worldbook: this.compatibilityPromptWorldbook(session.state, session.binding, record), event: session.event, templates: selected, globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables, compatMessages: this.compatChatProjection(agent).messages, lorebookSettings: session.state.compatibility.lorebookSettings }
   }
 
   regexEntries(agent) {
@@ -2001,7 +2003,7 @@ export class SillyTavernStore {
     if (binding === null) return undefined
     const record = session.state.cards.get(binding.cardId)
     if (record === undefined) return undefined
-    return { record, binding, worldbook: this.effectiveWorldbook(session.state, binding, record), memory: session.memory, templates: [], globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables }
+    return { record, binding, worldbook: this.effectiveWorldbook(session.state, binding, record), event: session.event, templates: [], globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables }
   }
 
   async saveTemplate(template, signal, context) {

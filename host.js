@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { assertTrustedLoopbackRequest, decodeBase64, readJsonBody, sendJson } from './src/http.js'
 import { assembleSillyTavernPrompt, compactedEventSeqs, initialGreetingView, injectWorldbookDepthMessages, sessionEventDelta, sessionEvents, sessionMessages } from './src/prompt.js'
-import { createMemoryMaintenanceJob, MemoryMaintenanceManager } from './src/memory-maintenance.js'
+import { createEventMaintenanceJob, EventMaintenanceManager } from './src/event-maintenance.js'
 import { SillyTavernStore } from './src/store.js'
 import { installBundledPreset } from './src/preset-installer.js'
 import { promptRegexRequest, transformRawAssistantStream, transformRawUserMessages } from './src/regex-pipeline.js'
@@ -95,31 +95,31 @@ export async function apply(ctx, config = {}) {
   const eligible = agent => agent?.session?.header?.origin !== 'subagent'
     && ctx.agentPresets.composedPreset(agent.ctx) === 'sillytavern'
   const maintenanceAgentOptions = {}
-  if (typeof config.memoryMaintenanceProvider === 'string' && config.memoryMaintenanceProvider !== '') maintenanceAgentOptions.provider = config.memoryMaintenanceProvider
-  if (typeof config.memoryMaintenanceModel === 'string' && config.memoryMaintenanceModel !== '') maintenanceAgentOptions.model = config.memoryMaintenanceModel
-  if (typeof config.memoryMaintenanceReasoningEffort === 'string' && config.memoryMaintenanceReasoningEffort !== '') maintenanceAgentOptions.reasoningEffort = config.memoryMaintenanceReasoningEffort
-  const memoryMaintenance = new MemoryMaintenanceManager({
+  if (typeof config.eventMaintenanceProvider === 'string' && config.eventMaintenanceProvider !== '') maintenanceAgentOptions.provider = config.eventMaintenanceProvider
+  if (typeof config.eventMaintenanceModel === 'string' && config.eventMaintenanceModel !== '') maintenanceAgentOptions.model = config.eventMaintenanceModel
+  if (typeof config.eventMaintenanceReasoningEffort === 'string' && config.eventMaintenanceReasoningEffort !== '') maintenanceAgentOptions.reasoningEffort = config.eventMaintenanceReasoningEffort
+  const eventMaintenance = new EventMaintenanceManager({
     store,
     subagents: ctx.subagents,
-    provider: typeof config.memoryMaintenanceSubagentProvider === 'string' && config.memoryMaintenanceSubagentProvider !== '' ? config.memoryMaintenanceSubagentProvider : 'spawn',
-    maxAttempts: config.memoryMaintenanceMaxAttempts,
-    maxConcurrency: config.memoryMaintenanceMaxConcurrency,
-    maxTokens: config.memoryMaintenanceMaxTokens,
+    provider: typeof config.eventMaintenanceSubagentProvider === 'string' && config.eventMaintenanceSubagentProvider !== '' ? config.eventMaintenanceSubagentProvider : 'spawn',
+    maxAttempts: config.eventMaintenanceMaxAttempts,
+    maxConcurrency: config.eventMaintenanceMaxConcurrency,
+    maxTokens: config.eventMaintenanceMaxTokens,
     agentOptions: maintenanceAgentOptions,
     isEligible: eligible,
     isCurrent: agent => active && ctx.agents.get(String(agent.id)) === agent,
   })
   const maintenanceRecoveryWarnings = new WeakSet()
-  const resumeMemoryMaintenance = async (agent, reason) => {
+  const resumeEventMaintenance = async (agent, reason) => {
     if (!active || !eligible(agent) || ctx.agents.get(String(agent.id)) !== agent) return false
     try {
-      await memoryMaintenance.resume(agent)
+      await eventMaintenance.resume(agent)
       maintenanceRecoveryWarnings.delete(agent)
       return true
     } catch (error) {
       if (!maintenanceRecoveryWarnings.has(agent)) {
         maintenanceRecoveryWarnings.add(agent)
-        console.error(`[dsh-sillytavern] failed to resume background memory maintenance during ${reason}; it will retry later`, error)
+        console.error(`[dsh-sillytavern] failed to resume background event maintenance during ${reason}; it will retry later`, error)
       }
       return false
     }
@@ -127,7 +127,7 @@ export async function apply(ctx, config = {}) {
   ctx.effect(() => async () => {
     active = false
     generationBroker.stopAll()
-    await memoryMaintenance.dispose()
+    await eventMaintenance.dispose()
   })
 
   const ensure = async (agent, signal) => {
@@ -157,7 +157,7 @@ export async function apply(ctx, config = {}) {
       const diagnosticGeneration = (worldbookDiagnosticSequences.get(agent) ?? 0) + 1
       worldbookDiagnosticSequences.set(agent, diagnosticGeneration)
       await ensure(agent, signal)
-      await resumeMemoryMaintenance(agent, 'prompt assembly')
+      await resumeEventMaintenance(agent, 'prompt assembly')
       const hasPersistedUserMessage = sessionEvents(agent.session).some(event => event.type === 'user/message')
       const pending = pendingOpenings.get(String(agent.session.id))
       const hasPendingFirstUser = pending !== undefined && pending.agent === agent && pending.session === agent.session
@@ -183,13 +183,13 @@ export async function apply(ctx, config = {}) {
         }
       }
       const compactedSeqs = compactedEventSeqs(agent)
-      let pendingMemoryFallback = []
+      let pendingEventFallback = []
       try {
-        pendingMemoryFallback = await memoryMaintenance.pendingFallback(agent, compactedSeqs)
+        pendingEventFallback = await eventMaintenance.pendingFallback(agent, compactedSeqs)
       } catch (error) {
         if (!maintenanceFallbackWarnings.has(agent)) {
           maintenanceFallbackWarnings.add(agent)
-          console.warn(`[dsh-sillytavern] could not read memory maintenance fallback; story generation will continue: ${error instanceof Error ? error.message : String(error)}`)
+          console.warn(`[dsh-sillytavern] could not read event maintenance fallback; story generation will continue: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
       const promptState = store.promptState(agent)
@@ -198,7 +198,7 @@ export async function apply(ctx, config = {}) {
       const injections = (promptState?.binding?.scriptInjections ?? []).filter(item => item.hasFilter !== true || eligibleInjectionIds.has(String(item.id)))
       const prompt = await assembleSillyTavernPrompt(agent, promptState, signal, {
         compactedSeqs,
-        pendingMemoryFallback,
+        pendingEventFallback,
         contextWindow,
         budgetPercent: lorebookSettings.context_percentage ?? config.worldInfoBudgetPercent ?? 25,
         budgetCap: lorebookSettings.budget_cap ?? config.worldInfoBudgetCap ?? 0,
@@ -243,19 +243,19 @@ export async function apply(ctx, config = {}) {
     },
     sessionView,
     flushOpening(agent) { return flushPendingOpening(agent) },
-    memory(agent, operation, signal) {
-      if (!eligible(agent)) throw new Error('memory queries are unavailable outside a SillyTavern parent Agent')
-      return store.memory(agent, operation, signal)
+    event(agent, operation, signal) {
+      if (!eligible(agent)) throw new Error('event queries are unavailable outside a SillyTavern parent Agent')
+      return store.event(agent, operation, signal)
     },
-    memoryGraph(agent, request, signal) {
-      if (!eligible(agent)) throw new Error('memory graph queries are unavailable outside a SillyTavern parent Agent')
-      return store.memoryGraph(agent, request, signal)
+    eventGraph(agent, request, signal) {
+      if (!eligible(agent)) throw new Error('event graph queries are unavailable outside a SillyTavern parent Agent')
+      return store.eventGraph(agent, request, signal)
     },
-    async consolidateMemory(agent, signal) {
-      if (!eligible(agent)) throw new Error('memory consolidation is unavailable outside a SillyTavern parent Agent')
+    async consolidateEvent(agent, signal) {
+      if (!eligible(agent)) throw new Error('event consolidation is unavailable outside a SillyTavern parent Agent')
       signal?.throwIfAborted()
       await ensure(agent, signal)
-      return memoryMaintenance.enqueuePeriodic(agent, { signal })
+      return eventMaintenance.enqueuePeriodic(agent, { signal })
     },
     transformUserMessages(agent, messages) {
       return transformRawUserMessages(messages, store.promptState(agent), sessionMessages(agent))
@@ -482,7 +482,7 @@ export async function apply(ctx, config = {}) {
     if (status !== 'idle') return
     const pending = pendingOpenings.get(String(agent.session.id))
     if (pending !== undefined && pending.agent === agent && pending.session === agent.session) attemptPendingOpening(pending)
-    void resumeMemoryMaintenance(agent, 'Agent idle transition')
+    void resumeEventMaintenance(agent, 'Agent idle transition')
   }
   const finishPendingOpeningOnClaim = ({ agent, message }) => {
     const id = String(agent.session.id)
@@ -883,9 +883,9 @@ export async function apply(ctx, config = {}) {
         sendJson(res, 200, { ok: true, value: stopped })
         return
       }
-      if (route === '/memory') {
+      if (route === '/event') {
         const agent = await agentFor(body.sessionId)
-        sendJson(res, 200, { ok: true, value: await store.memory(agent, body.operation ?? {}) })
+        sendJson(res, 200, { ok: true, value: await store.event(agent, body.operation ?? {}) })
         return
       }
       if (route === '/worldbook/create') {
@@ -961,7 +961,7 @@ export async function apply(ctx, config = {}) {
       await store.startSession(agent)
     }
     repairOpeningOrphan(agent)
-    await resumeMemoryMaintenance(agent, 'Agent recovery')
+    await resumeEventMaintenance(agent, 'Agent recovery')
   }
   const recoverAgent = async (agent, reason) => {
     try {
@@ -981,10 +981,10 @@ export async function apply(ctx, config = {}) {
       try {
         if (!await ctx.sessions.flush(session)) throw new Error('no session durability listener participated in the final-body flush')
         if (!active || ctx.agents.get(String(session.id)) !== agent || agent.session !== session || !eligible(agent)) return
-        const job = createMemoryMaintenanceJob(agent, event)
-        if (job !== null) await memoryMaintenance.enqueueCompletedTurn(agent, job)
+        const job = createEventMaintenanceJob(agent, event)
+        if (job !== null) await eventMaintenance.enqueueCompletedTurn(agent, job)
       } catch (error) {
-        console.error('[dsh-sillytavern] failed to durably enqueue background memory maintenance job', error)
+        console.error('[dsh-sillytavern] failed to durably enqueue background event maintenance job', error)
       }
     }).finally(() => {
       if (maintenanceEventTails.get(session) === current) maintenanceEventTails.delete(session)
@@ -1004,7 +1004,7 @@ export async function apply(ctx, config = {}) {
   ctx.on('agent/disposed', ({ agent }) => {
     openingSelections.delete(String(agent.session.id))
     pendingOpenings.delete(String(agent.session.id))
-    memoryMaintenance.stopAgent(agent)
+    eventMaintenance.stopAgent(agent)
     store.disposeSession(agent)
   })
 }

@@ -130,8 +130,8 @@ test('isolates same-card session persona, worldbook, memory, templates, variable
   })
   first.session.events.push({ type: 'assistant/message', seq: 0, data: { message: { content: 'Alice remembers shared-key for the first session.' } } })
   second.session.events.push({ type: 'assistant/message', seq: 0, data: { message: { content: 'Alice remembers shared-key for the second session.' } } })
-  await store.memory(first, { action: 'upsert', table: 'facts', key: 'shared-key', value: { owner: 'first' }, ...unknownMemoryContext })
-  await store.memory(second, { action: 'upsert', table: 'facts', key: 'shared-key', value: { owner: 'second' }, ...unknownMemoryContext })
+  await store.event(first, { action: 'upsert', table: 'facts', key: 'shared-key', value: { owner: 'first' }, ...unknownMemoryContext })
+  await store.event(second, { action: 'upsert', table: 'facts', key: 'shared-key', value: { owner: 'second' }, ...unknownMemoryContext })
   await Promise.all([store.startSession(first), store.startSession(second)])
 
   const firstView = store.sessionView(first)
@@ -143,8 +143,8 @@ test('isolates same-card session persona, worldbook, memory, templates, variable
   assert.equal(secondView.binding.variables.route, 'second')
   assert.equal(firstView.worldbookId, firstBook.id)
   assert.equal(secondView.worldbookId, secondBook.id)
-  assert.equal(firstView.memory.rows[0].value.owner, 'first')
-  assert.equal(secondView.memory.rows[0].value.owner, 'second')
+  assert.equal(firstView.event.rows[0].value.owner, 'first')
+  assert.equal(secondView.event.rows[0].value.owner, 'second')
   assert.deepEqual(store.promptState(first).templates.map(item => item.id), [firstTemplate.id])
   assert.deepEqual(store.promptState(second).templates.map(item => item.id), [secondTemplate.id])
   assert.equal(store.promptState(first).binding.scriptInjections[0].text, 'first prompt injection')
@@ -155,8 +155,8 @@ test('isolates same-card session persona, worldbook, memory, templates, variable
   await Promise.all([restored.ensureSession(first), restored.ensureSession(second)])
   assert.equal(restored.sessionView(first).binding.userPersona.name, 'Morgan')
   assert.equal(restored.sessionView(second).worldbookId, secondBook.id)
-  assert.equal(restored.sessionView(first).memory.rows[0].value.owner, 'first')
-  assert.equal(restored.sessionView(second).memory.rows[0].value.owner, 'second')
+  assert.equal(restored.sessionView(first).event.rows[0].value.owner, 'first')
+  assert.equal(restored.sessionView(second).event.rows[0].value.owner, 'second')
 })
 
 test('reports references, clears them on worldbook deletion, and confirms coupled card deletion before mutation', async t => {

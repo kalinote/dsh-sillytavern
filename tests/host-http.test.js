@@ -428,7 +428,7 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.deepEqual(eventState.body.value.card, { id: imported.body.value.record.id, name: 'Alice' })
   assert.equal(eventState.body.value.history.find(message => message.role === 'user')?.text, 'archive')
   assert.equal(eventState.body.value.history[0].role, 'assistant', 'the selected opening is a durable projected floor before the first user message')
-  assert.equal('memory' in eventState.body.value, false)
+  assert.equal('event' in eventState.body.value, false)
   assert.ok(JSON.stringify(eventState.body).length < 2048, 'event polling response stays lightweight')
   const traversal = await invoke(route, 'POST', '/api/dsh-sillytavern/card/update', { sessionId: live.id, cardId: '../escape', patch: { cardData: { name: 'x' } } })
   assert.equal(traversal.status, 400)
@@ -461,25 +461,25 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.equal(changedKind.body.value.scripts[0].enabled, false)
 
   live.session.append('assistant/message', { message: { content: 'Alice arrives at Narita Airport in the International Arrivals Hall.' } })
-  const oneKeyword = await invoke(route, 'POST', '/api/dsh-sillytavern/memory', {
+  const oneKeyword = await invoke(route, 'POST', '/api/dsh-sillytavern/event', {
     sessionId: live.id,
     operation: { action: 'upsert', table: 'events', key: 'invalid-count', value: {}, keywords: ['Alice'], ...unknownMemoryContext },
   })
   assert.equal(oneKeyword.status, 400)
   assert.match(oneKeyword.body.error, /2 to 10/)
-  const genericKeyword = await invoke(route, 'POST', '/api/dsh-sillytavern/memory', {
+  const genericKeyword = await invoke(route, 'POST', '/api/dsh-sillytavern/event', {
     sessionId: live.id,
     operation: { action: 'upsert', table: 'events', key: 'invalid-generic', value: {}, keywords: ['Alice', '事件'], ...unknownMemoryContext },
   })
   assert.equal(genericKeyword.status, 400)
   assert.match(genericKeyword.body.error, /generic classifications/)
-  const missingKeyword = await invoke(route, 'POST', '/api/dsh-sillytavern/memory', {
+  const missingKeyword = await invoke(route, 'POST', '/api/dsh-sillytavern/event', {
     sessionId: live.id,
     operation: { action: 'upsert', table: 'events', key: 'invalid-source', value: {}, keywords: ['Alice', 'Osaka'], ...unknownMemoryContext },
   })
   assert.equal(missingKeyword.status, 400)
   assert.match(missingKeyword.body.error, /missing: "Osaka"/)
-  const memory = await invoke(route, 'POST', '/api/dsh-sillytavern/memory', {
+  const memory = await invoke(route, 'POST', '/api/dsh-sillytavern/event', {
     sessionId: live.id,
     operation: { action: 'upsert', table: 'events', key: 'arrival', value: { place: 'archive' }, keywords: ['Alice', 'Narita Airport'], ...unknownMemoryContext, location: ['Tokyo Outskirts', 'Narita Airport', 'International Arrivals Hall'] },
   })
@@ -488,8 +488,8 @@ test('Host API imports into the existing session and exposes memory CRUD', async
 
   const session = await invoke(route, 'GET', `/api/dsh-sillytavern/session?sessionId=${live.id}`)
   assert.equal(session.status, 200)
-  assert.equal(session.body.value.memory.rows[0].key, 'arrival')
-  assert.deepEqual(session.body.value.memory.rows[0].location, ['Tokyo Outskirts', 'Narita Airport', 'International Arrivals Hall'])
+  assert.equal(session.body.value.event.rows[0].key, 'arrival')
+  assert.deepEqual(session.body.value.event.rows[0].location, ['Tokyo Outskirts', 'Narita Airport', 'International Arrivals Hall'])
   assert.equal(session.body.value.binding.cardId, imported.body.value.record.id)
   assert.equal(session.body.value.binding.variables.secret, 'amber')
   assert.equal(session.body.value.card.card.data.character_book, undefined)
@@ -508,13 +508,13 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.equal(subagentRuns.length, 0, 'background maintenance must wait until final-body persistence succeeds')
   releaseFinalBodyFlush(true)
   flushSession = async () => true
-  await waitFor(() => ctx.sillyTavern.sessionView(live).memory.rows.some(row => row.key === 'background maintained fact'), 'turn/end did not launch background memory maintenance')
+  await waitFor(() => ctx.sillyTavern.sessionView(live).event.rows.some(row => row.key === 'background maintained fact'), 'turn/end did not launch background event maintenance')
   assert.equal(sessionFlushes.at(-1), live.session)
   assert.equal(subagentRuns.length, 1)
   assert.equal(subagentRuns[0].provider, 'spawn')
   assert.equal(subagentRuns[0].options.parent, live)
   assert.match(subagentRuns[0].options.prompt[0].text, /Alice locks the silver bell/)
-  const maintained = ctx.sillyTavern.sessionView(live).memory.rows.find(row => row.key === 'background maintained fact')
+  const maintained = ctx.sillyTavern.sessionView(live).event.rows.find(row => row.key === 'background maintained fact')
   assert.deepEqual(maintained.sourceRefs, [
     { eventSeq: backgroundUser.seq, turn: backgroundTurn, role: 'user' },
     { eventSeq: backgroundAssistant.seq, turn: backgroundTurn, role: 'assistant' },
@@ -530,7 +530,7 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   const childEnd = maintenanceChild.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
   listeners.get('session/event')(maintenanceChild.session, childEnd)
   await delay(30)
-  assert.equal(subagentRuns.length, 1, 'a maintenance child must never recursively schedule memory maintenance')
+  assert.equal(subagentRuns.length, 1, 'a maintenance child must never recursively schedule event maintenance')
 
   const blockedDelete = await invoke(route, 'POST', '/api/dsh-sillytavern/card/delete', { sessionId: live.id, cardId: imported.body.value.record.id })
   assert.equal(blockedDelete.status, 409)
@@ -550,7 +550,7 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   const sessionAfterDelete = ctx.sillyTavern.sessionView(live)
   assert.equal(sessionAfterDelete.binding, null)
   assert.equal(sessionAfterDelete.card, null)
-  assert.equal(sessionAfterDelete.memory.rows[0].key, 'arrival', 'deleting a card does not erase session memory')
+  assert.equal(sessionAfterDelete.event.rows[0].key, 'arrival', 'deleting a card does not erase session memory')
   const duplicateDelete = await invoke(route, 'POST', '/api/dsh-sillytavern/card/delete', { sessionId: fresh.id, cardId: imported.body.value.record.id })
   assert.equal(duplicateDelete.status, 404)
 

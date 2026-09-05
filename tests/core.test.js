@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  applyMemoryOperation,
+  applyEventOperation,
   assertMemoryKeywordsInSource,
-  emptyMemoryDocument,
+  emptyEventDocument,
   isMemoryAutoRecallEligible,
-  memoryLimits,
-  normalizeMemoryDocument,
+  eventLimits,
+  normalizeEventDocument,
   queryMemory,
-  queryMemoryGraph,
-} from '../src/memory.js'
+  queryEventGraph,
+} from '../src/event.js'
 import { renderPromptTemplate } from '../src/template.js'
 import { activateWorldbook } from '../src/worldbook.js'
 import { injectWorldbookDepthMessages, sessionEventDelta } from '../src/prompt.js'
@@ -340,32 +340,32 @@ const eventMemory = (eventId, key, overrides = {}) => ({
 })
 
 test('requires narrative dimensions on new memory rows and inherits them on update', () => {
-  let document = emptyMemoryDocument('session-1')
+  let document = emptyEventDocument('session-1')
   assert.deepEqual(document, { schemaVersion: 5, sessionId: 'session-1', revision: 0, rows: [], eventEdges: [], appliedMaintenanceJobs: [] })
   assert.throws(
-    () => normalizeMemoryDocument({ schemaVersion: 4, revision: 4, rows: [{ id: 'legacy' }] }, 'session-1'),
+    () => normalizeEventDocument({ schemaVersion: 4, revision: 4, rows: [{ id: 'legacy' }] }, 'session-1'),
     /schema version 4 is unsupported; expected 5.*Delete.*manually/,
   )
   assert.deepEqual(
-    normalizeMemoryDocument({ ...document, rows: [{ id: 'invalid-schema-5-row' }] }, 'session-1'),
-    emptyMemoryDocument('session-1'),
+    normalizeEventDocument({ ...document, rows: [{ id: 'invalid-schema-5-row' }] }, 'session-1'),
+    emptyEventDocument('session-1'),
     'an invalid schema 5 document is replaced rather than partially migrated',
   )
-  assert.equal(memoryLimits.MAX_ROWS, 10_000)
-  assert.ok(memoryLimits.MAX_EVENT_EDGES >= memoryLimits.MAX_ROWS)
-  assert.equal(memoryLimits.MIN_KEYWORDS, 2)
-  assert.equal(memoryLimits.MAX_KEYWORDS, 10)
+  assert.equal(eventLimits.MAX_ROWS, 10_000)
+  assert.ok(eventLimits.MAX_EVENT_EDGES >= eventLimits.MAX_ROWS)
+  assert.equal(eventLimits.MIN_KEYWORDS, 2)
+  assert.equal(eventLimits.MAX_KEYWORDS, 10)
   const base = { action: 'upsert', table: 'relationships', key: 'Alice/User', value: { trust: 2 }, keywords: ['Alice', 'User'] }
-  assert.throws(() => applyMemoryOperation(document, base), /storyTime/)
-  assert.throws(() => applyMemoryOperation(document, { ...base, storyTime: unknownStoryTime() }), /location/)
-  assert.throws(() => applyMemoryOperation(document, { ...base, storyTime: unknownStoryTime(), location: null }), /characters/)
-  assert.throws(() => applyMemoryOperation(document, { ...base, storyTime: { state: 'normalized', label: null, timeline: '', start: 2, end: 1 }, location: null, characters: [] }), /finite ordered/)
-  assert.throws(() => applyMemoryOperation(document, { ...base, storyTime: { state: 'label-only', label: '', timeline: null, start: null, end: null }, location: null, characters: [] }), /non-empty label/)
-  assert.throws(() => applyMemoryOperation(document, { ...base, storyTime: unknownStoryTime(), location: [], characters: [] }), /non-empty array/)
-  assert.throws(() => applyMemoryOperation(document, { ...base, storyTime: unknownStoryTime(), location: ['Tokyo Outskirts', ' '], characters: [] }), /location segments/)
-  assert.throws(() => applyMemoryOperation(document, { ...base, storyTime: unknownStoryTime(), location: 'Archive', characters: [] }), /location segments/)
+  assert.throws(() => applyEventOperation(document, base), /storyTime/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime() }), /location/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: null }), /characters/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: { state: 'normalized', label: null, timeline: '', start: 2, end: 1 }, location: null, characters: [] }), /finite ordered/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: { state: 'label-only', label: '', timeline: null, start: null, end: null }, location: null, characters: [] }), /non-empty label/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: [], characters: [] }), /non-empty array/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: ['Tokyo Outskirts', ' '], characters: [] }), /location segments/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: 'Archive', characters: [] }), /location segments/)
 
-  document = applyMemoryOperation(document, {
+  document = applyEventOperation(document, {
     ...base,
     storyTime: { state: 'unknown', label: 'discarded', timeline: 'discarded', start: 1, end: 2 },
     location: null,
@@ -381,13 +381,13 @@ test('requires narrative dimensions on new memory rows and inherits them on upda
   assert.deepEqual(document.rows[0].sourceRefs, [])
   assert.equal(document.rows[0].recallPolicy, 'always')
 
-  document = applyMemoryOperation(document, {
+  document = applyEventOperation(document, {
     action: 'update',
     id: document.rows[0].id,
     sourceRefs: [{ eventSeq: 12, turn: 3, role: 'assistant' }],
     recallPolicy: 'query_only',
   }).document
-  const inherited = applyMemoryOperation(document, { action: 'update', id: document.rows[0].id, value: { trust: 3 }, importance: 1 }).document.rows[0]
+  const inherited = applyEventOperation(document, { action: 'update', id: document.rows[0].id, value: { trust: 3 }, importance: 1 }).document.rows[0]
   assert.equal(inherited.value.trust, 3)
   assert.deepEqual(inherited.storyTime, unknownStoryTime())
   assert.equal(inherited.location, null)
@@ -395,12 +395,12 @@ test('requires narrative dimensions on new memory rows and inherits them on upda
   assert.equal(inherited.eventId, 'relationship-1')
   assert.deepEqual(inherited.sourceRefs, [{ eventSeq: 12, turn: 3, role: 'assistant' }])
   assert.equal(inherited.recallPolicy, 'query_only', 'updates preserve an explicit policy even when importance changes')
-  assert.throws(() => applyMemoryOperation(document, { action: 'update', id: document.rows[0].id, eventId: ' ' }), /eventId/)
-  assert.throws(() => applyMemoryOperation(document, { action: 'update', id: document.rows[0].id, sourceRefs: [{ eventSeq: -1, turn: 1, role: 'user' }] }), /sourceRefs/)
-  assert.throws(() => applyMemoryOperation(document, { action: 'update', id: document.rows[0].id, sourceRefs: [{ eventSeq: 1, turn: 0, role: 'user' }] }), /sourceRefs/)
-  assert.throws(() => applyMemoryOperation(document, { action: 'update', id: document.rows[0].id, sourceRefs: [{ eventSeq: 1, turn: 1, role: 'system' }] }), /sourceRefs/)
-  assert.throws(() => applyMemoryOperation(document, { action: 'update', id: document.rows[0].id, recallPolicy: 'sometimes' }), /recallPolicy/)
-  assert.throws(() => applyMemoryOperation(document, { action: 'update', id: document.rows[0].id, tags: ['legacy'] }), /no longer supported/)
+  assert.throws(() => applyEventOperation(document, { action: 'update', id: document.rows[0].id, eventId: ' ' }), /eventId/)
+  assert.throws(() => applyEventOperation(document, { action: 'update', id: document.rows[0].id, sourceRefs: [{ eventSeq: -1, turn: 1, role: 'user' }] }), /sourceRefs/)
+  assert.throws(() => applyEventOperation(document, { action: 'update', id: document.rows[0].id, sourceRefs: [{ eventSeq: 1, turn: 0, role: 'user' }] }), /sourceRefs/)
+  assert.throws(() => applyEventOperation(document, { action: 'update', id: document.rows[0].id, sourceRefs: [{ eventSeq: 1, turn: 1, role: 'system' }] }), /sourceRefs/)
+  assert.throws(() => applyEventOperation(document, { action: 'update', id: document.rows[0].id, recallPolicy: 'sometimes' }), /recallPolicy/)
+  assert.throws(() => applyEventOperation(document, { action: 'update', id: document.rows[0].id, tags: ['legacy'] }), /no longer supported/)
 })
 
 test('validates keyword count, specificity, and verbatim assistant story sources', () => {
@@ -408,14 +408,14 @@ test('validates keyword count, specificity, and verbatim assistant story sources
     action: 'upsert', table: 'events', key: 'silver bell', value: { owner: 'Alice' },
     storyTime: unknownStoryTime(), location: null, characters: ['Alice'],
   }
-  const empty = emptyMemoryDocument('session-keywords')
-  assert.throws(() => applyMemoryOperation(empty, { ...base, keywords: ['Alice'] }), /2 to 10/)
-  assert.throws(() => applyMemoryOperation(empty, { ...base, keywords: Array.from({ length: 11 }, (_value, index) => `keyword-${index}`) }), /split memories/)
-  assert.throws(() => applyMemoryOperation(empty, { ...base, keywords: ['Alice', 'Alice'] }), /2 to 10/)
-  assert.throws(() => applyMemoryOperation(empty, { ...base, keywords: null }), /2 to 10/)
-  assert.throws(() => applyMemoryOperation(empty, { ...base, keywords: ['Alice', '物品'] }), /generic classifications/)
+  const empty = emptyEventDocument('session-keywords')
+  assert.throws(() => applyEventOperation(empty, { ...base, keywords: ['Alice'] }), /2 to 10/)
+  assert.throws(() => applyEventOperation(empty, { ...base, keywords: Array.from({ length: 11 }, (_value, index) => `keyword-${index}`) }), /split memories/)
+  assert.throws(() => applyEventOperation(empty, { ...base, keywords: ['Alice', 'Alice'] }), /2 to 10/)
+  assert.throws(() => applyEventOperation(empty, { ...base, keywords: null }), /2 to 10/)
+  assert.throws(() => applyEventOperation(empty, { ...base, keywords: ['Alice', '物品'] }), /generic classifications/)
 
-  const document = applyMemoryOperation(empty, {
+  const document = applyEventOperation(empty, {
     ...base,
     keywords: ['Alice', 'silver bell'],
     sourceRefs: [{ eventSeq: 7, turn: 1, role: 'assistant' }],
@@ -427,7 +427,7 @@ test('validates keyword count, specificity, and verbatim assistant story sources
     /missing: "silver bell"/,
   )
   assert.throws(() => assertMemoryKeywordsInSource(document, []), /no assistant story source/)
-  const userOnlySource = applyMemoryOperation(empty, {
+  const userOnlySource = applyEventOperation(empty, {
     ...base,
     keywords: ['Alice', 'silver bell'],
     sourceRefs: [{ eventSeq: 7, turn: 1, role: 'user' }],
@@ -436,7 +436,7 @@ test('validates keyword count, specificity, and verbatim assistant story sources
 })
 
 test('gates automatic recall by policy, compaction, and importance while retaining relevance priority', () => {
-  let document = emptyMemoryDocument('session-recall')
+  let document = emptyEventDocument('session-recall')
   const operations = [
     eventMemory('always-event', 'always-low', { importance: 0.2, recallPolicy: 'always', sourceRefs: [{ eventSeq: 1, turn: 1, role: 'user' }] }),
     eventMemory('query-event', 'query-high', { importance: 0.99, recallPolicy: 'query_only', sourceRefs: [] }),
@@ -444,7 +444,7 @@ test('gates automatic recall by policy, compaction, and importance while retaini
     eventMemory('manual-event', 'manual', { importance: 0.3 }),
     eventMemory('promoted-event', 'promoted', { importance: 0.85, recallPolicy: 'after_compaction', sourceRefs: [{ eventSeq: 4, turn: 2, role: 'assistant' }] }),
   ]
-  for (const operation of operations) document = applyMemoryOperation(document, operation).document
+  for (const operation of operations) document = applyEventOperation(document, operation).document
   const rows = Object.fromEntries(document.rows.map(row => [row.key, row]))
 
   assert.equal(rows.waiting.recallPolicy, 'after_compaction')
@@ -460,14 +460,14 @@ test('gates automatic recall by policy, compaction, and importance while retaini
 })
 
 test('uses normalized table/key identity for upsert and rejects persisted duplicates', () => {
-  let document = emptyMemoryDocument('session-row-identity')
-  document = applyMemoryOperation(document, {
+  let document = emptyEventDocument('session-row-identity')
+  document = applyEventOperation(document, {
     ...eventMemory('event-identity', ' durable fact '),
     table: ' events ',
     sourceRefs: [{ eventSeq: 1, turn: 1, role: 'assistant' }],
   }).document
   const originalId = document.rows[0].id
-  document = applyMemoryOperation(document, {
+  document = applyEventOperation(document, {
     ...eventMemory('event-identity', 'durable fact'),
     table: 'events',
     value: { note: 'corrected' },
@@ -481,20 +481,20 @@ test('uses normalized table/key identity for upsert and rejects persisted duplic
   duplicate.table = ' events '
   duplicate.key = ' durable fact '
   assert.deepEqual(
-    normalizeMemoryDocument({ ...document, rows: [...document.rows, duplicate] }, document.sessionId),
-    emptyMemoryDocument(document.sessionId),
+    normalizeEventDocument({ ...document, rows: [...document.rows, duplicate] }, document.sessionId),
+    emptyEventDocument(document.sessionId),
   )
 })
 
 test('queries memory by people, intersecting story time, location, event, and text', () => {
-  let document = emptyMemoryDocument('session-filters')
+  let document = emptyEventDocument('session-filters')
   const rows = [
     { key: 'arrival-hall', value: { note: 'first' }, keywords: ['Alice', 'terminal'], storyTime: { state: 'normalized', label: 'Dawn arrival', timeline: 'main', start: 1, end: 2 }, location: ['Tokyo Outskirts', 'Narita Airport', 'International Arrivals Hall'], characters: ['Alice', 'Bob'], eventId: 'shared-scene-42' },
     { key: 'arrival-garden', value: { note: 'second' }, keywords: ['Alice', 'Moon Garden'], storyTime: { state: 'normalized', label: 'Dusk departure', timeline: 'main', start: 5, end: 7 }, location: ['Tokyo Outskirts', 'Moon Garden'], characters: ['Alice', 'Cara'], eventId: 'shared-scene-42' },
     { key: 'festival-rumor', value: { note: 'vague' }, keywords: ['festival', 'rumor'], storyTime: { state: 'label-only', label: 'After the festival', timeline: 'main', start: null, end: null }, location: ['Central District', 'Archive'], characters: ['Bob'] },
     { key: 'unplaced', value: { note: 'unknown' }, keywords: ['unknown', 'unplaced'], storyTime: unknownStoryTime(), location: null, characters: [] },
   ]
-  for (const row of rows) document = applyMemoryOperation(document, { action: 'upsert', table: 'events', ...row }).document
+  for (const row of rows) document = applyEventOperation(document, { action: 'upsert', table: 'events', ...row }).document
 
   assert.deepEqual(queryMemory(document, { eventId: 'shared-scene-42', order: 'time_asc' }).map(row => row.key), ['arrival-hall', 'arrival-garden'])
   assert.deepEqual(queryMemory(document, { filters: { eventId: 'shared-scene-42', order: 'time_desc' } }).map(row => row.key), ['arrival-garden', 'arrival-hall'])
@@ -515,26 +515,26 @@ test('queries memory by people, intersecting story time, location, event, and te
   assert.equal(queryMemory(document, { query: 'shared-scene-42' }).length, 2, 'eventId participates in full-text search')
 })
 
-test('keeps memory batches atomic and enforces row budgets', () => {
-  let document = emptyMemoryDocument('session-batch')
-  document = applyMemoryOperation(document, {
+test('keeps event batches atomic and enforces row budgets', () => {
+  let document = emptyEventDocument('session-batch')
+  document = applyEventOperation(document, {
     action: 'upsert', table: 'items', key: 'brass key', value: { owner: 'User' },
     keywords: ['brass key', 'User'], storyTime: unknownStoryTime(), location: ['Central District', 'Archive'], characters: ['User'],
   }).document
   const before = structuredClone(document)
-  assert.throws(() => applyMemoryOperation(document, { action: 'batch', operations: [
+  assert.throws(() => applyEventOperation(document, { action: 'batch', operations: [
     { action: 'upsert', table: 'items', key: 'silver key', value: {}, keywords: ['silver key', 'Vault'], storyTime: unknownStoryTime(), location: ['Castle', 'Vault'], characters: [] },
     { action: 'update', id: 'missing', value: { owner: 'Nobody' } },
   ] }), /was not found/)
   assert.deepEqual(document, before, 'a failed later operation cannot expose earlier batch mutations')
 
   const id = document.rows[0].id
-  document = applyMemoryOperation(document, { action: 'batch', operations: [
+  document = applyEventOperation(document, { action: 'batch', operations: [
     { action: 'upsert', table: 'items', key: 'silver key', value: {}, keywords: ['silver key', 'Vault'], storyTime: unknownStoryTime(), location: ['Castle', 'Vault'], characters: [] },
     { action: 'delete', id },
   ] }).document
   assert.deepEqual(document.rows.map(row => row.key), ['silver key'])
-  assert.throws(() => applyMemoryOperation(document, {
+  assert.throws(() => applyEventOperation(document, {
     action: 'upsert', table: 'oversize', key: 'blob', value: { text: 'x'.repeat(300 * 1024) },
     keywords: ['oversize', 'blob'], storyTime: unknownStoryTime(), location: null, characters: [],
   }), /exceeds/)
@@ -546,12 +546,12 @@ test('records maintenance job application atomically and makes replay a no-op', 
     maintenanceJobId: 'turn-1-assistant-7',
     operations: [eventMemory('event-idempotent', 'durable fact')],
   }
-  const first = applyMemoryOperation(emptyMemoryDocument('session-idempotent'), operation)
+  const first = applyEventOperation(emptyEventDocument('session-idempotent'), operation)
   assert.equal(first.changed, true)
   assert.equal(first.document.revision, 1)
   assert.deepEqual(first.document.appliedMaintenanceJobs, ['turn-1-assistant-7'])
 
-  const replay = applyMemoryOperation(first.document, operation)
+  const replay = applyEventOperation(first.document, operation)
   assert.equal(replay.changed, false)
   assert.equal(replay.duplicate, true)
   assert.equal(replay.document.revision, 1)
@@ -559,11 +559,11 @@ test('records maintenance job application atomically and makes replay a no-op', 
 })
 
 test('upserts event edges idempotently and deletes them by id', () => {
-  let document = emptyMemoryDocument('session-edge-upsert')
-  document = applyMemoryOperation(document, eventMemory('event-1', 'first')).document
-  document = applyMemoryOperation(document, eventMemory('event-2', 'second')).document
+  let document = emptyEventDocument('session-edge-upsert')
+  document = applyEventOperation(document, eventMemory('event-1', 'first')).document
+  document = applyEventOperation(document, eventMemory('event-2', 'second')).document
 
-  const created = applyMemoryOperation(document, {
+  const created = applyEventOperation(document, {
     action: 'event_edge_upsert',
     kind: 'precedes',
     predecessorEventId: ' event-1 ',
@@ -578,7 +578,7 @@ test('upserts event edges idempotently and deletes them by id', () => {
 
   const originalId = created.result.id
   const originalCreatedAt = created.result.createdAt
-  const updated = applyMemoryOperation(document, {
+  const updated = applyEventOperation(document, {
     action: 'event_edge_upsert',
     predecessorEventId: 'event-1',
     successorEventId: 'event-2',
@@ -591,53 +591,53 @@ test('upserts event edges idempotently and deletes them by id', () => {
   assert.equal(updated.result.reason, 'Updated reason')
   assert.deepEqual(updated.result.sourceRefs, [{ eventSeq: 20, turn: 4, role: 'assistant' }])
 
-  const removed = applyMemoryOperation(document, { action: 'event_edge_delete', id: originalId })
+  const removed = applyEventOperation(document, { action: 'event_edge_delete', id: originalId })
   assert.equal(removed.result.id, originalId)
   assert.deepEqual(removed.document.eventEdges, [])
 })
 
 test('enforces event graph endpoints, self-edge, duplicate, and cycle invariants', () => {
-  let document = emptyMemoryDocument('session-graph-invariants')
+  let document = emptyEventDocument('session-graph-invariants')
   for (const eventId of ['event-1', 'event-2', 'event-3']) {
-    document = applyMemoryOperation(document, eventMemory(eventId, eventId)).document
+    document = applyEventOperation(document, eventMemory(eventId, eventId)).document
   }
   const pristine = structuredClone(document)
-  assert.throws(() => applyMemoryOperation(document, {
+  assert.throws(() => applyEventOperation(document, {
     action: 'event_edge_upsert', predecessorEventId: 'event-1', successorEventId: 'missing',
   }), /endpoints/)
-  assert.throws(() => applyMemoryOperation(document, {
+  assert.throws(() => applyEventOperation(document, {
     action: 'event_edge_upsert', predecessorEventId: 'event-1', successorEventId: 'event-1',
   }), /self-edge/)
   assert.deepEqual(document, pristine)
 
-  document = applyMemoryOperation(document, {
+  document = applyEventOperation(document, {
     action: 'event_edge_upsert', predecessorEventId: 'event-1', successorEventId: 'event-2',
   }).document
-  document = applyMemoryOperation(document, {
+  document = applyEventOperation(document, {
     action: 'event_edge_upsert', predecessorEventId: 'event-2', successorEventId: 'event-3',
   }).document
   const acyclic = structuredClone(document)
-  assert.throws(() => applyMemoryOperation(document, {
+  assert.throws(() => applyEventOperation(document, {
     action: 'event_edge_upsert', predecessorEventId: 'event-3', successorEventId: 'event-1',
   }), /cycle/)
   assert.deepEqual(document, acyclic)
 
   const firstRowId = document.rows.find(row => row.eventId === 'event-1').id
-  assert.throws(() => applyMemoryOperation(document, { action: 'delete', id: firstRowId }), /endpoints/)
+  assert.throws(() => applyEventOperation(document, { action: 'delete', id: firstRowId }), /endpoints/)
   assert.deepEqual(document, acyclic, 'a row deletion cannot leave a dangling event edge')
 
   const duplicate = structuredClone(document)
   duplicate.eventEdges.push({ ...duplicate.eventEdges[0], id: 'duplicate-id' })
   assert.deepEqual(
-    normalizeMemoryDocument(duplicate, document.sessionId),
-    emptyMemoryDocument(document.sessionId),
+    normalizeEventDocument(duplicate, document.sessionId),
+    emptyEventDocument(document.sessionId),
     'an invalid persisted graph normalizes to a fresh schema 5 document',
   )
 })
 
 test('validates mixed row and edge batches only after the final atomic document exists', () => {
-  let document = emptyMemoryDocument('session-mixed-batch')
-  const applied = applyMemoryOperation(document, {
+  let document = emptyEventDocument('session-mixed-batch')
+  const applied = applyEventOperation(document, {
     action: 'batch',
     operations: [
       { action: 'event_edge_upsert', predecessorEventId: 'event-1', successorEventId: 'event-2' },
@@ -651,7 +651,7 @@ test('validates mixed row and edge batches only after the final atomic document 
   assert.equal(document.eventEdges.length, 1)
 
   const beforeFailure = structuredClone(document)
-  assert.throws(() => applyMemoryOperation(document, {
+  assert.throws(() => applyEventOperation(document, {
     action: 'batch',
     operations: [
       eventMemory('event-3', 'third'),
@@ -662,7 +662,7 @@ test('validates mixed row and edge batches only after the final atomic document 
 
   const firstRowId = document.rows.find(row => row.eventId === 'event-1').id
   const edgeId = document.eventEdges[0].id
-  document = applyMemoryOperation(document, {
+  document = applyEventOperation(document, {
     action: 'batch',
     operations: [
       { action: 'delete', id: firstRowId },
@@ -674,7 +674,7 @@ test('validates mixed row and edge batches only after the final atomic document 
 })
 
 test('queries grouped event nodes with direct incoming and outgoing relationships', () => {
-  let document = emptyMemoryDocument('session-graph-query')
+  let document = emptyEventDocument('session-graph-query')
   const rows = [
     eventMemory('event-before', 'before'),
     eventMemory('event-seed', 'seed-a', { value: { note: 'unique silver clue' }, importance: 0.9 }),
@@ -682,26 +682,26 @@ test('queries grouped event nodes with direct incoming and outgoing relationship
     eventMemory('event-after', 'after'),
     eventMemory('event-unrelated', 'unrelated'),
   ]
-  for (const row of rows) document = applyMemoryOperation(document, row).document
-  document = applyMemoryOperation(document, {
+  for (const row of rows) document = applyEventOperation(document, row).document
+  document = applyEventOperation(document, {
     action: 'event_edge_upsert', predecessorEventId: 'event-before', successorEventId: 'event-seed', reason: 'setup',
   }).document
-  document = applyMemoryOperation(document, {
+  document = applyEventOperation(document, {
     action: 'event_edge_upsert', predecessorEventId: 'event-seed', successorEventId: 'event-after', reason: 'consequence',
   }).document
 
-  const direct = queryMemoryGraph(document, { eventId: 'event-seed' })
+  const direct = queryEventGraph(document, { eventId: 'event-seed' })
   assert.deepEqual(direct.seedEventIds, ['event-seed'])
   assert.deepEqual(direct.events.map(event => event.eventId), ['event-seed', 'event-before', 'event-after'])
   assert.equal(direct.events[0].rows.length, 2, 'all rows sharing the seed eventId are grouped into one event node')
   assert.deepEqual(direct.incomingEdges.map(edge => edge.predecessorEventId), ['event-before'])
   assert.deepEqual(direct.outgoingEdges.map(edge => edge.successorEventId), ['event-after'])
 
-  const derived = queryMemoryGraph(document, { query: 'unique silver clue', limit: 1 })
+  const derived = queryEventGraph(document, { query: 'unique silver clue', limit: 1 })
   assert.deepEqual(derived.seedEventIds, ['event-seed'])
   assert.deepEqual(derived.events.map(event => event.eventId), ['event-seed', 'event-before', 'event-after'])
   assert.equal(derived.events.some(event => event.eventId === 'event-unrelated'), false)
-  assert.deepEqual(queryMemoryGraph(document, { eventId: 'missing' }), {
+  assert.deepEqual(queryEventGraph(document, { eventId: 'missing' }), {
     seedEventIds: [], events: [], incomingEdges: [], outgoingEdges: [],
   })
 })

@@ -73,11 +73,11 @@ function queryFields() {
   }
 }
 
-export function memoryToolDefinitions(service) {
+export function eventToolDefinitions(service) {
   return [
-    definition(service, 'st_memory_query', 'Read long-term memory when established facts may affect the next scene. Explicit queries bypass automatic-recall policy and source-compaction gates.', queryFields(),
-      (args, agent, signal) => service.memory(agent, { ...args, action: 'query' }, signal)),
-    definition(service, 'st_memory_graph_query', 'Read an event node, all memory rows grouped under it, and its direct incoming/outgoing precedes relations. Supply eventId when known, or use the same filters as memory query to discover seed events.', queryFields(),
-      (args, agent, signal) => service.memoryGraph(agent, args, signal)),
+    definition(service, 'st_event_query', 'Read matching memory rows from events when established facts may affect the next scene. Each event groups multiple memory rows under one eventId. Explicit queries bypass automatic-recall policy and source-compaction gates.', queryFields(),
+      (args, agent, signal) => service.event(agent, { ...args, action: 'query' }, signal)),
+    definition(service, 'st_event_graph_query', 'Read an event node, all memory rows grouped under it, and its direct incoming/outgoing precedes relations. Supply eventId when known, or use the same filters as st_event_query to discover seed events.', queryFields(),
+      (args, agent, signal) => service.eventGraph(agent, args, signal)),
   ]
 }

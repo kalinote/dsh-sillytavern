@@ -76,7 +76,7 @@ const edgeDeleteOperation = {
   required: ['action', 'id'],
 }
 
-export const MEMORY_PATCH_SCHEMA = Object.freeze({
+export const EVENT_PATCH_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
   properties: {
@@ -173,7 +173,7 @@ function createIncrementalJob(round) {
   }
 }
 
-export function createMemoryMaintenanceJob(agent, turnEndEvent) {
+export function createEventMaintenanceJob(agent, turnEndEvent) {
   const round = conversationRoundFromEndEvent(sessionEvents(agent?.session), turnEndEvent)
   return round === null ? null : createIncrementalJob(round)
 }
@@ -208,7 +208,7 @@ function eventSummary(document, eventId) {
   }
 }
 
-export function selectMaintenanceMemory(document, text, options = {}) {
+export function selectMaintenanceEvents(document, text, options = {}) {
   const normalizedText = normalizeMaintenanceMatchText(text)
   const touchedRowIds = new Set(Array.isArray(options.touchedRowIds) ? options.touchedRowIds : [])
   const touchedEventIds = new Set(Array.isArray(options.touchedEventIds) ? options.touchedEventIds : [])
@@ -258,13 +258,13 @@ function contextText(job) {
 }
 
 function promptForJob(job, document, touches = {}) {
-  const memory = selectMaintenanceMemory(document, contextText(job), job.kind === 'periodic' ? touches : {})
+  const event = selectMaintenanceEvents(document, contextText(job), job.kind === 'periodic' ? touches : {})
   const periodic = job.kind === 'periodic'
   const instructions = [
     periodic
-      ? 'Periodically consolidate long-term memory for the supplied contiguous roleplay conversation rounds.'
-      : 'Incrementally maintain long-term memory after the latest completed roleplay round.',
-    'Produce only the structured patch requested by the output tool. An empty operations array is valid.',
+      ? 'Periodically consolidate narrative events for the supplied contiguous roleplay conversation rounds.'
+      : 'Incrementally maintain narrative events after the latest completed roleplay round.',
+    'Produce only the structured event patch requested by the output tool. An empty operations array is valid.',
     '',
     'Responsibilities:',
     ...(periodic ? [
@@ -279,6 +279,7 @@ function promptForJob(job, document, touches = {}) {
       '- Correct or delete contradicted candidate facts, and update a candidate row instead of creating a near-duplicate.',
     ]),
     '- Group multiple memories from the same logical event with one stable eventId.',
+    '- Treat each event as one logical unit that aggregates one or more memory rows.',
     '- Link events, never individual memory rows. Use a precedes edge only for a direct narrative prerequisite or progression, not mere temporal adjacency.',
     '- If an existing event is continued, reuse its exact eventId. Do not invent a second id for the same event.',
     '- Do not create an edge to an event that is not represented by at least one row in the resulting patch/document.',
@@ -302,14 +303,14 @@ function promptForJob(job, document, touches = {}) {
       'Candidate rows were selected only by normalized keyword substring hits in the latest real user message(s) plus final assistant body.',
     ]),
     'Rows sharing a selected eventId are supplied together. Only direct edges are supplied; adjacent events appear only as brief summaries.',
-    memory.complete ? 'The candidate-group selection is complete.' : `The ranked candidate-group limit omitted ${memory.omittedCandidateGroups} lower-ranked groups.`,
+    event.complete ? 'The candidate-group selection is complete.' : `The ranked candidate-group limit omitted ${event.omittedCandidateGroups} lower-ranked groups.`,
   ].join('\n')
   const narrative = JSON.stringify({ conversationRounds: job.rounds.map(round => ({ turn: round.turn, messages: round.messages })) })
-  const snapshotText = JSON.stringify(memory)
-  return { text: `${instructions}\n\nComplete conversation rounds for this task:\n${narrative}\n\nRelevant memory candidates:\n${snapshotText}`, memory }
+  const snapshotText = JSON.stringify(event)
+  return { text: `${instructions}\n\nComplete conversation rounds for this task:\n${narrative}\n\nRelevant event candidates:\n${snapshotText}`, event }
 }
 
-export function buildMemoryMaintenancePrompt(job, document) {
+export function buildEventMaintenancePrompt(job, document) {
   return promptForJob(job, document).text
 }
 
@@ -354,7 +355,7 @@ function normalizeState(raw, sessionId) {
 async function readState(path, sessionId) {
   try {
     const content = await readFile(path)
-    if (content.length > MAX_STATE_BYTES) throw new Error('memory maintenance state exceeds its size limit')
+    if (content.length > MAX_STATE_BYTES) throw new Error('event maintenance state exceeds its size limit')
     return normalizeState(JSON.parse(content.toString('utf8')), sessionId)
   } catch (error) {
     if (error?.code === 'ENOENT') return emptyState(sessionId)
@@ -366,7 +367,7 @@ async function writeState(path, state) {
   await mkdir(resolve(path, '..'), { recursive: true })
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
   const text = `${JSON.stringify(state, null, 2)}\n`
-  if (Buffer.byteLength(text, 'utf8') > MAX_STATE_BYTES) throw new Error('memory maintenance state exceeds its size limit')
+  if (Buffer.byteLength(text, 'utf8') > MAX_STATE_BYTES) throw new Error('event maintenance state exceeds its size limit')
   await writeFile(temporary, text, 'utf8')
   try { await rename(temporary, path) } catch (error) {
     await rm(temporary, { force: true })
@@ -393,12 +394,12 @@ function conversationContextBytes(rounds) {
 }
 
 export function splitPeriodicConversationRounds(rounds, limit = MAX_PERIODIC_CONTEXT_BYTES) {
-  if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('periodic memory context byte limit must be a positive integer')
+  if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('periodic event context byte limit must be a positive integer')
   const chunks = []
   let current = []
   for (const round of rounds) {
     if (conversationContextBytes([round]) > limit) {
-      throw new Error(`complete conversation turn ${round.turn} exceeds the ${limit}-byte periodic memory context limit and cannot be split without truncation`)
+      throw new Error(`complete conversation turn ${round.turn} exceeds the ${limit}-byte periodic event context limit and cannot be split without truncation`)
     }
     if (current.length > 0 && conversationContextBytes([...current, round]) > limit) {
       chunks.push(current)
@@ -453,8 +454,8 @@ function createPeriodicJobs(rounds, boundary, target, trigger, overlap, contextL
 }
 
 function operationsForCommit(rawOperations, document, sourceRefs) {
-  if (!Array.isArray(rawOperations)) throw new Error('memory maintenance result has no operations array')
-  if (rawOperations.length > MAX_PATCH_OPERATIONS) throw new Error(`memory maintenance result exceeds ${MAX_PATCH_OPERATIONS} operations`)
+  if (!Array.isArray(rawOperations)) throw new Error('event maintenance result has no operations array')
+  if (rawOperations.length > MAX_PATCH_OPERATIONS) throw new Error(`event maintenance result exceeds ${MAX_PATCH_OPERATIONS} operations`)
   const rowIds = new Set(document.rows.map(row => row.id))
   const edgeIds = new Set(document.eventEdges.map(edge => edge.id))
   const rowsById = new Map(document.rows.map(row => [row.id, row]))
@@ -514,7 +515,7 @@ function touchesFromAppliedJob(document, job) {
   }
 }
 
-export class MemoryMaintenanceManager {
+export class EventMaintenanceManager {
   constructor(options) {
     this.store = options.store
     this.subagents = options.subagents
@@ -543,7 +544,7 @@ export class MemoryMaintenanceManager {
   statePath(agent) {
     const id = String(agent.id)
     const name = createHash('sha256').update(id).digest('hex')
-    return join(this.store.rootForWorkspace(this.store.workspaceOf(agent)), 'memory-maintenance', `${name}.json`)
+    return join(this.store.rootForWorkspace(this.store.workspaceOf(agent)), 'event-maintenance', `${name}.json`)
   }
 
   async serialState(agent, operation) {
@@ -611,7 +612,7 @@ export class MemoryMaintenanceManager {
         }
       }
       if (conversationContextBytes(job.rounds) > this.periodicContextBytes) {
-        throw new Error(`complete conversation turn ${job.turn} exceeds the ${this.periodicContextBytes}-byte memory context limit and cannot be maintained without truncation`)
+        throw new Error(`complete conversation turn ${job.turn} exceeds the ${this.periodicContextBytes}-byte event context limit and cannot be maintained without truncation`)
       }
       state.pending.push(clone(job))
       await this.save(agent, state)
@@ -680,7 +681,7 @@ export class MemoryMaintenanceManager {
       return
     }
     const worker = this.process(agent).catch(error => {
-      console.error('[dsh-sillytavern] memory maintenance queue failed', error)
+      console.error('[dsh-sillytavern] event maintenance queue failed', error)
     }).finally(() => {
       if (this.workers.get(key) === worker) this.workers.delete(key)
     })
@@ -698,7 +699,7 @@ export class MemoryMaintenanceManager {
       waiter.aborted = () => {
         const index = this.capacityWaiters.indexOf(waiter)
         if (index !== -1) this.capacityWaiters.splice(index, 1)
-        reject(signal.reason ?? new Error('memory maintenance aborted'))
+        reject(signal.reason ?? new Error('event maintenance aborted'))
       }
       signal.addEventListener('abort', waiter.aborted, { once: true })
       this.capacityWaiters.push(waiter)
@@ -725,7 +726,7 @@ export class MemoryMaintenanceManager {
     try {
       await this.acquireCapacity(controller.signal)
       acquired = true
-      const document = await this.store.memorySnapshot(agent, controller.signal)
+      const document = await this.store.eventSnapshot(agent, controller.signal)
       if (document.appliedMaintenanceJobs.includes(job.id)) return touchesFromAppliedJob(document, job)
       const touches = job.kind === 'periodic'
         ? await this.serialState(agent, async () => {
@@ -736,35 +737,35 @@ export class MemoryMaintenanceManager {
       const built = promptForJob(job, document, touches)
       run = await this.subagents.start(this.provider, {
         label: job.kind === 'periodic'
-          ? `Periodic memory consolidation ${job.chunkIndex + 1}/${job.chunkCount}, through turn ${job.periodEndTurn}`
-          : `Incremental memory maintenance turn ${job.turn}`,
+          ? `Periodic event consolidation ${job.chunkIndex + 1}/${job.chunkCount}, through turn ${job.periodEndTurn}`
+          : `Incremental event maintenance turn ${job.turn}`,
         prompt: [{ type: 'text', text: built.text }],
         parent: agent,
         signal: controller.signal,
         agentOptions: { ...this.agentOptions, maxTokens: this.maxTokens },
-        outputSchema: MEMORY_PATCH_SCHEMA,
+        outputSchema: EVENT_PATCH_SCHEMA,
         maxDepth: 1,
         toolFilter: { allow: [] },
-        persona: 'You are a dedicated narrative-memory curator. Do not roleplay or continue the story. Reconcile durable facts and event relationships, then submit exactly one structured memory patch.',
+        persona: 'You are a dedicated narrative-event curator. Do not roleplay or continue the story. Treat each event as one logical unit that aggregates one or more memory rows. Reconcile durable facts and event relationships, then submit exactly one structured event patch.',
       })
       const result = await run.result
       if (result.stopReason !== 'completed' || result.structured === undefined) {
-        throw new Error(`memory maintenance subagent stopped with ${result.stopReason}${result.diagnostic ? `: ${result.diagnostic}` : ''}`)
+        throw new Error(`event maintenance subagent stopped with ${result.stopReason}${result.diagnostic ? `: ${result.diagnostic}` : ''}`)
       }
-      const latest = await this.store.memorySnapshot(agent, controller.signal)
+      const latest = await this.store.eventSnapshot(agent, controller.signal)
       if (latest.revision !== document.revision) {
-        const error = new Error(`memory revision changed from ${document.revision} to ${latest.revision} while maintenance was running`)
-        error.code = 'memory-revision-conflict'
+        const error = new Error(`event revision changed from ${document.revision} to ${latest.revision} while maintenance was running`)
+        error.code = 'event-revision-conflict'
         throw error
       }
       const operations = operationsForCommit(result.structured.operations, latest, job.sourceRefs)
-      const committed = await this.store.memory(agent, {
+      const committed = await this.store.event(agent, {
         action: 'batch',
         operations,
         expectedRevision: latest.revision,
         maintenanceJobId: job.id,
       }, controller.signal)
-      return touchesFromCommit(built.memory, committed.result)
+      return touchesFromCommit(built.event, committed.result)
     } finally {
       try { if (run !== undefined) await run.dispose() } finally {
         this.controllers.delete(key)
@@ -862,10 +863,10 @@ export class MemoryMaintenanceManager {
 
   async dispose() {
     this.active = false
-    for (const controller of this.controllers.values()) controller.abort(new Error('memory maintenance manager disposed'))
+    for (const controller of this.controllers.values()) controller.abort(new Error('event maintenance manager disposed'))
     for (const waiter of this.capacityWaiters.splice(0)) {
       waiter.signal.removeEventListener('abort', waiter.aborted)
-      waiter.reject(new Error('memory maintenance manager disposed'))
+      waiter.reject(new Error('event maintenance manager disposed'))
     }
     await Promise.allSettled([...this.workers.values()])
   }

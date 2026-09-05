@@ -34,7 +34,7 @@ function state(scoped, extras = {}) {
   return {
     record: { card: { data: { name: 'Alice', description: 'Archivist' } }, scripts: scoped },
     binding: { userPersona: { name: 'A+B', description: '' }, variables: { trim: '<cut>' } },
-    memory: { rows: [] },
+    event: { rows: [] },
     templates: [],
     globalRegexScripts: extras.global ?? [],
     presetRegexScripts: extras.preset ?? [],

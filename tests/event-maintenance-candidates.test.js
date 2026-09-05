@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   normalizeMaintenanceMatchText,
-  selectMaintenanceMemory,
+  selectMaintenanceEvents,
   splitPeriodicConversationRounds,
-} from '../src/memory-maintenance.js'
+} from '../src/event-maintenance.js'
 
 const PERIODIC_CONTEXT_BYTES = 160 * 1024
 
@@ -60,7 +60,7 @@ test('selects only strict keyword substring hits and ranks hit count, keyword le
     row('tie-low', 'event-tie-low', ['tie'], 0.2),
     row('irrelevant-important', 'event-unrelated', ['never-seen'], 1),
   ]
-  const selected = selectMaintenanceMemory(
+  const selected = selectMaintenanceEvents(
     document(rows),
     'alpha beta very-long-token short tie',
   )
@@ -100,7 +100,7 @@ test('completes selected event rows, keeps only direct edges, and summarizes adj
       reason: 'not direct to selected event',
     },
   ]
-  const selected = selectMaintenanceMemory(document(rows, eventEdges), 'archive')
+  const selected = selectMaintenanceEvents(document(rows, eventEdges), 'archive')
 
   assert.deepEqual(selected.rows.map(item => item.id), ['selected-hit', 'selected-sibling'])
   assert.deepEqual(selected.rows[1].matchedKeywords, [])
@@ -128,6 +128,6 @@ test('throws explicitly when one complete periodic round exceeds the context lim
 
   assert.throws(
     () => splitPeriodicConversationRounds(oversized),
-    /complete conversation turn 99 exceeds the 163840-byte periodic memory context limit and cannot be split without truncation/,
+    /complete conversation turn 99 exceeds the 163840-byte periodic event context limit and cannot be split without truncation/,
   )
 })

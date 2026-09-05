@@ -171,7 +171,7 @@ const CAPABILITIES = {
   'dsh.getState': capability('dsh.getState', 'function', 'exact', 'sync', 'TavernHelper.dsh.getState(): DshSessionView', { origin: 'dsh' }),
   'dsh.getCharacterCard': capability('dsh.getCharacterCard', 'function', 'exact', 'sync', 'TavernHelper.dsh.getCharacterCard(): CharacterCard|null', { origin: 'dsh' }),
   'dsh.getCurrentWorldbook': capability('dsh.getCurrentWorldbook', 'function', 'exact', 'sync', 'TavernHelper.dsh.getCurrentWorldbook(): object|null', { origin: 'dsh' }),
-  'dsh.memory': capability('dsh.memory', 'function', 'exact', 'async', 'TavernHelper.dsh.memory(operation): Promise<object>', { origin: 'dsh' }),
+  'dsh.event': capability('dsh.event', 'function', 'exact', 'async', 'TavernHelper.dsh.event(operation): Promise<object>', { origin: 'dsh' }),
   'dsh.flushWrites': capability('dsh.flushWrites', 'function', 'exact', 'async', 'TavernHelper.dsh.flushWrites(): Promise<void>', { origin: 'dsh' }),
   'dsh.setVariables': capability('dsh.setVariables', 'function', 'degraded', 'async', 'TavernHelper.setVariables(variables): Promise<void>', { origin: 'dsh', reason: 'Deprecated DSH alias retained for scripts written against pre-phase-1 builds.' }),
 }
@@ -247,7 +247,7 @@ export function buildCompatibilitySnapshot({ sessionId, view, fallback, messages
     binding: fallback.binding,
     card: fallback.record,
     worldbook: fallback.worldbook,
-    memory: fallback.memory,
+    event: fallback.event,
     templates: fallback.templates,
     globalRegexScripts: fallback.globalRegexScripts,
     presetRegexScripts: fallback.presetRegexScripts,

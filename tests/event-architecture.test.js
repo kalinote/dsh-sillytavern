@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import test from 'node:test'
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
-import { createMemoryMaintenanceJob, MEMORY_PATCH_SCHEMA, MemoryMaintenanceManager } from '../src/memory-maintenance.js'
+import { createEventMaintenanceJob, EVENT_PATCH_SCHEMA, EventMaintenanceManager } from '../src/event-maintenance.js'
 import { assembleSillyTavernPrompt, compactedEventSeqs, selectAutoRecallRows } from '../src/prompt.js'
 import { SillyTavernStore } from '../src/store.js'
 import { minimalCard } from './helpers.js'
@@ -74,8 +75,8 @@ function appendConversationRound(live, turn, userText = `user ${turn}`, assistan
 }
 
 test('maintenance structured output schema is accepted by the DSH runtime subset', () => {
-  assert.doesNotThrow(() => assertObjectJsonSchema(MEMORY_PATCH_SCHEMA))
-  const schemaText = JSON.stringify(MEMORY_PATCH_SCHEMA)
+  assert.doesNotThrow(() => assertObjectJsonSchema(EVENT_PATCH_SCHEMA))
+  const schemaText = JSON.stringify(EVENT_PATCH_SCHEMA)
   assert.match(schemaText, /keywords/)
   assert.doesNotMatch(schemaText, /"tags"/)
 })
@@ -116,7 +117,7 @@ test('automatic recall promotes important rows, gates ordinary rows on source co
     { eventId: 'event-private', key: 'query only secret', importance: 1, recallPolicy: 'query_only', sourceRefs: [] },
   ]
   for (const row of rows) {
-    await store.memory(live, {
+    await store.event(live, {
       action: 'upsert',
       table: 'events',
       value: { note: row.key },
@@ -125,21 +126,21 @@ test('automatic recall promotes important rows, gates ordinary rows on source co
       ...row,
     })
   }
-  await store.memory(live, {
+  await store.event(live, {
     action: 'event_edge_upsert',
     predecessorEventId: 'event-old',
     successorEventId: 'event-high',
     reason: 'The archived clue enabled the return.',
     sourceRefs: [{ eventSeq: 11, turn: 1, role: 'assistant' }],
   })
-  await store.memory(live, {
+  await store.event(live, {
     action: 'event_edge_upsert',
     predecessorEventId: 'event-old',
     successorEventId: 'event-related',
     reason: 'The archive mechanism reveals this otherwise unrelated consequence.',
     sourceRefs: [{ eventSeq: 11, turn: 1, role: 'assistant' }],
   })
-  await store.memory(live, {
+  await store.event(live, {
     action: 'event_edge_upsert',
     predecessorEventId: 'event-high',
     successorEventId: 'event-next',
@@ -150,18 +151,18 @@ test('automatic recall promotes important rows, gates ordinary rows on source co
 
   const compacted = compactedEventSeqs(live)
   assert.deepEqual([...compacted], [10, 11])
-  const selected = selectAutoRecallRows(store.sessionView(live).memory, [{ role: 'user', text: 'archive', seq: 0 }], compacted)
+  const selected = selectAutoRecallRows(store.sessionView(live).event, [{ role: 'user', text: 'archive', seq: 0 }], compacted)
   assert.deepEqual(selected.map(row => row.key), ['high canon', 'future high canon', 'sealed consequence', 'compacted ordinary'])
 
   const prompt = await assembleSillyTavernPrompt(live, store.promptState(live), undefined, {
     compactedSeqs: compacted,
-    pendingMemoryFallback: [{
+    pendingEventFallback: [{
       id: 'pending-turn',
       turn: 1,
       turnMessages: [{ role: 'assistant', text: 'Raw compacted scene fallback.', seq: 11 }],
     }],
   })
-  assert.match(prompt.system, /Automatically recalled long-term memory/)
+  assert.match(prompt.system, /Automatically recalled events/)
   assert.match(prompt.system, /high canon/)
   assert.match(prompt.system, /compacted ordinary/)
   assert.match(prompt.system, /sealed consequence/)
@@ -188,7 +189,7 @@ test('incremental maintenance captures only real user messages and the completed
     event('turn/end', 8, { turn: 2, reason: { kind: 'completed' } }),
   ]
   const live = agent('G:\\fiction', 'session-job-capture', events)
-  const job = createMemoryMaintenanceJob(live, events.at(-1))
+  const job = createEventMaintenanceJob(live, events.at(-1))
   assert.equal(job.id, 'incremental-turn-2-assistant-7')
   assert.equal(job.kind, 'incremental')
   assert.deepEqual(job.sourceRefs, [
@@ -201,7 +202,7 @@ test('incremental maintenance captures only real user messages and the completed
   assert.equal(JSON.stringify(job).includes('Earlier same-turn user text'), false)
   assert.equal(JSON.stringify(job).includes('Injected runtime context'), false)
   assert.equal(JSON.stringify(job).includes('Intermediate assistant text'), false)
-  assert.equal(createMemoryMaintenanceJob(live, { ...events.at(-1), data: { turn: 2, reason: { kind: 'aborted' } } }), null)
+  assert.equal(createEventMaintenanceJob(live, { ...events.at(-1), data: { turn: 2, reason: { kind: 'aborted' } } }), null)
 })
 
 test('background manager is non-blocking, processes each session FIFO, and commits host-owned provenance at the latest revision', async t => {
@@ -215,8 +216,8 @@ test('background manager is non-blocking, processes each session FIFO, and commi
   const starts = []
   const releases = []
   const commits = []
-  const originalMemory = store.memory.bind(store)
-  store.memory = async (...args) => {
+  const originalMemory = store.event.bind(store)
+  store.event = async (...args) => {
     commits.push(structuredClone(args[1]))
     return originalMemory(...args)
   }
@@ -229,7 +230,7 @@ test('background manager is non-blocking, processes each session FIFO, and commi
       return { result, async dispose() {} }
     },
   }
-  const manager = new MemoryMaintenanceManager({ store, subagents, maxConcurrency: 2 })
+  const manager = new EventMaintenanceManager({ store, subagents, maxConcurrency: 2 })
   t.after(() => manager.dispose())
   const first = maintenanceJob('job-1', 1, 10)
   const second = maintenanceJob('job-2', 2, 20)
@@ -241,7 +242,10 @@ test('background manager is non-blocking, processes each session FIFO, and commi
   assert.equal(starts.length, 1, 'enqueue returns without awaiting background generation')
   assert.equal(starts[0].provider, 'spawn')
   assert.equal(starts[0].options.parent, live)
-  assert.equal(starts[0].options.outputSchema, MEMORY_PATCH_SCHEMA)
+  assert.equal(starts[0].options.outputSchema, EVENT_PATCH_SCHEMA)
+  assert.match(starts[0].options.label, /Incremental event maintenance/)
+  assert.match(starts[0].options.persona, /each event as one logical unit that aggregates one or more memory rows/)
+  assert.equal(manager.statePath(live), join(workspace, '.dsh', 'sillytavern', 'event-maintenance', `${createHash('sha256').update(live.id).digest('hex')}.json`))
   assert.deepEqual(starts[0].options.toolFilter, { allow: [] })
   assert.equal(starts[0].options.maxDepth, 1)
   await manager.resume(live)
@@ -264,7 +268,7 @@ test('background manager is non-blocking, processes each session FIFO, and commi
   releases[1]({ stopReason: 'completed', structured: { operations: [] } })
   await waitFor(() => manager.workers.size === 0, 'FIFO worker did not settle')
 
-  const memory = await store.memorySnapshot(live)
+  const memory = await store.eventSnapshot(live)
   assert.equal(memory.rows.length, 1)
   assert.deepEqual(memory.rows[0].sourceRefs, first.sourceRefs)
   assert.equal(commits[0].expectedRevision, 0)
@@ -276,7 +280,7 @@ test('background manager is non-blocking, processes each session FIFO, and commi
 
   await manager.execute(live, first)
   assert.equal(starts.length, 2, 'an applied job marker skips duplicate subagent execution after a crash-window replay')
-  assert.equal((await store.memorySnapshot(live)).revision, memory.revision)
+  assert.equal((await store.eventSnapshot(live)).revision, memory.revision)
 })
 
 test('background manager rejects oversized structured patches before committing them', async t => {
@@ -287,7 +291,7 @@ test('background manager rejects oversized structured patches before committing 
   const store = new SillyTavernStore({ fallbackWorkspace: workspace })
   await store.ready
   await store.ensureSession(live)
-  const manager = new MemoryMaintenanceManager({
+  const manager = new EventMaintenanceManager({
     store,
     maxAttempts: 1,
     subagents: {
@@ -311,7 +315,7 @@ test('background manager rejects oversized structured patches before committing 
   assert.equal(state.completed.length, 0)
   assert.equal(state.failed.length, 1)
   assert.match(state.failed[0].lastError, /exceeds 100 operations/)
-  assert.equal((await store.memorySnapshot(live)).revision, 0)
+  assert.equal((await store.eventSnapshot(live)).revision, 0)
 })
 
 test('background manager retries transient failures and restores an interrupted persisted job after restart', async t => {
@@ -324,7 +328,7 @@ test('background manager retries transient failures and restores an interrupted 
   await store.ensureSession(live)
 
   let retryStarts = 0
-  const retryManager = new MemoryMaintenanceManager({
+  const retryManager = new EventMaintenanceManager({
     store,
     maxAttempts: 3,
     subagents: {
@@ -332,7 +336,7 @@ test('background manager retries transient failures and restores an interrupted 
         retryStarts += 1
         if (retryStarts === 1) throw new Error('temporary model failure')
         if (retryStarts === 2) {
-          await store.memory(live, {
+          await store.event(live, {
             action: 'upsert',
             table: 'manual',
             key: 'concurrent edit',
@@ -354,7 +358,7 @@ test('background manager retries transient failures and restores an interrupted 
   await retryManager.dispose()
 
   let interruptedStarts = 0
-  const interruptedManager = new MemoryMaintenanceManager({
+  const interruptedManager = new EventMaintenanceManager({
     store,
     subagents: {
       async start(_provider, options) {
@@ -384,7 +388,7 @@ test('background manager retries transient failures and restores an interrupted 
   assert.equal(interruptedState.failed.length, 0)
 
   let resumedStarts = 0
-  const resumedManager = new MemoryMaintenanceManager({
+  const resumedManager = new EventMaintenanceManager({
     store,
     subagents: {
       async start() {
@@ -410,7 +414,7 @@ test('automatic scheduling consolidates every ten complete rounds with one-round
   await store.ready
   await store.ensureSession(live)
   const starts = []
-  const manager = new MemoryMaintenanceManager({
+  const manager = new EventMaintenanceManager({
     store,
     subagents: {
       async start(_provider, options) {
@@ -423,15 +427,15 @@ test('automatic scheduling consolidates every ten complete rounds with one-round
 
   for (let turn = 1; turn <= 9; turn += 1) {
     const ended = appendConversationRound(live, turn)
-    assert.equal((await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, ended))).kind, 'incremental')
+    assert.equal((await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, ended))).kind, 'incremental')
   }
   await waitFor(() => manager.workers.size === 0 && starts.length === 9, 'first nine incremental jobs did not settle')
 
   const tenth = appendConversationRound(live, 10)
-  const firstPeriodic = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, tenth))
+  const firstPeriodic = await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, tenth))
   assert.deepEqual(firstPeriodic, { queued: true, kind: 'periodic', startTurn: 1, endTurn: 10, chunks: 1 })
   await waitFor(() => manager.workers.size === 0 && starts.length === 10, 'first periodic job did not settle')
-  assert.match(starts.at(-1).label, /Periodic memory consolidation/)
+  assert.match(starts.at(-1).label, /Periodic event consolidation/)
   assert.match(starts.at(-1).prompt[0].text, /"turn":1/)
   assert.match(starts.at(-1).prompt[0].text, /"turn":10/)
   let state = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
@@ -439,11 +443,11 @@ test('automatic scheduling consolidates every ten complete rounds with one-round
 
   for (let turn = 11; turn <= 19; turn += 1) {
     const ended = appendConversationRound(live, turn)
-    assert.equal((await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, ended))).kind, 'incremental')
+    assert.equal((await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, ended))).kind, 'incremental')
   }
   await waitFor(() => manager.workers.size === 0 && starts.length === 19, 'second period incremental jobs did not settle')
   const twentieth = appendConversationRound(live, 20)
-  const secondPeriodic = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, twentieth))
+  const secondPeriodic = await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, twentieth))
   assert.deepEqual(secondPeriodic, { queued: true, kind: 'periodic', startTurn: 10, endTurn: 20, chunks: 1 })
   await waitFor(() => manager.workers.size === 0 && starts.length === 20, 'second periodic job did not settle')
   const secondPrompt = starts.at(-1).prompt[0].text
@@ -463,7 +467,7 @@ test('a failed periodic consolidation does not advance its boundary and the next
   await store.ready
   await store.ensureSession(live)
   const starts = []
-  const manager = new MemoryMaintenanceManager({
+  const manager = new EventMaintenanceManager({
     store,
     periodicInterval: 2,
     maxAttempts: 1,
@@ -482,17 +486,17 @@ test('a failed periodic consolidation does not advance its boundary and the next
   t.after(() => manager.dispose())
 
   const first = appendConversationRound(live, 1)
-  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, first))
+  await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, first))
   await waitFor(() => manager.workers.size === 0 && starts.length === 1, 'incremental setup did not settle')
   const second = appendConversationRound(live, 2)
-  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, second))
+  await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, second))
   await waitFor(() => manager.workers.size === 0 && starts.length === 2, 'failed periodic job did not settle')
   let state = JSON.parse(await readFile(manager.statePath(live), 'utf8'))
   assert.equal(state.lastPeriodicBoundary, null)
   assert.equal(state.failed.at(-1).kind, 'periodic')
 
   const third = appendConversationRound(live, 3)
-  const retriedRange = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, third))
+  const retriedRange = await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, third))
   assert.deepEqual(retriedRange, { queued: true, kind: 'periodic', startTurn: 1, endTurn: 3, chunks: 1 })
   await waitFor(() => manager.workers.size === 0 && starts.length === 3, 'replacement periodic job did not settle')
   assert.match(starts.at(-1).prompt[0].text, /"turn":1/)
@@ -511,7 +515,7 @@ test('manual periodic consolidation queues behind an in-flight incremental job w
   await store.ensureSession(live)
   const starts = []
   let releaseIncremental
-  const manager = new MemoryMaintenanceManager({
+  const manager = new EventMaintenanceManager({
     store,
     periodicInterval: 100,
     subagents: {
@@ -530,7 +534,7 @@ test('manual periodic consolidation queues behind an in-flight incremental job w
   t.after(() => manager.dispose())
 
   const ended = appendConversationRound(live, 1)
-  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, ended))
+  await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, ended))
   await waitFor(() => starts.length === 1 && releaseIncremental !== undefined, 'incremental job did not start')
   const incrementalSignal = starts[0].signal
   const manual = await manager.enqueuePeriodic(live)
@@ -539,7 +543,7 @@ test('manual periodic consolidation queues behind an in-flight incremental job w
   assert.equal(starts.length, 1, 'manual consolidation must remain queued behind the incremental job')
   releaseIncremental({ stopReason: 'completed', structured: { operations: [] } })
   await waitFor(() => manager.workers.size === 0 && starts.length === 2, 'manual periodic job did not follow the incremental job')
-  assert.match(starts[1].label, /Periodic memory consolidation/)
+  assert.match(starts[1].label, /Periodic event consolidation/)
 })
 
 test('a multi-chunk periodic range advances the boundary only after its final whole-round task succeeds', async t => {
@@ -552,7 +556,7 @@ test('a multi-chunk periodic range advances the boundary only after its final wh
   await store.ensureSession(live)
   const starts = []
   let releaseFinalChunk
-  const manager = new MemoryMaintenanceManager({
+  const manager = new EventMaintenanceManager({
     store,
     periodicInterval: 2,
     periodicContextBytes: 1024,
@@ -569,10 +573,10 @@ test('a multi-chunk periodic range advances the boundary only after its final wh
   t.after(() => manager.dispose())
 
   const first = appendConversationRound(live, 1, 'u1', `first ${'a'.repeat(600)}`)
-  await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, first))
+  await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, first))
   await waitFor(() => manager.workers.size === 0 && starts.length === 1, 'incremental setup did not settle')
   const second = appendConversationRound(live, 2, 'u2', `second ${'b'.repeat(600)}`)
-  const scheduled = await manager.enqueueCompletedTurn(live, createMemoryMaintenanceJob(live, second))
+  const scheduled = await manager.enqueueCompletedTurn(live, createEventMaintenanceJob(live, second))
   assert.equal(scheduled.kind, 'periodic')
   assert.equal(scheduled.chunks, 2)
   await waitFor(() => starts.length === 3 && releaseFinalChunk !== undefined, 'final periodic chunk did not start')
@@ -611,7 +615,7 @@ test('background maintenance enforces one global concurrency budget across sessi
       return { result, async dispose() {} }
     },
   }
-  const manager = new MemoryMaintenanceManager({ store, subagents, maxConcurrency: 1 })
+  const manager = new EventMaintenanceManager({ store, subagents, maxConcurrency: 1 })
   t.after(() => manager.dispose())
   await Promise.all([
     manager.enqueue(firstAgent, maintenanceJob('concurrency-a', 1, 10)),
@@ -628,7 +632,7 @@ test('background maintenance enforces one global concurrency budget across sessi
 })
 
 test('global capacity hands released slots directly to queued workers', async t => {
-  const manager = new MemoryMaintenanceManager({ store: {}, subagents: {}, maxConcurrency: 2 })
+  const manager = new EventMaintenanceManager({ store: {}, subagents: {}, maxConcurrency: 2 })
   t.after(() => manager.dispose())
   const signal = new AbortController().signal
   await manager.acquireCapacity(signal)

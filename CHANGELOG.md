@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修复多个 Store 并发绑定同一会话时，冲突方仍保留旧角色绑定缓存的问题；绑定冲突返回前同步磁盘中的最新状态，保持角色选择、替换校验与会话开始状态一致。
+- 明确将原“记忆表格”模块定义为“事件”：页面、存储目录与文件名、维护子 Agent、查询工具和整理命令统一使用 `event` 命名；一个事件仍通过 `eventId` 聚合多条 memory rows，`rows + eventEdges` 结构与行为保持不变。开发阶段不迁移旧数据，旧的 `memory/` 与 `memory-maintenance/` 数据文件需在重启前删除。
 - 输入框角色卡选择器在名称超长或工具栏空间不足时收起为单个图标，保留完整名称提示和菜单；宽度恢复后自动显示可容纳的短名称。
 - 新增 TavernHelper 4.9.3 / SillyTavern 1.18.0 固定基线的机器可读能力清单与 `/compatibility`、`/compat/runtime` 接口；未实现能力以 `degraded`/`unavailable` 和原因显式登记。
 - 新增 Session 级 iframe 兼容运行时：角色代码执行前即安装同步状态快照、`TavernHelper`、`SillyTavern.getContext()`、变量 API、注入 disposer、完整监听器管理 facade 和同 Session 自定义事件总线；后续状态使用单调 revision 推送。
