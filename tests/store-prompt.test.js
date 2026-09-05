@@ -9,7 +9,7 @@ import { SillyTavernStore } from '../src/store.js'
 import { minimalCard } from './helpers.js'
 
 const unknownMemoryContext = {
-  storyTime: { state: 'unknown', label: null, timeline: null, start: null, end: null },
+  storyTime: { state: 'normalized', label: null, timeline: 'story', start: 1, end: null },
   location: null,
   characters: [],
   keywords: ['Alice', 'smiles'],

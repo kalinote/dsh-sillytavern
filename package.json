@@ -28,8 +28,10 @@
     }
   },
   "scripts": {
+    "build:events": "node scripts/build-event-explorer.mjs",
+    "check:events-bundle": "node scripts/build-event-explorer.mjs --check",
     "test": "node --test --test-isolation=none tests/*.test.js",
-    "check": "node --check host.js && node --check agent.js && node --check client.cjs && node --test --test-isolation=none tests/*.test.js",
+    "check": "node scripts/build-event-explorer.mjs --check && node --check host.js && node --check agent.js && node --check client.cjs && node --test --test-isolation=none tests/*.test.js",
     "pack:dry": "pnpm pack --pack-destination .artifacts"
   },
   "files": [
@@ -37,6 +39,7 @@
     "agent.js",
     "client.cjs",
     "src",
+    "scripts/build-event-explorer.mjs",
     "preset/*.yml",
     "docs/*.md",
     "cordis.patch.yml",

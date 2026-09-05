@@ -234,7 +234,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
       },
     })
     assert.equal(decoration.name, 'st-import')
-    assert.deepEqual(slots, ['conversation.input.left', 'conversation.input.dock', 'shell.overlay', 'settings.section', 'conversation.chat.commandview', 'conversation.chat.commandview'])
+    assert.deepEqual(slots, ['conversation.input.left', 'conversation.input.dock', 'shell.overlay', 'settings.section', 'conversation.chat.commandview', 'conversation.chat.commandview', 'conversation.view'])
     assert.deepEqual(slotOptions.map(option => [option.name, option.id, option.order, option.priority]), [
       ['conversation.input.left', 'sillytavern-character', 25, undefined],
       ['conversation.input.dock', 'sillytavern-opening-greeting', -10, undefined],
@@ -242,6 +242,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
       ['settings.section', 'sillytavern', 18, undefined],
       ['conversation.chat.commandview', undefined, undefined, undefined],
       ['conversation.chat.commandview', undefined, undefined, undefined],
+      ['conversation.view', 'sillytavern-events', 20, undefined],
     ])
     assert.equal(slotOptions[4].key, 'st-opening')
     assert.equal(slotOptions[5].key, 'narrator')
@@ -254,6 +255,14 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
       false,
     ]
     const sessionState = { byId: { 'session-a': { projectionValues: { agentPreset: 'sillytavern' } } } }
+    assert.equal(slotOptions[6].label, '事件')
+    const eventView = slotComponents[6]({ sessionId: 'session-a', useSessions: selector => selector(sessionState) })
+    assert.equal(eventView.type.name, 'TavernEventsSession')
+    const eventState = { document: { revision: 0, rows: [], eventEdges: [] }, loading: false, refreshing: false, error: null }
+    const eventsElement = eventView.type({ ...eventView.props, useEventExplorer: selector => selector(eventState), refreshEvents() {} })
+    assert.equal(eventsElement.props.document, eventState.document)
+    const notTavern = slotComponents[6]({ sessionId: 'other', useSessions: selector => selector({ byId: { other: { agentPreset: 'standard' } } }) })
+    assert.match(notTavern.children.join(''), /酒馆模式会话/)
     const inputState = { draft: '已有草稿', phase: 'plain' }
     const useInput = selector => selector(inputState)
     let nextDraft
@@ -710,11 +719,12 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.match(eventTabSource, /重要度/)
     assert.match(eventTabSource, /row\.keywords\.map/)
     assert.doesNotMatch(eventTabSource, /row\.tags/)
-    assert.match(eventTabSource, /storyTimeStatus/)
-    assert.match(eventTabSource, /value: 'label-only'/)
-    assert.match(eventTabSource, /value: 'normalized'/)
-    assert.match(eventTabSource, /state: 'unknown'/)
-    assert.match(eventTabSource, /state: 'label-only'/)
+    assert.doesNotMatch(eventTabSource, /storyTimeStatus/)
+    assert.doesNotMatch(eventTabSource, /value: 'label-only'/)
+    assert.doesNotMatch(eventTabSource, /state: 'unknown'/)
+    assert.doesNotMatch(eventTabSource, /state: 'label-only'/)
+    assert.match(eventTabSource, /剧情开始时间必填/)
+    assert.match(eventTabSource, /storyTimeEnd\.trim\(\) === '' \? null/)
     assert.match(eventTabSource, /state: 'normalized'/)
     assert.match(eventTabSource, /storyTime: storyTime/)
     assert.match(eventTabSource, /function memoryLocation/)
@@ -783,6 +793,6 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(slotComponents[2](), null, 'plugin disposal must reset module-scoped overlay state')
     assert.equal(removed, true)
     assert.equal(commandDisposed, 1)
-    assert.equal(slotsDisposed, 11)
+    assert.equal(slotsDisposed, 12)
   } finally { globalThis.window = previous; globalThis.document = previousDocument; globalThis.fetch = previousFetch }
 })

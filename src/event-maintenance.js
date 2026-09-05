@@ -14,17 +14,19 @@ const MAX_FAILED_JOBS = 64
 const MAX_PATCH_OPERATIONS = 100
 
 const nullableString = { oneOf: [{ type: 'string' }, { type: 'null' }] }
+// The DSH structured-output schema subset has no minLength keyword; the event
+// write path enforces that timeline remains non-empty after trimming.
 const storyTimeSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    state: { type: 'string', enum: ['normalized', 'label-only', 'unknown'] },
+    state: { type: 'string', const: 'normalized' },
     label: nullableString,
-    timeline: nullableString,
-    start: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+    timeline: { type: 'string', description: 'A non-empty narrative timeline identifier.' },
+    start: { type: 'number', description: 'A finite narrative coordinate grounded in the story, never real-world time.' },
     end: { oneOf: [{ type: 'number' }, { type: 'null' }] },
   },
-  required: ['state', 'label', 'timeline', 'start', 'end'],
+  required: ['state', 'label', 'timeline', 'start'],
 }
 const locationSchema = { oneOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }] }
 const rowBaseProperties = {
@@ -283,7 +285,13 @@ function promptForJob(job, document, touches = {}) {
     '- Link events, never individual memory rows. Use a precedes edge only for a direct narrative prerequisite or progression, not mere temporal adjacency.',
     '- If an existing event is continued, reuse its exact eventId. Do not invent a second id for the same event.',
     '- Do not create an edge to an event that is not represented by at least one row in the resulting patch/document.',
-    '- Do not infer unknown story time. Use the explicit unknown structure.',
+    '- Every new memory row must include normalized storyTime with state "normalized", a non-empty timeline, and a finite numeric start grounded in the supplied story.',
+    '- A storyTime end may be omitted or null when the ending has not been established. If present as a number, it must be finite and greater than or equal to start.',
+    '- A null or omitted end means only that no ending was recorded. It does not mean the event continues through the present.',
+    '- Never use the real-world clock, the model runtime, or the current date as story time.',
+    '- When the story does not establish an absolute calendar, you may use numeric positions on a clearly named relative timeline, but only when the supplied story grounds their ordering or distance. Do not invent elapsed time or dates.',
+    '- If the supplied story provides no grounded start for a prospective memory, do not write that memory row.',
+    '- An update may omit storyTime only when the existing row already has a valid normalized timeline and start and its story time is unchanged. Updating a legacy unknown or label-only row requires replacing storyTime with a normalized timeline and grounded numeric start.',
     '- Keep one broad-to-specific location path per row. Use separate rows sharing eventId when one event has multiple locations.',
     '- Give every memory 2 to 10 unique keywords copied verbatim, with exact spelling and case, from the assistant story text represented by its source references.',
     '- Keywords must be concrete searchable text such as names, aliases, proper nouns, identifiers, or distinctive phrases. Never use generic classifications such as 物品, 事件, 关系, or 状态变化.',

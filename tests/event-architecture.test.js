@@ -5,14 +5,15 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import test from 'node:test'
-import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
-import { createEventMaintenanceJob, EVENT_PATCH_SCHEMA, EventMaintenanceManager } from '../src/event-maintenance.js'
+import { assertObjectJsonSchema, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { buildEventMaintenancePrompt, createEventMaintenanceJob, EVENT_PATCH_SCHEMA, EventMaintenanceManager } from '../src/event-maintenance.js'
+import { applyEventOperation, emptyEventDocument } from '../src/event.js'
 import { assembleSillyTavernPrompt, compactedEventSeqs, selectAutoRecallRows } from '../src/prompt.js'
 import { SillyTavernStore } from '../src/store.js'
 import { minimalCard } from './helpers.js'
 
-const unknownContext = {
-  storyTime: { state: 'unknown', label: null, timeline: null, start: null, end: null },
+const timedContext = {
+  storyTime: { state: 'normalized', label: null, timeline: 'test-relative-turns', start: 1, end: null },
   location: null,
   characters: [],
 }
@@ -79,6 +80,81 @@ test('maintenance structured output schema is accepted by the DSH runtime subset
   const schemaText = JSON.stringify(EVENT_PATCH_SCHEMA)
   assert.match(schemaText, /keywords/)
   assert.doesNotMatch(schemaText, /"tags"/)
+
+  const operation = {
+    action: 'upsert',
+    table: 'events',
+    key: 'arrival',
+    value: {},
+    keywords: ['Alice', 'archive'],
+    storyTime: { state: 'normalized', label: null, timeline: 'scene-order', start: 0 },
+    location: null,
+    characters: ['Alice'],
+  }
+  assert.deepEqual(validateJsonSchemaValue(EVENT_PATCH_SCHEMA, { operations: [operation] }), [])
+  assert.deepEqual(validateJsonSchemaValue(EVENT_PATCH_SCHEMA, {
+    operations: [{ ...operation, storyTime: { ...operation.storyTime, end: null } }],
+  }), [])
+  assert.deepEqual(validateJsonSchemaValue(EVENT_PATCH_SCHEMA, {
+    operations: [{ action: 'update', id: 'existing-normalized-row', value: { revised: true } }],
+  }), [], 'updates may inherit an existing valid normalized storyTime')
+  assert.match(validateJsonSchemaValue(EVENT_PATCH_SCHEMA, {
+    operations: [{ ...operation, storyTime: { state: 'unknown', timeline: null, start: null, end: null } }],
+  }).join('\n'), /oneOf|const|normalized/)
+  assert.notDeepEqual(validateJsonSchemaValue(EVENT_PATCH_SCHEMA, {
+    operations: [{ ...operation, storyTime: { state: 'normalized', label: null, timeline: 'scene-order' } }],
+  }), [])
+})
+
+test('memory patches inherit normalized story time and require legacy rows to be upgraded when changed', () => {
+  const inserted = applyEventOperation(emptyEventDocument('story-time-patch'), {
+    action: 'upsert',
+    table: 'events',
+    key: 'arrival',
+    value: { version: 1 },
+    keywords: ['Alice', 'archive'],
+    ...timedContext,
+    sourceRefs: [],
+    recallPolicy: 'after_compaction',
+  })
+  const id = inserted.document.rows[0].id
+  const patched = applyEventOperation(inserted.document, { action: 'update', id, value: { version: 2 } })
+  assert.deepEqual(patched.document.rows[0].storyTime, timedContext.storyTime)
+
+  const legacy = structuredClone(inserted.document)
+  legacy.rows[0].storyTime = { state: 'unknown', label: null, timeline: null, start: null, end: null }
+  assert.throws(
+    () => applyEventOperation(legacy, { action: 'update', id, value: { version: 3 } }),
+    /storyTime\.start is required for writes/,
+  )
+  const upgraded = applyEventOperation(legacy, {
+    action: 'update',
+    id,
+    value: { version: 3 },
+    storyTime: { state: 'normalized', timeline: 'scene-order', start: 2 },
+  })
+  assert.deepEqual(upgraded.document.rows[0].storyTime, {
+    state: 'normalized', label: null, timeline: 'scene-order', start: 2, end: null,
+  })
+})
+
+test('maintenance prompt requires grounded normalized starts and treats a missing end as unknown', () => {
+  const prompt = buildEventMaintenancePrompt(maintenanceJob('prompt-time-contract', 1, 10), {
+    rows: [{
+      id: 'legacy-row', eventId: 'legacy-event', table: 'events', key: 'legacy', value: {}, keywords: ['final body 1'],
+      importance: 0.5, recallPolicy: 'after_compaction', sourceRefs: [], location: null, characters: [],
+      storyTime: { state: 'unknown', label: null, timeline: null, start: null, end: null }, createdAt: 1, updatedAt: 1,
+    }],
+    eventEdges: [],
+  })
+  assert.match(prompt, /Every new memory row must include normalized storyTime/)
+  assert.match(prompt, /null or omitted end means only that no ending was recorded/)
+  assert.match(prompt, /does not mean the event continues through the present/)
+  assert.match(prompt, /Never use the real-world clock/)
+  assert.match(prompt, /relative timeline/)
+  assert.match(prompt, /no grounded start[\s\S]*do not write that memory row/)
+  assert.match(prompt, /Updating a legacy unknown or label-only row requires replacing storyTime/)
+  assert.doesNotMatch(prompt, /Use the explicit unknown structure/)
 })
 
 async function waitFor(predicate, message, timeout = 5000) {
@@ -122,7 +198,7 @@ test('automatic recall promotes important rows, gates ordinary rows on source co
       table: 'events',
       value: { note: row.key },
       keywords: [row.key, `${row.key} marker`],
-      ...unknownContext,
+      ...timedContext,
       ...row,
     })
   }
@@ -259,7 +335,7 @@ test('background manager is non-blocking, processes each session FIFO, and commi
       key: 'first fact',
       value: { durable: true },
       keywords: ['final body 1', 'body 1'],
-      ...unknownContext,
+      ...timedContext,
       importance: 0.5,
       recallPolicy: 'after_compaction',
     }] },
@@ -342,7 +418,7 @@ test('background manager retries transient failures and restores an interrupted 
             key: 'concurrent edit',
             value: { changed: true },
             keywords: ['final body 1', 'body 1'],
-            ...unknownContext,
+            ...timedContext,
             recallPolicy: 'always',
             sourceRefs: [],
           })

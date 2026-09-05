@@ -65,6 +65,26 @@ Host 监听父会话成功的 `turn/end`，先通过 `sessions.flush(session)` �
 
 V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同名字段只作兼容回退；缺省 position 按 After Char 处理。Before/After Character、AN Top/Bottom 和 EM Top/Bottom 分别落到独立 Prompt 锚点；命名 Outlet 只由 `{{outlet::Name}}` 在宏感知模板中消费，并兼容 `outlet_name`、`outletName`、`outlet`；at-depth 内容经 Host 的 `llm/stream` 投影插入当次不可变请求副本，保持指定 system/user/assistant role 与相对历史 depth，不追加 Session 事件。仅当本轮存在 `@depth` 投影时才生成请求绑定 ID，只有携带该私有 marker 的确切系统提示请求可以取得对应投影；没有 `@depth` 条目时系统提示保持原样，避免随机 marker 造成无意义的提示词缓存失效。Host 在重派发/adapter 前移除 marker，路由不一致则跳过并告警。未知 position 与空名称 Outlet 均跳过并告警，未知 decorator/content 原样保留。最近一次成功组装的活动条目、预算和警告保存在 Host 的会话级弱引用诊断快照，通过 `/session` 显示，但不写入 Session 事件，也不返回 Prompt 或扫描原文。扫描文本/深度、角色卡输入和最终 Prompt 仍受各自的通用数据预算约束；在这些通用边界内，世界书正则直接使用原生 JavaScript RegExp，不再施加正则专用长度上限，也不限制分组、交替、量词、前后查找、反向引用或 flags，不设置执行 deadline，数据与执行安全性由用户负责。EJS 模板在独立 resource-limited Worker 的禁用字符串代码生成 VM 中执行，50 ms VM timeout + 500 ms Worker deadline 后强制终止；本轮 AbortSignal 会立即 terminate Worker 并停止后续模板。模板只收到受预算的最小 scope。
 
+### 剧情开始时间写入约束
+
+持久化读取仍接受 schema 5 历史 `unknown` / `label-only` 记录；`normalizedStoryTime` 另外接受可省略或为 null 的 `end`，读取后统一为 null。行的新增/更新统一通过 `writableStoryTime`：必须是 `normalized`、非空时间线和有限数字 `start`；非空 `end` 必须有限且不早于开始。更新不带整个 `storyTime` 时继承已有值后再校验，因此无法通过修改其他字段继续写入缺少开始时间的历史记录；删除和纯关系操作不要求重写这些记录。
+
+维护 Agent 的 `EVENT_PATCH_SCHEMA` 同步要求 normalized、字符串 timeline 和数字 start，end 为可选的 number/null；label 保持必填但可为 null，update 保持部分更新契约。DSH 的结构化输出 schema 子集不支持 `minLength`，所以时间线去空白后的非空约束由 Host 统一落实。提示明确不使用现实时间，不凭空推算结束时间；无绝对纪年时可用有剧情依据的相对时间线，无法确定开始时不写该行。
+
+缺少结束时间不等于正在持续：查询排序和范围相交以 `end ?? start` 处理已知时间点；可视化也仅用它计算边界与位置，原始文档、interval 和详情继续保留 null。甘特图用独立的“结束时间未记录”标记，与 end=start 的确定零时长圆点区分。Manager 表单以同一时间线为前提复用已有 start，空 end 显式提交 null，空 start 不转换成 0。
+
+## 对话页事件可视化
+
+插件通过公开 `conversation.view` Slot 注册 `sillytavern-events`（label `事件`，order `20`），与 `chat`、`trajectory` 共用 DSH 的会话标签选择机制。非酒馆会话显示提示，不加载事件文档；空白会话继续遵循宿主隐藏 View header 的行为。原管理弹窗的事件编辑页不变。
+
+`GET /api/dsh-sillytavern/events?sessionId=<id>&revision=<optional>` 复用现有会话适用性检查，调用 `store.eventSnapshot(agent)` 在既有串行队列和文件锁中刷新持久文档。revision 相同返回 `{ sessionId, revision, unchanged: true }`；否则返回完整 schema 5 `document`，包括全部 rows、eventEdges 和应用记录。这是剧情事件快照，不是 `/event-state` 的兼容运行时消息窗口。
+
+Client 的 `src/client/event-explorer-source.cjs` 是符合标准 HookSource 契约的共享数据源：首个订阅启动顺序轮询、revision 未变保持 snapshot 引用、最后一个订阅卸载时取消定时器和请求并释放文档，页面可见性控制后续轮询；错误保留上次成功数据。每个 session 的源相互独立，不会混入迟到的跨会话响应。
+
+`src/client/event-explorer-model.cjs` 按 `eventId` 构建索引并聚合 rows，保留每条独立 storyTime，按 timeline 分组；未分组 rows 单列。图布局根据已保存的 `precedes` 作拓扑分层，独立连通分量分开排布，不推断新关系，不按召回条件或搜索结果删除节点。`src/client/event-explorer-ui.cjs` 使用 React + HTML/SVG 渲染：顶部独立时间轴甘特图、主区域可平移缩放的关系图、右侧原生 dialog 详情；搜索仅高亮和定位。模型与布局通过 memo 按文档引用缓存。
+
+这三个 CJS 模块由 `pnpm run build:events` 内联进 `client.cjs` 的标记区，浏览器无新增包加载依赖。`pnpm run check` 先核对生成内容与源文件一致，再执行语法检查和回归测试；修改 UI 后需要重新生成 bundle，并重启 DSH 应用更新。
+
 ## 存储
 
 ```text

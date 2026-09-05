@@ -11,7 +11,7 @@ import { SillyTavernStore } from '../src/store.js'
 import { minimalCard } from './helpers.js'
 
 const unknownMemoryContext = {
-  storyTime: { state: 'unknown', label: null, timeline: null, start: null, end: null },
+  storyTime: { state: 'normalized', label: null, timeline: 'story', start: 1, end: null },
   location: null,
   characters: [],
 }
@@ -479,6 +479,18 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   })
   assert.equal(missingKeyword.status, 400)
   assert.match(missingKeyword.body.error, /missing: "Osaka"/)
+  for (const storyTime of [
+    { state: 'unknown', start: null, end: null },
+    { state: 'normalized', timeline: 'story', end: 2 },
+    { state: 'normalized', timeline: 'story', start: 2, end: 1 },
+  ]) {
+    const invalidTime = await invoke(route, 'POST', '/api/dsh-sillytavern/event', {
+      sessionId: live.id,
+      operation: { action: 'upsert', table: 'events', key: 'invalid-time', value: {}, keywords: ['Alice', 'Narita Airport'], ...unknownMemoryContext, storyTime },
+    })
+    assert.equal(invalidTime.status, 400)
+    assert.match(invalidTime.body.error, /storyTime/)
+  }
   const memory = await invoke(route, 'POST', '/api/dsh-sillytavern/event', {
     sessionId: live.id,
     operation: { action: 'upsert', table: 'events', key: 'arrival', value: { place: 'archive' }, keywords: ['Alice', 'Narita Airport'], ...unknownMemoryContext, location: ['Tokyo Outskirts', 'Narita Airport', 'International Arrivals Hall'] },
@@ -494,6 +506,16 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.equal(session.body.value.binding.variables.secret, 'amber')
   assert.equal(session.body.value.card.card.data.character_book, undefined)
   assert.equal(session.body.value.worldbook.book.entries[0].content, '{{getvar::secret}}')
+  assert.deepEqual(session.body.value.event.rows[0].storyTime, unknownMemoryContext.storyTime, 'required start and nullable end survive API persistence')
+
+  const eventView = await invoke(route, 'GET', `/api/dsh-sillytavern/events?sessionId=${live.id}`)
+  assert.equal(eventView.status, 200)
+  assert.deepEqual(eventView.body.value.document, session.body.value.event, 'the explorer receives all stored rows and edges without query/recall limits')
+  assert.equal(eventView.body.value.sessionId, live.id)
+  const unchangedEvents = await invoke(route, 'GET', `/api/dsh-sillytavern/events?sessionId=${live.id}&revision=1`)
+  assert.deepEqual(unchangedEvents.body.value, { sessionId: live.id, revision: 1, unchanged: true })
+  const otherEvents = await invoke(route, 'GET', `/api/dsh-sillytavern/events?sessionId=${fresh.id}`)
+  assert.equal(otherEvents.body.value.document.rows.length, 0, 'events remain scoped to the requested session')
 
   const backgroundTurn = 9
   live.session.append('turn/start', { turn: backgroundTurn })
@@ -509,6 +531,9 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   releaseFinalBodyFlush(true)
   flushSession = async () => true
   await waitFor(() => ctx.sillyTavern.sessionView(live).event.rows.some(row => row.key === 'background maintained fact'), 'turn/end did not launch background event maintenance')
+  const updatedEvents = await invoke(route, 'GET', `/api/dsh-sillytavern/events?sessionId=${live.id}&revision=1`)
+  assert.equal(updatedEvents.body.value.unchanged, false)
+  assert.equal(updatedEvents.body.value.document.rows.some(row => row.key === 'background maintained fact'), true)
   assert.equal(sessionFlushes.at(-1), live.session)
   assert.equal(subagentRuns.length, 1)
   assert.equal(subagentRuns[0].provider, 'spawn')

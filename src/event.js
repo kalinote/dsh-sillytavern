@@ -46,14 +46,27 @@ function normalizedStoryTime(value) {
   }
   if (value.state === 'normalized') {
     const timeline = typeof value.timeline === 'string' ? value.timeline.trim() : ''
-    if (timeline === '' || !Number.isFinite(value.start) || !Number.isFinite(value.end) || value.end < value.start) {
-      throw new Error('normalized memory storyTime requires a timeline and finite ordered start/end')
+    if (timeline === '' || !Number.isFinite(value.start)) {
+      throw new Error('memory storyTime requires a non-empty timeline and finite numeric start (story time, not wall-clock time)')
+    }
+    const end = value.end ?? null
+    if (end !== null && (!Number.isFinite(end) || end < value.start)) {
+      throw new Error('memory storyTime end must be null or a finite number greater than or equal to start')
     }
     if (value.label !== undefined && value.label !== null && typeof value.label !== 'string') throw new Error('memory storyTime label must be a string or null')
     const label = typeof value.label === 'string' && value.label.trim() !== '' ? value.label.trim() : null
-    return { state: 'normalized', label, timeline, start: value.start, end: value.end }
+    return { state: 'normalized', label, timeline, start: value.start, end }
   }
   throw new Error('memory storyTime state must be normalized, label-only, or unknown')
+}
+
+// Read historical label-only/unknown rows without changing them, but require a
+// known narrative start whenever a row is created or updated.
+function writableStoryTime(value) {
+  if (value?.state !== 'normalized') {
+    throw new Error('memory storyTime.start is required for writes; provide normalized story time with a timeline and finite numeric start')
+  }
+  return normalizedStoryTime(value)
 }
 
 function normalizedLocation(value) {
@@ -267,7 +280,7 @@ function normalizedRow(input, existing) {
     value: snapshot(value),
     keywords,
     importance,
-    storyTime: readRequired('storyTime', normalizedStoryTime),
+    storyTime: writableStoryTime(readRequired('storyTime', value => value)),
     location: readRequired('location', normalizedLocation),
     characters: readRequired('characters', normalizedCharacters),
     ...(eventId === undefined ? {} : { eventId }),
@@ -339,7 +352,8 @@ export function queryMemory(document, request = {}) {
     if (leftNormalized !== rightNormalized) return leftNormalized ? -1 : 1
     if (!leftNormalized) return relevance(left, right)
     const direction = order === 'time_asc' ? 1 : -1
-    return direction * (left.storyTime.start - right.storyTime.start || left.storyTime.end - right.storyTime.end) || relevance(left, right)
+    return direction * (left.storyTime.start - right.storyTime.start
+      || (left.storyTime.end ?? left.storyTime.start) - (right.storyTime.end ?? right.storyTime.start)) || relevance(left, right)
   }
   const matchesCharacters = row => {
     if (characters === undefined || characters.length === 0) return true
@@ -353,7 +367,9 @@ export function queryMemory(document, request = {}) {
     .filter(matchesCharacters)
     .filter(row => timeRange === undefined || row.storyTime.state === 'normalized'
       && row.storyTime.timeline === timeRange.timeline
-      && row.storyTime.end >= timeRange.start
+      // A missing end records only the known start; it does not imply that the
+      // event continues indefinitely or ends at a real-world timestamp.
+      && (row.storyTime.end ?? row.storyTime.start) >= timeRange.start
       && row.storyTime.start <= timeRange.end)
     .filter(row => {
       if (!hasLocation) return true

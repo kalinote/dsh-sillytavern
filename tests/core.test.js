@@ -326,12 +326,13 @@ test('event deltas advance by event cursor without dropping bursts', () => {
 })
 
 const unknownStoryTime = () => ({ state: 'unknown', label: null, timeline: null, start: null, end: null })
+const knownStoryTime = () => ({ state: 'normalized', label: null, timeline: 'story', start: 1, end: null })
 const eventMemory = (eventId, key, overrides = {}) => ({
   action: 'upsert',
   table: 'events',
   key,
   value: { note: key },
-  storyTime: unknownStoryTime(),
+  storyTime: knownStoryTime(),
   location: null,
   characters: [],
   keywords: [String(key).trim(), `${String(eventId).trim()} source`],
@@ -357,23 +358,23 @@ test('requires narrative dimensions on new memory rows and inherits them on upda
   assert.equal(eventLimits.MAX_KEYWORDS, 10)
   const base = { action: 'upsert', table: 'relationships', key: 'Alice/User', value: { trust: 2 }, keywords: ['Alice', 'User'] }
   assert.throws(() => applyEventOperation(document, base), /storyTime/)
-  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime() }), /location/)
-  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: null }), /characters/)
-  assert.throws(() => applyEventOperation(document, { ...base, storyTime: { state: 'normalized', label: null, timeline: '', start: 2, end: 1 }, location: null, characters: [] }), /finite ordered/)
-  assert.throws(() => applyEventOperation(document, { ...base, storyTime: { state: 'label-only', label: '', timeline: null, start: null, end: null }, location: null, characters: [] }), /non-empty label/)
-  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: [], characters: [] }), /non-empty array/)
-  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: ['Tokyo Outskirts', ' '], characters: [] }), /location segments/)
-  assert.throws(() => applyEventOperation(document, { ...base, storyTime: unknownStoryTime(), location: 'Archive', characters: [] }), /location segments/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: knownStoryTime() }), /location/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: knownStoryTime(), location: null }), /characters/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: { state: 'normalized', label: null, timeline: '', start: 2, end: 1 }, location: null, characters: [] }), /timeline.*start/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: { state: 'label-only', label: '', timeline: null, start: null, end: null }, location: null, characters: [] }), /start is required/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: knownStoryTime(), location: [], characters: [] }), /non-empty array/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: knownStoryTime(), location: ['Tokyo Outskirts', ' '], characters: [] }), /location segments/)
+  assert.throws(() => applyEventOperation(document, { ...base, storyTime: knownStoryTime(), location: 'Archive', characters: [] }), /location segments/)
 
   document = applyEventOperation(document, {
     ...base,
-    storyTime: { state: 'unknown', label: 'discarded', timeline: 'discarded', start: 1, end: 2 },
+    storyTime: { state: 'normalized', label: ' ', timeline: ' story ', start: 1 },
     location: null,
     characters: [' Alice ', '', 'Bob', 'Alice'],
     eventId: ' relationship-1 ',
     importance: 0.8,
   }).document
-  assert.deepEqual(document.rows[0].storyTime, unknownStoryTime())
+  assert.deepEqual(document.rows[0].storyTime, knownStoryTime())
   assert.deepEqual(document.rows[0].characters, ['Alice', 'Bob'])
   assert.deepEqual(document.rows[0].keywords, ['Alice', 'User'])
   assert.equal(Object.hasOwn(document.rows[0], 'tags'), false)
@@ -389,7 +390,7 @@ test('requires narrative dimensions on new memory rows and inherits them on upda
   }).document
   const inherited = applyEventOperation(document, { action: 'update', id: document.rows[0].id, value: { trust: 3 }, importance: 1 }).document.rows[0]
   assert.equal(inherited.value.trust, 3)
-  assert.deepEqual(inherited.storyTime, unknownStoryTime())
+  assert.deepEqual(inherited.storyTime, knownStoryTime())
   assert.equal(inherited.location, null)
   assert.deepEqual(inherited.characters, ['Alice', 'Bob'])
   assert.equal(inherited.eventId, 'relationship-1')
@@ -406,7 +407,7 @@ test('requires narrative dimensions on new memory rows and inherits them on upda
 test('validates keyword count, specificity, and verbatim assistant story sources', () => {
   const base = {
     action: 'upsert', table: 'events', key: 'silver bell', value: { owner: 'Alice' },
-    storyTime: unknownStoryTime(), location: null, characters: ['Alice'],
+    storyTime: knownStoryTime(), location: null, characters: ['Alice'],
   }
   const empty = emptyEventDocument('session-keywords')
   assert.throws(() => applyEventOperation(empty, { ...base, keywords: ['Alice'] }), /2 to 10/)
@@ -494,7 +495,9 @@ test('queries memory by people, intersecting story time, location, event, and te
     { key: 'festival-rumor', value: { note: 'vague' }, keywords: ['festival', 'rumor'], storyTime: { state: 'label-only', label: 'After the festival', timeline: 'main', start: null, end: null }, location: ['Central District', 'Archive'], characters: ['Bob'] },
     { key: 'unplaced', value: { note: 'unknown' }, keywords: ['unknown', 'unplaced'], storyTime: unknownStoryTime(), location: null, characters: [] },
   ]
-  for (const row of rows) document = applyEventOperation(document, { action: 'upsert', table: 'events', ...row }).document
+  for (const row of rows) document = applyEventOperation(document, { action: 'upsert', table: 'events', ...row, storyTime: knownStoryTime() }).document
+  // These old label-only/unknown rows are read fixtures, not valid new writes.
+  document = normalizeEventDocument({ ...document, rows: document.rows.map((row, index) => ({ ...row, storyTime: rows[index].storyTime })) }, document.sessionId)
 
   assert.deepEqual(queryMemory(document, { eventId: 'shared-scene-42', order: 'time_asc' }).map(row => row.key), ['arrival-hall', 'arrival-garden'])
   assert.deepEqual(queryMemory(document, { filters: { eventId: 'shared-scene-42', order: 'time_desc' } }).map(row => row.key), ['arrival-garden', 'arrival-hall'])
@@ -519,24 +522,24 @@ test('keeps event batches atomic and enforces row budgets', () => {
   let document = emptyEventDocument('session-batch')
   document = applyEventOperation(document, {
     action: 'upsert', table: 'items', key: 'brass key', value: { owner: 'User' },
-    keywords: ['brass key', 'User'], storyTime: unknownStoryTime(), location: ['Central District', 'Archive'], characters: ['User'],
+    keywords: ['brass key', 'User'], storyTime: knownStoryTime(), location: ['Central District', 'Archive'], characters: ['User'],
   }).document
   const before = structuredClone(document)
   assert.throws(() => applyEventOperation(document, { action: 'batch', operations: [
-    { action: 'upsert', table: 'items', key: 'silver key', value: {}, keywords: ['silver key', 'Vault'], storyTime: unknownStoryTime(), location: ['Castle', 'Vault'], characters: [] },
+    { action: 'upsert', table: 'items', key: 'silver key', value: {}, keywords: ['silver key', 'Vault'], storyTime: knownStoryTime(), location: ['Castle', 'Vault'], characters: [] },
     { action: 'update', id: 'missing', value: { owner: 'Nobody' } },
   ] }), /was not found/)
   assert.deepEqual(document, before, 'a failed later operation cannot expose earlier batch mutations')
 
   const id = document.rows[0].id
   document = applyEventOperation(document, { action: 'batch', operations: [
-    { action: 'upsert', table: 'items', key: 'silver key', value: {}, keywords: ['silver key', 'Vault'], storyTime: unknownStoryTime(), location: ['Castle', 'Vault'], characters: [] },
+    { action: 'upsert', table: 'items', key: 'silver key', value: {}, keywords: ['silver key', 'Vault'], storyTime: knownStoryTime(), location: ['Castle', 'Vault'], characters: [] },
     { action: 'delete', id },
   ] }).document
   assert.deepEqual(document.rows.map(row => row.key), ['silver key'])
   assert.throws(() => applyEventOperation(document, {
     action: 'upsert', table: 'oversize', key: 'blob', value: { text: 'x'.repeat(300 * 1024) },
-    keywords: ['oversize', 'blob'], storyTime: unknownStoryTime(), location: null, characters: [],
+    keywords: ['oversize', 'blob'], storyTime: knownStoryTime(), location: null, characters: [],
   }), /exceeds/)
 })
 

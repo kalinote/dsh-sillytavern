@@ -10,6 +10,7 @@
 - EJS 风格提示词模板与 `{{char}}`、`{{user}}`、`{{getvar::name}}`；
 - 生成前自动召回 + 主模型按需只读查询的事件：主 Agent 只负责剧情生成，只暴露 `st_event_query` 和 `st_event_graph_query`。普通完成回合在后台进行增量维护，仅向独立事件维护 Agent 提供该轮最后一条真实用户消息、最终助手正文和关键词命中的相关 memory rows；每 10 个完整回合自动进行一次定期整理，用重叠 1 轮的完整上下文归并、纠错和补全事件关系，再由 Host 原子提交结构化 patch；
 - 工作区角色库、独立世界书库、角色编辑、模板、事件和脚本管理 UI；管理页使用全屏弹窗；
+- 对话页“对话 / 轨迹”旁新增“事件”视图：上方剧情时间甘特图、下方完整事件关系图，点击时间条或节点打开右侧详情；支持搜索定位、缩放、拖动画布和自动刷新；
 - 面向 TavernHelper 4.9.3 / SillyTavern 1.18.0 固定基线的 Session 级兼容运行时：所有 iframe 在角色代码执行前获得同步状态快照，共享 `TavernHelper`、`SillyTavern.getContext()`、变量、消息、事件、注入、生成、世界书、Regex 与常见前端生态 facade；已确认的 JavaScript 作为会话后台脚本持续运行；能力清单可从 `GET /api/dsh-sillytavern/compatibility` 读取；
 - 角色、变量、Prompt、事件（由多条 memory rows 聚合而成）、增量事件 API 与 opaque-origin iframe 前端渲染；助手正文使用 DSH 原生 GFM Markdown，并兼容传统独占行 `<font color>`；状态栏等自定义标签只按角色卡或其他 Regex 来源实际定义的规则渲染，插件不猜测未命中标签的含义；
 - 将 `extensions.regex_scripts` 作为完整的 `findRegex → replaceString` 规则导入；支持 Global → Preset → Scoped 顺序、用户/助手/Slash/世界书/Reasoning placement、原始/显示/Prompt/Edit 阶段、depth、Trim Out、NONE/RAW/ESCAPED 宏替换以及 `/narrator`、`/regex`、`/regex-state`、`/regex-toggle`；导入规则默认启用，编辑执行材料后自动停用；
@@ -41,6 +42,28 @@ Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的�
 7. 从角色卡菜单底部的“管理酒馆模式”进入全屏管理页，管理角色设定、persona、世界书、事件、脚本和模板。“事件”页可录入剧情时间状态与时间轴范围、从大到小的地点路径、在场人物、召回策略和可选事件组 ID；一个事件通过 `eventId` 聚合多条 memory rows，并按事件聚合展示直接前置/后续关系及来源。同一事件涉及多个地点时每个地点单独一行，并使用不同 key。世界书是独立全局资源：编辑器下拉框选择要编辑的书，默认选中当前 Session 引用的书；另一个下拉框仅选择当前 Session 引用的书，两者互不等同。当前每张角色卡和每个 Session 均暂限一套世界书，未来可扩展为多书引用。世界书页以结构化条目编辑器管理激活策略、关键字、概率、Order 与 Position，并原样保留未展示的扩展字段；已确认并启用的 JavaScript 会在当前 Session 持续挂载为后台脚本，Regex 仍按文本阶段运行，管理页“运行预览”只创建额外的临时预览；
 8. 酒馆会话处于前台时，Client 仅对该会话临时接管 assistant/user/steering 及过程展示 renderer：显示阶段 Regex 在按次创建、可由组件卸载取消且没有代码内容过滤或执行时限的 Worker 中运行；Host 在用户入日志前执行原始 User Input 规则，在模型流持久化前执行原始 AI/Reasoning 规则，并通过一次受控的公共 LLM 重派发把 promptOnly 历史投影给模型而不改写持久日志。匹配结果精确替换对应 text/reasoning block，HTML 在 opaque-origin iframe 中交互运行，并通过已校验的消息桥按实际内容高度自适应。共享 Regex 引擎已实现 `isEdit`/`runOnEdit` 语义；当前 DSH 尚无原生持久消息编辑事件，因此会话 UI 暂无可接入的编辑阶段触发器。DSH 原生 `turnProcess` 折叠在酒馆对话中显示为“剧情推进”，仍由原生状态控制思考过程、工具调用和多层工具调用；系统提示词行仅从酒馆对话视图隐藏，不影响实际模型提示词。最终剧情正文、图片、Regex/HTML 渲染结果和状态栏保持可见。
 
+### 对话页的“事件”标签
+
+已有消息的酒馆会话可在“对话 / 轨迹 / 事件”中切换。这里展示当前 Session 事件文档中的全部剧情事件，不是 DSH 的工具调用、流式片段等运行日志，也不受自动召回数量、重要度或 compact 状态限制。管理弹窗中原有的“事件”编辑页保持不变。
+
+- 同一 `eventId` 的多条 memory rows 聚合为一个节点；箭头只表示已保存的 `precedes`（前置 → 后续），不会根据时间或关键词猜测关系。
+- 甘特图按 `storyTime` 排列，不同 `timeline` 各用独立刻度；同一事件的不同时间记录分别展示，不把不连续时间合并成长区间。结束时间未记录时只标出已知开始位置，与确定的零时长事件区分；历史文字标签或时间未知的记录另列，且仍显示在关系图里。
+- 点击时间条、事件名称或图节点可查看完整记录、地点、人物、关键词、来源、召回策略和关系依据；详情中的前置/后续事件可直接跳转。
+- 搜索只高亮、定位，不隐藏其他节点。未填写 `eventId` 的记录单列在“未分组记录”中，不伪造事件节点或关联。
+- 视图打开时每两秒检查文档 revision，变化后替换完整快照；切换标签、会话或卸载插件会取消请求，浏览器页面隐藏时暂停后续轮询。支持手动刷新，失败时保留上次成功数据并提示错误。
+
+### 事件写入的时间要求
+
+新增事件记忆必须提供 `storyTime.state: "normalized"`、非空 `timeline` 和有限数值 `start`（剧情开始时间，`0` 也是合法值）。`end` 可以省略或填 `null`；非空时必须是大于或等于 `start` 的有限数值。例如：
+
+```json
+{"state":"normalized","label":"抵达港口","timeline":"剧情日","start":3,"end":null}
+```
+
+时间来自剧情，不使用系统时钟、模型运行时间或现实日期。没有绝对纪年时，可以使用剧情依据支持的相对时间线；没有可依据的开始时间时，维护 Agent 不写入该条记忆。结束为空仅表示“结束时间未记录”，不推定仍在持续；区间查询只将这种记录匹配到已知开始位置。
+
+更新已有记录而不改变时间时，可省略整个 `storyTime` 沿用已有的有效开始时间。管理表单覆盖同名记录时，仅在时间线相同的情况下允许沿用开始时间。历史 `unknown` / `label-only` 数据仍可读取、查询和删除，不自动迁移或补值；再次修改这些记录时必须补齐标准化的开始时间。
+
 ## 数据
 
 全部插件数据按工作区隔离，保存在 `<workspace>/.dsh/sillytavern/`；不再使用 `${DSH_HOME}/data/dsh-sillytavern/`，也不存在跨工作区共享的插件数据。角色库、原始导入文件、独立世界书、模板、选择状态、Regex 与全局变量、会话绑定、事件及后台维护队列均属于当前工作区。
@@ -66,6 +89,7 @@ Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的�
 ## 开发与验证
 
 ```powershell
+pnpm run build:events # 修改 src/client/event-explorer-*.cjs 后更新 Client bundle
 pnpm run check
 pnpm pack --pack-destination .artifacts
 ```

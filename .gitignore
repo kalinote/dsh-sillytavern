@@ -1,1 +1,3 @@
 node_modules
+.artifacts/events-smoke/
+.artifacts/events-smoke-home/

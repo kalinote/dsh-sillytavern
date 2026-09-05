@@ -687,6 +687,18 @@ export async function apply(ctx, config = {}) {
         sendJson(res, 200, { ok: true, value: { ...sessionView(agent), history: sessionMessages(agent, 100) } })
         return
       }
+      if (req.method === 'GET' && route === '/events') {
+        const agent = await agentFor(url.searchParams.get('sessionId'), false)
+        const document = await store.eventSnapshot(agent)
+        const unchanged = url.searchParams.get('revision') === String(document.revision)
+        sendJson(res, 200, { ok: true, value: {
+          sessionId: String(agent.id),
+          revision: document.revision,
+          unchanged,
+          ...(unchanged ? {} : { document }),
+        } })
+        return
+      }
       if (req.method === 'GET' && route === '/compat/runtime') {
         const agent = await agentFor(url.searchParams.get('sessionId'))
         await store.refreshCompatChat(agent)
