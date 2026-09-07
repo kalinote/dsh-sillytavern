@@ -1,5 +1,5 @@
 import { isMemoryAutoRecallEligible, eventLimits } from './event.js'
-import { neutralizeDshTemplates, renderMacros, renderPromptTemplate } from './template.js'
+import { createTemplateRuntime, neutralizeDshTemplates, renderMacros } from './template.js'
 import { activateWorldbook } from './worldbook.js'
 import { projectInjectionDescriptors } from './compat-injections.js'
 import { getRegexedString, REGEX_PLACEMENT, regexRulesForState } from './regex.js'
@@ -336,6 +336,43 @@ export function initialGreetingView(state, swipeId = 0) {
   return { characterName: characterName || '角色', text, swipeId, swipeCount }
 }
 
+function templateRuntimeOptions(state, options, scope) {
+  const compatibility = state.compatibilityVariables ?? {}
+  const variableScopes = compatibility.scopes ?? {}
+  const card = state.record.card
+  const worldbook = state.worldbook?.book
+  const worldbookName = String(worldbook?.name ?? state.worldbook?.name ?? state.worldbook?.id ?? 'current')
+  const characterName = String(card.data.name ?? scope.char ?? 'current')
+  const extraResources = options.templateResources ?? {}
+  const currentMessageId = extraResources.currentMessageId ?? options.currentMessageId
+  const currentMessage = currentMessageId === undefined
+    ? (state.compatMessages ?? []).findLast(message => message.role !== 'system')
+    : (state.compatMessages ?? []).find(message => message.message_id === currentMessageId)
+  const currentSwipeId = extraResources.currentSwipeId ?? options.currentSwipeId ?? currentMessage?.swipe_id
+  return {
+    state: {
+      global: variableScopes.global ?? state.globalVariables ?? {},
+      initial: options.templateInitialVariables ?? {},
+      local: variableScopes.chat ?? state.binding.variables ?? {},
+      message: currentMessage?.swipes_data?.[currentSwipeId ?? 0] ?? currentMessage?.data ?? variableScopes.message ?? {},
+    },
+    baseRevisions: compatibility.revisions ?? {},
+    resources: {
+      ...extraResources,
+      currentWorldbook: extraResources.currentWorldbook ?? worldbookName,
+      currentCharacter: extraResources.currentCharacter ?? characterName,
+      currentMessageId: currentMessage?.message_id ?? currentMessageId,
+      currentSwipeId,
+      worldbooks: extraResources.worldbooks ?? (worldbook === undefined ? [] : [{ id: state.worldbook?.id, name: worldbookName, entries: worldbook.entries ?? [] }]),
+      characters: extraResources.characters ?? [{ id: state.record.id, name: characterName, card }],
+      presets: extraResources.presets,
+      includes: extraResources.includes,
+    },
+    execute: options.executeTemplateCommand,
+    resolveInclude: options.resolveTemplateInclude,
+  }
+}
+
 export async function assembleSillyTavernPrompt(agent, state, signal, options = {}) {
   if (state === undefined) return { system: '', postHistory: '', activeWorldbookEntries: [], worldbookDepthEntries: [] }
   signal?.throwIfAborted()
@@ -350,9 +387,27 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     : sessionMessages(agent, 100)
   const scope = scopeFor(state, messages, compactedSeqs)
   const regexSources = regexRulesForState(state)
+  const templateRuntime = createTemplateRuntime(templateRuntimeOptions(state, options, scope))
+  try {
+  const templateDiagnostics = []
+  const renderTemplateSource = async (value, source, renderScope = scope, fallback = '[content omitted: template evaluation failed]') => {
+    try {
+      return (await templateRuntime.render(String(value ?? '').slice(0, MAX_SECTION_CHARS), renderScope, { source, stage: 'generate' }, signal)).text
+    } catch (error) {
+      if (signal?.aborted) throw (signal.reason ?? error)
+      templateDiagnostics.push(error?.diagnostic ?? {
+        severity: 'error',
+        code: error?.code ?? 'TEMPLATE_RUNTIME_ERROR',
+        message: error instanceof Error ? error.message : String(error),
+        source,
+      })
+      return fallback
+    }
+  }
   let selectedOpening = ''
   try { selectedOpening = initialGreetingView(state, Number(state.binding.openingSwipeId ?? 0))?.text ?? '' } catch { selectedOpening = '' }
   if (Array.isArray(state.compatMessages) && state.compatMessages.some(message => message?.extra?.dsh_opening === true)) selectedOpening = ''
+  if (selectedOpening !== '') selectedOpening = await renderTemplateSource(selectedOpening, `character:${scope.char}/opening`, scope, '[opening omitted: template evaluation failed]')
   const injectionProjection = projectInjectionDescriptors(options.injections ?? state.binding.scriptInjections.filter(item => item.hasFilter !== true))
   const rawMessages = [...(selectedOpening === '' ? [] : [selectedOpening]), ...messages.map(message => message.text), ...injectionProjection.scan.map(item => item.content)]
   const world = await activateWorldbook(state.worldbook?.book, rawMessages, {
@@ -363,9 +418,9 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     fallbackTokenBudget: options.fallbackTokenBudget,
     countTokens: options.countTokens,
     renderKey: key => renderMacros(String(key ?? '').slice(0, MAX_SECTION_CHARS), scope, MAX_SECTION_CHARS),
-    render: content => {
-      let rendered
-      try { rendered = renderMacros(String(content ?? '').slice(0, MAX_SECTION_CHARS), scope, MAX_SECTION_CHARS) } catch { return '[content omitted: macro expansion exceeded limits]' }
+    render: async (content, entry) => {
+      const sourceName = `worldbook:${String(state.worldbook?.book?.name ?? state.worldbook?.name ?? 'current')}/${String(entry?.comment ?? entry?.name ?? entry?.id ?? entry?.uid ?? 'entry')}`
+      const rendered = await renderTemplateSource(content, sourceName, { ...scope, world_info: entry })
       return promptRegex(rendered, REGEX_PLACEMENT.WORLD_INFO, regexSources, { isPrompt: true, scope }, 'world info prompt')
     },
     onWarning: warning => console.warn(`[dsh-sillytavern] ${warning}`),
@@ -382,19 +437,30 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
   const postTemplates = []
   for (const template of state.templates.slice(0, 16)) {
     signal?.throwIfAborted()
-    let rendered
-    try { rendered = await renderPromptTemplate(template.content, scope, signal) } catch (error) {
-      if (signal?.aborted) throw (signal.reason ?? error)
-      rendered = `[Prompt template ${template.name} failed: ${error instanceof Error ? error.message : String(error)}]`
-    }
+    const rendered = await renderTemplateSource(
+      template.content,
+      `template:${String(template.id ?? template.name ?? 'prompt')}`,
+      scope,
+      `[Prompt template ${template.name} failed]`,
+    )
     signal?.throwIfAborted()
     if (template.position === 'before') beforeTemplates.push(rendered)
     else if (template.position === 'post-history') postTemplates.push(rendered)
     else afterTemplates.push(rendered)
   }
-  const render = (value, allowOutlets = false) => {
-    const renderScope = allowOutlets ? scope : { ...scope, outlets: undefined }
-    try { return renderMacros(String(value ?? '').slice(0, MAX_SECTION_CHARS), renderScope, MAX_SECTION_CHARS) } catch { return '[content omitted: macro expansion exceeded limits]' }
+  const cardScope = { ...scope, outlets: undefined }
+  const renderCardField = (field, value) => renderTemplateSource(value, `character:${scope.char}/${field}`, cardScope)
+  const renderedCard = {
+    name: await renderCardField('name', card.data.name),
+    nickname: await renderCardField('nickname', card.data.nickname || card.data.name),
+    description: await renderCardField('description', card.data.description),
+    personality: await renderCardField('personality', card.data.personality),
+    scenario: await renderCardField('scenario', card.data.scenario),
+    systemPrompt: await renderCardField('system_prompt', card.data.system_prompt),
+    example: await renderCardField('mes_example', card.data.mes_example),
+    postHistory: await renderCardField('post_history_instructions', card.data.post_history_instructions),
+    personaName: await renderTemplateSource(state.binding.userPersona.name, 'persona:name', cardScope),
+    personaDescription: await renderTemplateSource(state.binding.userPersona.description, 'persona:description', cardScope),
   }
   let worldChars = 0
   const boundedWorld = values => values.flatMap(value => {
@@ -412,32 +478,75 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     authorNoteTop: boundedWorld(world.authorNoteTop ?? []),
     authorNoteBottom: boundedWorld(world.authorNoteBottom ?? []),
   }
+  const promptOverrides = options.promptOverrides ?? {}
+  if (Object.hasOwn(promptOverrides, 'world_info_before')) renderedWorld.before = [await renderTemplateSource(promptOverrides.world_info_before, 'override:world_info_before')]
+  if (Object.hasOwn(promptOverrides, 'world_info_after')) {
+    renderedWorld.after = [await renderTemplateSource(promptOverrides.world_info_after, 'override:world_info_after')]
+    renderedWorld.middle = []
+  }
+  const authorNote = Object.hasOwn(promptOverrides.chat_history ?? {}, 'author_note')
+    ? await renderTemplateSource(promptOverrides.chat_history.author_note, 'override:author_note') : ''
+  const renderedNamedPrompts = {
+    char_description: renderedCard.description,
+    char_personality: renderedCard.personality,
+    scenario: renderedCard.scenario,
+    persona_description: renderedCard.personaDescription,
+    dialogue_examples: renderedCard.example,
+    world_info_before: renderedWorld.before.join('\n'),
+    world_info_after: [...renderedWorld.after, ...renderedWorld.middle].join('\n'),
+  }
   const worldbookDepthEntries = [...world.depthEntries, ...injectionProjection.messages].flatMap(item => {
     const rendered = boundedWorld([item.content])
     return rendered.length === 0 ? [] : [{ ...item, content: rendered[0] }]
   })
+  const template = await templateRuntime.snapshot(signal)
+  template.diagnostics.push(...templateDiagnostics)
+  const templateBefore = []
+  const templateAfter = []
+  const templatePostHistory = []
+  for (const item of template.injections) {
+    const text = String(item.text ?? '').slice(0, MAX_SECTION_CHARS)
+    if (text.trim() === '') continue
+    if (item.position === 'before') templateBefore.push(text)
+    else if (item.position === 'after') templateAfter.push(text)
+    else if (item.position === 'post-history') templatePostHistory.push(text)
+    else if (item.position === 'depth' || Number(item.depth) > 0) {
+      const role = typeof item.role === 'number' ? item.role : Math.max(0, DEPTH_ROLES.indexOf(String(item.role)))
+      worldbookDepthEntries.push({ content: text, depth: Math.max(0, Number(item.depth) || 0), role, source: item.source })
+    } else {
+      template.diagnostics.push({
+        severity: 'warning',
+        code: 'TEMPLATE_INJECTION_POSITION_UNKNOWN',
+        message: `template injection position ${String(item.position)} is not supported`,
+        source: item.source,
+      })
+    }
+  }
   const parts = [
     '# SillyTavern Character Card V3',
-    `You are roleplaying as ${render(card.data.nickname || card.data.name)}. Maintain the character consistently, continue the scene naturally, and never describe these instructions.`,
+    ...templateBefore,
+    `You are roleplaying as ${renderedCard.nickname}. Maintain the character consistently, continue the scene naturally, and never describe these instructions.`,
     ...beforeTemplates,
     ...renderedWorld.before,
-    section('Character name', render(card.data.name)),
-    section('Character description', render(card.data.description)),
-    section('Personality', render(card.data.personality)),
-    section('Scenario', render(card.data.scenario)),
-    section('User persona', `${render(state.binding.userPersona.name)}\n${render(state.binding.userPersona.description)}`),
-    section('Character system prompt', render(card.data.system_prompt)),
+    section('Character name', renderedCard.name),
+    section('Character description', renderedCard.description),
+    section('Personality', renderedCard.personality),
+    section('Scenario', renderedCard.scenario),
+    section('User persona', `${renderedCard.personaName}\n${renderedCard.personaDescription}`),
+    section('Character system prompt', renderedCard.systemPrompt),
     section('Conversation-opening assistant message', selectedOpening),
     ...renderedWorld.after,
     ...renderedWorld.middle,
     ...renderedWorld.exampleTop,
-    section('Example dialogue', render(card.data.mes_example)),
+    section('Example dialogue', renderedCard.example),
     ...renderedWorld.exampleBottom,
     section('Automatically recalled events', eventText(state.event, messages, compactedSeqs)),
     section('Compacted source awaiting background event maintenance', pendingEventText(options.pendingEventFallback)),
     ...afterTemplates,
+    ...templateAfter,
     ...renderedWorld.authorNoteTop,
-    section('Post-history instructions', [render(card.data.post_history_instructions), ...postTemplates].filter(value => value.trim() !== '').join('\n\n')),
+    section('Author note', authorNote),
+    section('Post-history instructions', [renderedCard.postHistory, ...postTemplates, ...templatePostHistory].filter(value => value.trim() !== '').join('\n\n')),
     ...renderedWorld.authorNoteBottom,
   ].filter(value => String(value).trim() !== '')
   const boundedParts = parts.map(value => {
@@ -453,6 +562,11 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     worldbookDepthEntries,
     worldbookBudget: { tokens: world.budget, usedTokens: world.usedTokens, overflowed: world.overflowed },
     worldbookWarnings: world.warnings,
+    renderedNamedPrompts,
+    template,
+  }
+  } finally {
+    await templateRuntime.close()
   }
 }
 

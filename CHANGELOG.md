@@ -2,7 +2,16 @@
 
 ## Unreleased
 
-- 事件新增/更新要求有效的剧情开始时间（normalized + timeline + start），结束时间允许省略/null；同步维护 Agent schema、提示、管理表单、区间查询和甘特图标记。读取保留历史 unknown/label-only，不迁移、不填入现实时间；再次修改历史记录时需要补齐开始时间。
+## 0.10.0
+
+- 新增标准 TavernHelper 脚本导入器，保留启用状态、文件夹、脚本变量与按钮/导出元数据；取消条数和浅层遍历截断，管理器展示逐项导入报告。
+- 修复兼容消息到原生 LLM 请求的投影：支持删除、隐藏、排序与同文合成消息，保留图片及工具协议，使用本轮快照避免复用过期历史。
+- 修复 `generate/generateRaw` 的零历史、混合 `ordered_prompts`、覆盖项、请求注入、字符串图片和模型参数；不可用的预设及 File 输入显式报错。
+- 新增 Session 生成准备协调器，等待 iframe 写入，调用 filter/macro owner，处理取消、失联和跨 frame 停止；一次性注入由 Host 消费。
+- 使用固定 EJS 3.1.10 执行异步模板，同一轮共享定义和变量缓存；求值结果带变更及诊断，Host 复核 revision 后提交 local/global/当前 message swipe，模板错误不提交状态或调用模型。
+- 对照基线更新至 TavernHelper 4.9.4 / ST-Prompt-Template 1.17.9，完整边界、后续依赖及测试方式见 [0.10.0 兼容性说明](docs/COMPATIBILITY-0.10.md)。
+
+- 事件新增/更新要求有效的剧情开始时间（normalized + timeline + start），结束时间允许省略/null；同步维护 Agent schema、提示、管理表单和区间查询。甘特图把未记录结束时间的事件以开放态条纹延伸至同时间线的最新已知剧情时间，但不写回或推断结束时间。读取保留历史 unknown/label-only，不迁移、不填入现实时间；再次修改历史记录时需要补齐开始时间。
 - 新增对话页“事件”标签，使用公开 `conversation.view` Slot，不修改 Harness：剧情时间甘特图按 timeline 独立缩放，关系图聚合每个 `eventId` 并展示全部已记录的前置/后续边；支持缩放、平移、搜索定位和右侧完整详情，未知时间及未分组记录不会被丢弃。
 - 新增只读 `/events` 完整快照接口和 revision 条件轮询；读取跨 Store 持久化更新，不受自动召回窗口限制，离开视图时取消请求并释放数据。新增独立可测试的事件聚合/布局、刷新源及生成 Client bundle 的脚本。
 - 修复多个 Store 并发绑定同一会话时，冲突方仍保留旧角色绑定缓存的问题；绑定冲突返回前同步磁盘中的最新状态，保持角色选择、替换校验与会话开始状态一致。

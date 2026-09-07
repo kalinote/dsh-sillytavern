@@ -7,11 +7,11 @@
 - 从输入框左下角“+”导入 V3 PNG、APNG 或 JSON；角色卡内携带的世界书会作为独立世界书资源一并导入；
 - V3 `ccv3` CRC/Base64/UTF-8/JSON 分层校验，V2-only 明确拒绝；对生态中常见但不规范的缺失 `group_only_greetings`/世界书 `extensions` 安全补空并给出警告；
 - 角色卡、用户设定/变量、首条问候、独立的结构化 Character Book V3 世界书管理和 system-role post-history 注入；角色卡可绑定一套默认世界书，Session 在首次真实用户消息时以其初始化自身的世界书引用，之后可独立修改该引用；TavernHelper API 还可绑定工作区全局书及当前角色的 primary/additional 书，生成时按全局→角色→当前会话去重合并。世界书支持常驻/关键词/向量标记策略、Secondary Logic、概率、原生 JavaScript 正则、多级递归、Order、0–7 Position、`@depth`、Outlet 与递归控制，并在宏及 WORLD_INFO Regex 展开后按本轮模型真实 tokenizer 与上下文窗口比例（默认 25%）预算；卡内 `token_budget` 可进一步收紧该预算，最近一次激活条目、预算与运行时警告可在管理页查看；纯向量相似度激活仍需要未来接入 embedding retriever；
-- EJS 风格提示词模板与 `{{char}}`、`{{user}}`、`{{getvar::name}}`；
+- EJS 3.1.10 异步提示词模板、共享变量缓存与提交，以及 `{{char}}`、`{{user}}`、`{{getvar::name}}`；
 - 生成前自动召回 + 主模型按需只读查询的事件：主 Agent 只负责剧情生成，只暴露 `st_event_query` 和 `st_event_graph_query`。普通完成回合在后台进行增量维护，仅向独立事件维护 Agent 提供该轮最后一条真实用户消息、最终助手正文和关键词命中的相关 memory rows；每 10 个完整回合自动进行一次定期整理，用重叠 1 轮的完整上下文归并、纠错和补全事件关系，再由 Host 原子提交结构化 patch；
 - 工作区角色库、独立世界书库、角色编辑、模板、事件和脚本管理 UI；管理页使用全屏弹窗；
 - 对话页“对话 / 轨迹”旁新增“事件”视图：上方剧情时间甘特图、下方完整事件关系图，点击时间条或节点打开右侧详情；支持搜索定位、缩放、拖动画布和自动刷新；
-- 面向 TavernHelper 4.9.3 / SillyTavern 1.18.0 固定基线的 Session 级兼容运行时：所有 iframe 在角色代码执行前获得同步状态快照，共享 `TavernHelper`、`SillyTavern.getContext()`、变量、消息、事件、注入、生成、世界书、Regex 与常见前端生态 facade；已确认的 JavaScript 作为会话后台脚本持续运行；能力清单可从 `GET /api/dsh-sillytavern/compatibility` 读取；
+- 面向 TavernHelper 4.9.4 / SillyTavern 1.18.0 固定基线的 Session 级兼容运行时：所有 iframe 在角色代码执行前获得同步状态快照，共享 `TavernHelper`、`SillyTavern.getContext()`、变量、消息、事件、注入、生成、世界书、Regex 与常见前端生态 facade；已确认的 JavaScript 作为会话后台脚本持续运行；能力清单可从 `GET /api/dsh-sillytavern/compatibility` 读取；
 - 角色、变量、Prompt、事件（由多条 memory rows 聚合而成）、增量事件 API 与 opaque-origin iframe 前端渲染；助手正文使用 DSH 原生 GFM Markdown，并兼容传统独占行 `<font color>`；状态栏等自定义标签只按角色卡或其他 Regex 来源实际定义的规则渲染，插件不猜测未命中标签的含义；
 - 将 `extensions.regex_scripts` 作为完整的 `findRegex → replaceString` 规则导入；支持 Global → Preset → Scoped 顺序、用户/助手/Slash/世界书/Reasoning placement、原始/显示/Prompt/Edit 阶段、depth、Trim Out、NONE/RAW/ESCAPED 宏替换以及 `/narrator`、`/regex`、`/regex-state`、`/regex-toggle`；导入规则默认启用，编辑执行材料后自动停用；
 - 所有插件数据均在工作区的 `.dsh/sillytavern/` 持久化；会话绑定、事件与全局资源在该工作区内隔离，支持跨 Store 刷新、dead-owner lock 恢复与 dispose 提交屏障。
@@ -47,7 +47,7 @@ Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的�
 已有消息的酒馆会话可在“对话 / 轨迹 / 事件”中切换。这里展示当前 Session 事件文档中的全部剧情事件，不是 DSH 的工具调用、流式片段等运行日志，也不受自动召回数量、重要度或 compact 状态限制。管理弹窗中原有的“事件”编辑页保持不变。
 
 - 同一 `eventId` 的多条 memory rows 聚合为一个节点；箭头只表示已保存的 `precedes`（前置 → 后续），不会根据时间或关键词猜测关系。
-- 甘特图按 `storyTime` 排列，不同 `timeline` 各用独立刻度；同一事件的不同时间记录分别展示，不把不连续时间合并成长区间。结束时间未记录时只标出已知开始位置，与确定的零时长事件区分；历史文字标签或时间未知的记录另列，且仍显示在关系图里。
+- 甘特图按 `storyTime` 排列，不同 `timeline` 各用独立刻度；同一事件的不同时间记录分别展示，不把不连续时间合并成长区间。结束时间未记录时以条纹进度条从已知开始位置延伸至该时间线的当前剧情时间（最新已知时间点），仅作为图示范围且不写回结束时间；确定的零时长事件仍显示为圆点。历史文字标签或时间未知的记录另列，且仍显示在关系图里。
 - 点击时间条、事件名称或图节点可查看完整记录、地点、人物、关键词、来源、召回策略和关系依据；详情中的前置/后续事件可直接跳转。
 - 搜索只高亮、定位，不隐藏其他节点。未填写 `eventId` 的记录单列在“未分组记录”中，不伪造事件节点或关联。
 - 视图打开时每两秒检查文档 revision，变化后替换完整快照；切换标签、会话或卸载插件会取消请求，浏览器页面隐藏时暂停后续轮询。支持手动刷新，失败时保留上次成功数据并提示错误。
@@ -80,9 +80,11 @@ Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的�
 
 删除世界书会在确认框列出引用它的角色卡与 Session；确认后删除资源并清除这些引用。删除角色卡前会检查尚未删除或归档的 Session，有任何此类 Session 时禁止删除并列出它们；可删除时，确认框可勾选同步删除该卡默认绑定的世界书。脚本源不改写。角色记录 Schema 4 延续 Schema 3 的 Regex 规则模型：Character Card 的 `regex_scripts` 原子化保存为整条规则，并把 0.5.3 错误拆分出的字段迁回规则；Global/Preset 规则与 `{{globalvar::key}}` 全局变量保存在当前工作区的 `.dsh/sillytavern/regex-scripts.json`。授权 SHA-256 同时绑定类型、匹配式、替换内容、trim/placement 与阶段选项，任一修改都会自动停用。Regex 运行器遵循 SillyTavern 的 JavaScript RegExp 和替换回调语义，不限制 pattern、规则数、trim 数量，不做嵌套重复/alternation 拒绝，不过滤或清洗 replaceString，也不设置执行 deadline；`substituteRegex` NONE/RAW/ESCAPED 均执行。代码安全性由启用者自行验证。交互 HTML 和手动预览在 opaque-origin iframe 中运行；常见的 parent `querySelector`/`getElementById`/jQuery `#send_textarea` 与 `#send_but` 调用映射到 DSH 官方 `inputActions.setDraft`，不开放父页面 DOM。
 
-## TavernHelper 兼容阶段 5
+## TavernHelper 与提示词模板兼容性
 
-兼容目标固定为 TavernHelper `4.9.3`（commit `e559c5a13f6337b2ac1a1086c69587793beb3823`）和 SillyTavern `1.18.0` release（commit `8172dcd0ee672d3cd9a5e5f7af134f91a45cd2b8`）。每个 Session 只有一个父层状态镜像和消息总线；开场、普通消息、管理预览与后台 JavaScript 在执行角色代码前就获得相同的初始快照，后续更新使用单调 revision 推送，不通过重载 iframe 更新状态。
+兼容目标固定为 TavernHelper `4.9.4`（commit `8c1f159388e216b52bff0e0995f371a8c9861bca`）和 SillyTavern `1.18.0` release（commit `8172dcd0ee672d3cd9a5e5f7af134f91a45cd2b8`）。每个 Session 只有一个父层状态镜像和消息总线；开场、普通消息、管理预览与后台 JavaScript 在执行角色代码前就获得相同的初始快照，后续更新使用单调 revision 推送，不通过重载 iframe 更新状态。
+
+0.10.0 补齐标准脚本导入报告、最终请求消息投影、生成参数语义和跨 iframe 生成准备屏障，并以 ST-Prompt-Template `1.17.9` 为对照引入核心 EJS 执行环境。完整 STPT 渲染生命周期、初始化规则、生成预设和脚本树/按钮管理尚未实现；支持范围及具体依赖见 [0.10.0 兼容性说明](docs/COMPATIBILITY-0.10.md)。更新后需要重启 DSH。
 
 阶段 2–5 已覆盖全部变量作用域、持久消息投影与 CRUD/swipe、`filter/once` Prompt injection、常用 STScript 管线、独立生成与停止、具备 revision CAS 的命名世界书 CRUD/条目操作、global/character/chat 世界书绑定、Lorebook 兼容别名、Tavern Regex 查询/替换/格式化，以及宏、音频、剪贴板、弹窗、lodash/jQuery/toastr 等常见 iframe 依赖。消息删除/旋转只改变兼容投影，不破坏 DSH append-only 事件；生成、绑定和前端 facade 因宿主模型不同按 `degraded` 标注。角色/预设/persona 的完整 CRUD、原生扩展安装和脚本树 UI 等没有可靠 DSH 等价物的能力保持 `unavailable`，不会用成功空值伪装。脚本可通过 `TavernHelper.compatibility` 或同步 `getCompatibility()` 读取精确状态。
 

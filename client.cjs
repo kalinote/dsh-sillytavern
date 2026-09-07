@@ -542,17 +542,25 @@ window.__ModuleLoader__.load({
             const domainSpan = maximum - minimum
             const span = finite(Number(timeline.span)) && Number(timeline.span) > 0 ? Number(timeline.span) : domainSpan
             const tickPortions = domainSpan === 0 ? [0.5] : [0, 0.25, 0.5, 0.75, 1]
-            const ticks = tickPortions.map(portion =>
-              h('span', { key: portion, style: { left: `${portion * 100}%` } }, formatNumber(minimum + (maximum - minimum) * portion)))
+            const ticks = tickPortions.map(portion => {
+              const current = domainSpan === 0 || portion === 1
+              return h('span', {
+                key: portion,
+                className: classes(portion === 0 && 'first', current && 'current'),
+                style: { left: `${portion * 100}%` },
+              }, current ? `当前 ${formatNumber(maximum)}` : formatNumber(minimum + (maximum - minimum) * portion))
+            })
             const bars = list(timeline.intervals).map((interval, index) => {
               const storyTime = timeOf(interval)
               const start = storyTime.start
               const endUnrecorded = storyTime.end == null || text(storyTime.end).trim() === ''
-              const end = endUnrecorded ? start : storyTime.end
-              const point = !endUnrecorded && start === end
-              const marker = point || endUnrecorded
+              // A missing end stays unknown in the data, but is displayed through the
+              // latest known point on its own story timeline so ongoing events read as
+              // intervals instead of easily missed one-pixel markers.
+              const displayEnd = endUnrecorded ? maximum : storyTime.end
+              const point = !endUnrecorded && start === displayEnd
               const left = domainSpan === 0 ? 50 : clamp((start - minimum) / span * 100, 0, 100)
-              const width = marker ? 0 : Math.min(100 - left, Math.max(0, (end - start) / span * 100))
+              const width = point || domainSpan === 0 ? 0 : Math.min(100 - left, Math.max(0, (displayEnd - start) / span * 100))
               const pointTransform = left <= 0 ? 'none' : left >= 100 ? 'translateX(-100%)' : 'translateX(-50%)'
               const eventId = text(interval.eventId)
               const matched = hasQuery && matchedIds.has(eventId)
@@ -572,11 +580,11 @@ window.__ModuleLoader__.load({
                   h('button', {
                     type: 'button',
                     className: classes('dst-explorer-bar', point && 'point', endUnrecorded && 'end-unrecorded', selectedId === eventId && 'selected', hasQuery && !matched && 'search-dim', matched && 'search-match'),
-                    style: marker ? { left: `${left}%`, transform: pointTransform } : { left: `${left}%`, width: `${width}%` },
-                    title: `${barTitle}\n${formatStoryTime(storyTime)}`,
-                    'aria-label': `打开事件 ${eventId}：${formatStoryTime(storyTime)}`,
+                    style: point || width === 0 ? { left: `${left}%`, transform: pointTransform } : { left: `${left}%`, width: `${width}%` },
+                    title: `${barTitle}\n${formatStoryTime(storyTime)}${endUnrecorded ? `\n图示延伸至当前剧情时间 ${formatNumber(maximum)}` : ''}`,
+                    'aria-label': `打开事件 ${eventId}：${formatStoryTime(storyTime)}${endUnrecorded ? `；图示延伸至当前剧情时间 ${formatNumber(maximum)}` : ''}`,
                     onClick: event => onChoose(eventId, event.currentTarget),
-                  }, marker ? null : h('span', null, text(storyTime.label) || `${formatNumber(start)}–${formatNumber(end)}`))))
+                  }, point || width === 0 ? null : h('span', null, text(storyTime.label) || (endUnrecorded ? `${formatNumber(start)}–当前` : `${formatNumber(start)}–${formatNumber(displayEnd)}`)))))
             })
             return h('article', { className: 'dst-explorer-timeline', key: text(timeline.timeline) },
               h('div', { className: 'dst-explorer-timeline-head' },
@@ -610,7 +618,7 @@ window.__ModuleLoader__.load({
             h('header', { className: 'dst-explorer-panel-head' },
               h('div', null,
                 h('h2', { id: 'dst-explorer-gantt-title' }, '剧情时间'),
-                h('p', null, '每条时间线使用独立比例，避免不同纪年互相压缩。')),
+                h('p', null, '每条时间线独立缩放；结束时间未记录的事件延伸至当前剧情时间。')),
               h('span', { className: 'dst-explorer-count' }, `${timelines.length} 条时间线`)),
             timelines.length === 0 && untimed.length === 0
               ? h('div', { className: 'dst-explorer-empty' }, '尚无可显示的剧情时间。')
@@ -1049,7 +1057,7 @@ window.__ModuleLoader__.load({
 
         const css = `
       .dst-explorer-root{box-sizing:border-box;display:flex;min-width:0;height:100%;min-height:0;flex-direction:column;overflow:hidden;background:var(--dsw-alias-bg-base,#f7f8fa);color:var(--dsw-alias-label-primary,#172033);font:14px/1.5 system-ui,sans-serif}.dst-explorer-root *{box-sizing:border-box}.dst-explorer-toolbar{display:flex;flex:0 0 auto;align-items:center;gap:18px;padding:14px 18px;border-bottom:1px solid var(--dsw-alias-border-l2,#dfe3ea);background:var(--dsw-alias-bg-layer-1,#fff)}.dst-explorer-heading{display:flex;min-width:max-content;align-items:baseline;gap:9px}.dst-explorer-heading h1{margin:0;font-size:18px;line-height:1.25}.dst-explorer-kicker{color:var(--dsw-alias-brand-primary,#326fd1);font-size:11px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.dst-explorer-revision,.dst-explorer-muted{color:var(--dsw-alias-label-secondary,#667085);font-size:12px}.dst-explorer-search{display:flex;min-width:240px;max-width:720px;flex:1;align-items:center;gap:6px}.dst-explorer-search label{min-width:0;flex:1}.dst-explorer-search input{width:100%;height:34px;padding:0 11px;border:1px solid var(--dsw-alias-border-l1,#cbd3df);border-radius:9px;background:var(--dsw-alias-bg-base,#fff);color:inherit;font:inherit}.dst-explorer-search output{min-width:70px;color:var(--dsw-alias-label-secondary,#667085);font-size:12px;text-align:center}.dst-explorer-toolbar button,.dst-explorer-zoom button,.dst-explorer-relations button{min-height:32px;border:1px solid var(--dsw-alias-border-l1,#ccd5e3);border-radius:8px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;cursor:pointer;font:inherit}.dst-explorer-toolbar button{padding:0 10px}.dst-explorer-toolbar button:disabled,.dst-explorer-zoom button:disabled{opacity:.45;cursor:not-allowed}.dst-explorer-refresh{color:var(--dsw-alias-brand-primary,#326fd1)!important}.dst-explorer-content{display:grid;min-height:0;flex:1;grid-template-rows:minmax(250px,42%) minmax(320px,1fr) auto;gap:12px;padding:12px;overflow:auto}.dst-explorer-panel{min-width:0;min-height:0;border:1px solid var(--dsw-alias-border-l2,#dfe3ea);border-radius:13px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 3px 14px rgba(15,23,42,.04);overflow:hidden}.dst-explorer-panel-head{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:11px 14px;border-bottom:1px solid var(--dsw-alias-border-l2,#e4e7ec)}.dst-explorer-panel-head h2{margin:0;font-size:15px}.dst-explorer-panel-head p{margin:2px 0 0;color:var(--dsw-alias-label-secondary,#667085);font-size:12px}.dst-explorer-count{padding:2px 8px;border-radius:999px;background:var(--dsw-alias-bg-layer-2,#eef2f7);color:var(--dsw-alias-label-secondary,#667085);font-size:11px}.dst-explorer-gantt{display:flex;flex-direction:column}.dst-explorer-gantt-scroll{min-height:0;flex:1;padding:4px 14px 14px;overflow:auto}.dst-explorer-timeline{min-width:660px;padding:10px 0;border-bottom:1px solid var(--dsw-alias-border-l3,#edf0f4)}.dst-explorer-timeline:last-child{border-bottom:0}.dst-explorer-timeline-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:5px}.dst-explorer-timeline-head>span{color:var(--dsw-alias-label-secondary,#667085);font-size:11px;font-variant-numeric:tabular-nums}.dst-explorer-axis{position:relative;height:24px;margin-left:190px;border-bottom:1px solid var(--dsw-alias-border-l1,#ccd5e3)}.dst-explorer-axis>span{position:absolute;bottom:2px;color:var(--dsw-alias-label-tertiary,#87909f);font-size:10px;transform:translateX(-50%)}.dst-explorer-axis>span::after{position:absolute;top:20px;bottom:-10000px;left:50%;width:1px;background:var(--dsw-alias-border-l3,#edf0f4);content:''}.dst-explorer-bars{position:relative;isolation:isolate}.dst-explorer-bar-row{content-visibility:auto;contain-intrinsic-size:32px;display:grid;grid-template-columns:180px minmax(450px,1fr);align-items:center;gap:10px;min-height:32px}.dst-explorer-event-button{border:0;background:none;color:inherit;cursor:pointer;font:inherit;text-align:left}.dst-explorer-bar-row>.dst-explorer-event-button{min-width:0;padding:3px 6px;border-radius:6px}.dst-explorer-bar-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-explorer-bar-track{position:relative;height:18px;border-radius:5px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-2,#eef2f7) 80%,transparent)}.dst-explorer-bar{position:absolute;top:2px;height:14px;min-width:4px;border-radius:5px;background:var(--dsw-alias-brand-primary,#326fd1);box-shadow:0 1px 3px rgba(36,84,138,.2);overflow:hidden}.dst-explorer-bar>span{display:block;padding:0 5px;overflow:hidden;color:#fff;font-size:10px;line-height:14px;text-overflow:ellipsis;white-space:nowrap}.dst-explorer-bar.selected{outline:3px solid color-mix(in srgb,var(--dsw-alias-brand-primary,#326fd1) 28%,transparent);outline-offset:2px}.dst-explorer-event-button.selected{background:color-mix(in srgb,var(--dsw-alias-brand-primary,#326fd1) 12%,transparent);color:var(--dsw-alias-brand-primary,#24548a)}.dst-explorer-event-button.search-match{box-shadow:inset 0 0 0 2px #f2b84b}.dst-explorer-event-button.search-dim{opacity:.3}.dst-explorer-untimed-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:7px}.dst-explorer-untimed-item{display:flex;min-width:0;align-items:center;gap:8px;padding:7px 9px!important;border:1px solid var(--dsw-alias-border-l2,#dfe3ea)!important;border-radius:8px;background:var(--dsw-alias-bg-base,#fff)!important}.dst-explorer-untimed-item strong{max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-explorer-time-pill{display:inline-flex;width:max-content;max-width:100%;padding:1px 7px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:11px;overflow-wrap:anywhere}.dst-explorer-time-pill.label-only{background:#fff4d6;color:#744d00}.dst-explorer-time-pill.unknown{background:#f1f3f6;color:#667085}.dst-explorer-graph{display:flex;flex-direction:column}.dst-explorer-graph-head{flex:0 0 auto}.dst-explorer-zoom{display:flex;align-items:center;gap:5px}.dst-explorer-zoom button{min-width:32px;padding:0 8px}.dst-explorer-zoom output{min-width:48px;color:var(--dsw-alias-label-secondary,#667085);font-size:11px;text-align:center}.dst-explorer-graph-viewport{position:relative;min-height:280px;flex:1;overflow:hidden;background-color:var(--dsw-alias-bg-base,#f8fafc);background-image:radial-gradient(circle,var(--dsw-alias-border-l1,#d5dbe5) 1px,transparent 1px);background-size:18px 18px;cursor:grab;touch-action:none}.dst-explorer-graph-viewport.dragging{cursor:grabbing}.dst-explorer-graph-viewport:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#326fd1);outline-offset:-2px}.dst-explorer-graph-canvas{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform}.dst-explorer-edges{position:absolute;inset:0;overflow:visible}.dst-explorer-edge{fill:none;stroke:#9aa8ba;stroke-width:2}.dst-explorer-edge.active{stroke:var(--dsw-alias-brand-primary,#326fd1);stroke-width:3}.dst-explorer-arrow{fill:#9aa8ba}.dst-explorer-graph-node{position:absolute!important;padding:0!important;overflow:visible}.dst-explorer-graph-node-position{display:flex;width:100%;height:100%;flex-direction:column;justify-content:center;gap:4px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1,#cbd3df);border-radius:11px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 4px 12px rgba(15,23,42,.09);overflow:hidden}.dst-explorer-graph-node:hover .dst-explorer-graph-node-position,.dst-explorer-graph-node:focus-visible .dst-explorer-graph-node-position{border-color:var(--dsw-alias-brand-primary,#326fd1);box-shadow:0 7px 20px rgba(50,111,209,.18)}.dst-explorer-graph-node.selected .dst-explorer-graph-node-position{border:2px solid var(--dsw-alias-brand-primary,#326fd1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1,#fff) 92%,var(--dsw-alias-brand-primary,#326fd1) 8%)}.dst-explorer-graph-node.search-match .dst-explorer-graph-node-position{box-shadow:0 0 0 3px #f2b84b}.dst-explorer-graph-node.search-dim .dst-explorer-graph-node-position{opacity:.3}.dst-explorer-graph-node-position strong{overflow:hidden;font-size:13px;text-overflow:ellipsis;white-space:nowrap}.dst-explorer-node-summary,.dst-explorer-node-time,.dst-explorer-node-characters{overflow:hidden;color:var(--dsw-alias-label-secondary,#667085);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.dst-explorer-empty,.dst-explorer-loading{display:grid;min-height:160px;place-items:center;padding:24px;color:var(--dsw-alias-label-secondary,#667085);text-align:center}.dst-explorer-error{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 18px;border-bottom:1px solid #f1b8b8;background:#fff0f0;color:#9b1c1c}.dst-explorer-error button{border:0;background:none;color:inherit;text-decoration:underline;cursor:pointer}.dst-explorer-ungrouped{padding:11px 14px;border:1px solid var(--dsw-alias-border-l2,#dfe3ea);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff)}.dst-explorer-ungrouped>summary{cursor:pointer;font-weight:700}.dst-explorer-detail-dialog{position:fixed;inset:0 0 0 auto;width:min(520px,calc(100vw - 32px));height:100dvh;max-width:none;max-height:none;margin:0;padding:0;border:0;border-left:1px solid var(--dsw-alias-border-l1,#cbd3df);background:transparent;color:inherit;box-shadow:-18px 0 50px rgba(15,23,42,.18)}.dst-explorer-detail-dialog::backdrop{background:rgba(15,23,42,.36)}.dst-explorer-detail-card{display:flex;width:100%;height:100%;flex-direction:column;background:var(--dsw-alias-bg-layer-1,#fff)}.dst-explorer-detail-head{display:flex;flex:0 0 auto;align-items:flex-start;justify-content:space-between;gap:12px;padding:18px;border-bottom:1px solid var(--dsw-alias-border-l2,#e4e7ec)}.dst-explorer-detail-head h2{margin:2px 0 0;font-size:20px;overflow-wrap:anywhere}.dst-explorer-detail-head p{margin:4px 0 0;color:var(--dsw-alias-label-secondary,#667085)}.dst-explorer-close{width:36px;height:36px;border:0;border-radius:50%;background:var(--dsw-alias-bg-layer-2,#eef2f7);color:inherit;cursor:pointer;font:24px/1 system-ui}.dst-explorer-detail-body{min-height:0;flex:1;padding:0 18px 28px;overflow:auto}.dst-explorer-detail-section{padding:16px 0;border-bottom:1px solid var(--dsw-alias-border-l3,#edf0f4)}.dst-explorer-detail-section:last-child{border-bottom:0}.dst-explorer-detail-section h3,.dst-explorer-detail-section h4{margin:0 0 9px}.dst-explorer-detail-grid{display:grid;grid-template-columns:110px minmax(0,1fr);gap:7px 12px;margin:0}.dst-explorer-detail-grid dt{color:var(--dsw-alias-label-secondary,#667085);font-size:12px;font-weight:650}.dst-explorer-detail-grid dd{min-width:0;margin:0;overflow-wrap:anywhere}.dst-explorer-relations{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}.dst-explorer-relations li{padding:9px;border:1px solid var(--dsw-alias-border-l2,#dfe3ea);border-radius:9px}.dst-explorer-relations button{height:auto;min-height:0;padding:0;border:0;color:var(--dsw-alias-brand-primary,#326fd1);font-weight:700;text-align:left;overflow-wrap:anywhere}.dst-explorer-relations p{margin:5px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}.dst-explorer-source-list{margin:6px 0 0;padding-left:22px}.dst-explorer-source-list li{padding:2px 0;overflow-wrap:anywhere}.dst-explorer-memory-list{display:flex;flex-direction:column;gap:12px}.dst-explorer-memory-detail{padding:13px;border:1px solid var(--dsw-alias-border-l2,#dfe3ea);border-radius:11px;background:var(--dsw-alias-bg-base,#fafbfc)}.dst-explorer-memory-detail>header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.dst-explorer-memory-detail h3{margin:5px 0 10px;font-size:14px;overflow-wrap:anywhere}.dst-explorer-table-pill{display:inline-block;padding:1px 7px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:10px;font-weight:700}.dst-explorer-importance{flex:none;color:var(--dsw-alias-label-secondary,#667085);font-size:11px}.dst-explorer-json{max-width:100%;max-height:none;margin:0;padding:11px;border-radius:8px;background:#111827;color:#e5e7eb;white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;font:11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.dst-explorer-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:760px){.dst-explorer-toolbar{flex-wrap:wrap;gap:10px}.dst-explorer-heading{width:100%}.dst-explorer-search{min-width:0;order:3;width:100%}.dst-explorer-content{grid-template-rows:minmax(250px,42%) minmax(300px,1fr) auto}.dst-explorer-detail-dialog{width:100vw}.dst-explorer-detail-grid{grid-template-columns:90px minmax(0,1fr)}}@media(prefers-reduced-motion:reduce){.dst-explorer-root *{scroll-behavior:auto!important}}
-      .dst-explorer-panel-head{border-bottom:1px solid var(--dsw-alias-border-l2,#e4e7ec)}.dst-explorer-axis>span::after{content:none}.dst-explorer-bar{min-width:0;padding:0;border:0;color:#fff;cursor:pointer;font:inherit}.dst-explorer-bar.point{top:5px;width:8px;height:8px;border-radius:50%}.dst-explorer-bar.end-unrecorded{top:3px;width:5px;height:12px;border-radius:1px;background:#b66916}.dst-explorer-bar.search-match{box-shadow:0 0 0 3px #f2b84b}.dst-explorer-bar.search-dim{opacity:.3}.dst-explorer-node-id{overflow:hidden;color:var(--dsw-alias-label-tertiary,#87909f);font:10px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.dst-explorer-edge-meta{display:grid;grid-template-columns:82px minmax(0,1fr);gap:3px 8px;margin:8px 0 0;font-size:11px}.dst-explorer-edge-meta dt{color:var(--dsw-alias-label-secondary,#667085);font-weight:650}.dst-explorer-edge-meta dd{min-width:0;margin:0;overflow-wrap:anywhere}.dst-explorer-raw{margin-top:10px}.dst-explorer-raw>summary{color:var(--dsw-alias-brand-primary,#326fd1);cursor:pointer;font-size:12px}.dst-explorer-raw>.dst-explorer-json{margin-top:8px}
+      .dst-explorer-panel-head{border-bottom:1px solid var(--dsw-alias-border-l2,#e4e7ec)}.dst-explorer-timeline{--dst-gantt-label-width:clamp(220px,22vw,340px);min-width:760px}.dst-explorer-axis{margin-left:calc(var(--dst-gantt-label-width) + 10px)}.dst-explorer-axis>span::after{content:none}.dst-explorer-axis>span.first{transform:none}.dst-explorer-axis>span.current{color:#9a5b12;font-weight:700;transform:translateX(-100%)}.dst-explorer-axis>span.current::before{display:inline-block;width:6px;height:6px;margin-right:4px;border-radius:50%;background:#c7771d;content:'';vertical-align:1px}.dst-explorer-bar-row{grid-template-columns:var(--dst-gantt-label-width) minmax(450px,1fr)}.dst-explorer-bar-track{overflow:visible;background:linear-gradient(90deg,color-mix(in srgb,var(--dsw-alias-bg-layer-2,#eef2f7) 82%,transparent),color-mix(in srgb,var(--dsw-alias-bg-layer-2,#eef2f7) 55%,transparent))}.dst-explorer-bar{min-width:0;padding:0;border:0;color:#fff;cursor:pointer;font:inherit}.dst-explorer-bar.point{top:5px;width:8px;height:8px;border-radius:50%}.dst-explorer-bar.end-unrecorded{min-width:5px;border-radius:5px 2px 2px 5px;background:repeating-linear-gradient(135deg,#b66916 0,#b66916 6px,#d9913c 6px,#d9913c 11px)}.dst-explorer-bar.end-unrecorded::after{position:absolute;top:0;right:0;width:3px;height:100%;background:#92500e;content:''}.dst-explorer-bar.search-match{box-shadow:0 0 0 3px #f2b84b}.dst-explorer-bar.search-dim{opacity:.3}.dst-explorer-node-id{overflow:hidden;color:var(--dsw-alias-label-tertiary,#87909f);font:10px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.dst-explorer-edge-meta{display:grid;grid-template-columns:82px minmax(0,1fr);gap:3px 8px;margin:8px 0 0;font-size:11px}.dst-explorer-edge-meta dt{color:var(--dsw-alias-label-secondary,#667085);font-weight:650}.dst-explorer-edge-meta dd{min-width:0;margin:0;overflow-wrap:anywhere}.dst-explorer-raw{margin-top:10px}.dst-explorer-raw>summary{color:var(--dsw-alias-brand-primary,#326fd1);cursor:pointer;font-size:12px}.dst-explorer-raw>.dst-explorer-json{margin-top:8px}
       `
 
         // The public View marker opts into the host's fixed-height layout. Reserve its
@@ -1317,6 +1325,9 @@ self.onmessage = event => {
     const compatRuntime = (() => {
       const sessions = new Map()
       const frames = new Map()
+      const frameCalls = new Map()
+      const lifecycleClientId = `client-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      let frameCallSeq = 0
       let removeWindowListener = null
       let nextRevision = 0
 
@@ -1332,6 +1343,52 @@ self.onmessage = event => {
       }
       const notify = runtime => { for (const listener of runtime.listeners) listener() }
       const post = (registration, message) => registration.getWindow()?.postMessage({ __dshSillyTavern: true, channel: registration.channel, ...message }, '*')
+      const callFrame = (registration, kind, payload = {}) => new Promise((resolve, reject) => {
+        const id = `host-${++frameCallSeq}`
+        const timer = window.setTimeout(() => { frameCalls.delete(id); reject(new Error(`script callback ${kind} timed out`)) }, 10000)
+        frameCalls.set(id, { channel: registration.channel, resolve, reject, timer })
+        post(registration, { event: 'compat-call', payload: { id, kind, ...payload } })
+      })
+      const drainWrites = async runtime => {
+        await runtime.queue
+        if (runtime.writeError) { const error = runtime.writeError; runtime.writeError = null; throw error }
+      }
+      const prepareRuntime = async runtime => {
+        const owners = [...runtime.frames].map(channel => frames.get(channel)).filter(Boolean)
+        await Promise.all(owners.map(owner => callFrame(owner, 'barrier')))
+        await drainWrites(runtime)
+        const results = await Promise.all(owners.map(owner => callFrame(owner, 'filters')))
+        await drainWrites(runtime)
+        return { eligibleInjectionIds: results.flatMap(result => result?.eligibleInjectionIds || []), ownerFrameIds: owners.map(owner => owner.channel) }
+      }
+      const pollLifecycle = async runtime => {
+        if (runtime.frames.size === 0 || runtime.polling) return
+        runtime.polling = true
+        try {
+          const requests = await api(`/compat/lifecycle?sessionId=${encodeURIComponent(runtime.id)}&clientId=${encodeURIComponent(lifecycleClientId)}`)
+          for (const request of requests || []) {
+            let result, error
+            try {
+              if (request.kind === 'prepare') result = await prepareRuntime(runtime)
+              else if (request.kind === 'macros') {
+                let texts = request.payload.texts
+                for (const channel of runtime.frames) {
+                  const owner = frames.get(channel)
+                  if (owner) texts = (await callFrame(owner, 'macros', { texts })).texts
+                }
+                await drainWrites(runtime)
+                result = { texts }
+              }
+              else throw new Error(`unknown lifecycle request ${request.kind}`)
+            } catch (failure) { error = failure?.message || String(failure) }
+            await api('/compat/lifecycle/result', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, clientId: lifecycleClientId, id: request.id, result, error }) })
+          }
+        } catch (error) { console.error('[dsh-sillytavern] lifecycle coordination failed', error) }
+        finally {
+          runtime.polling = false
+          if (runtime.frames.size > 0 && sessions.get(runtime.id) === runtime) runtime.pollTimer = window.setTimeout(() => void pollLifecycle(runtime), 250)
+        }
+      }
       const broadcastState = runtime => {
         if (runtime.snapshot === null) return
         for (const channel of runtime.frames) {
@@ -1344,7 +1401,7 @@ self.onmessage = event => {
         const runtime = sessionFor(sessionId)
         if (token !== undefined && runtime.token === token) return
         runtime.token = token
-        runtime.snapshot = { ...clone(snapshot), runtimeRevision: ++nextRevision }
+        runtime.snapshot = { ...clone(snapshot), activeGenerationIds: [...(runtime.generations || [])], runtimeRevision: ++nextRevision }
         const history = runtime.snapshot.state?.history || []
         runtime.eventSeq = Math.max(runtime.eventSeq, ...history.map(message => Number(message?.seq)).filter(Number.isSafeInteger), -1)
         runtime.cardId = runtime.snapshot.cardRecord?.id ?? null
@@ -1353,6 +1410,13 @@ self.onmessage = event => {
       }
       const patchSnapshot = (runtime, patch) => {
         if (runtime.snapshot === null) return
+        // Variable scopes and their backing resources share the same CAS counter.
+        const revisions = { ...(runtime.snapshot.variableRevisions || {}), ...(patch.variableRevisions || {}) }
+        for (const [field, scope] of [['bindingRevision', 'chat'], ['regexRevision', 'global'], ['chatRevision', 'message']]) {
+          if (Object.hasOwn(patch, field)) revisions[scope] = patch[field]
+          else if (Object.hasOwn(patch.variableRevisions || {}, scope)) patch[field] = revisions[scope]
+        }
+        patch = { ...patch, variableRevisions: revisions }
         runtime.snapshot = { ...runtime.snapshot, ...clone(patch), runtimeRevision: ++nextRevision }
         notify(runtime)
         broadcastState(runtime)
@@ -1454,7 +1518,7 @@ self.onmessage = event => {
             throw error
           }
         })
-        runtime.queue = operation.catch(() => undefined)
+        runtime.queue = operation.catch(error => { runtime.writeError = error })
         return operation
       }
       const persistSessionPatch = (runtime, patch) => {
@@ -1470,7 +1534,7 @@ self.onmessage = event => {
             throw error
           }
         })
-        runtime.queue = operation.catch(() => undefined)
+        runtime.queue = operation.catch(error => { runtime.writeError = error })
         return operation
       }
       const handleAction = async (registration, message) => {
@@ -1538,14 +1602,18 @@ self.onmessage = event => {
           }
           return null
           })
-          runtime.queue = operation.catch(() => undefined)
+          runtime.queue = operation.catch(error => { runtime.writeError = error })
           return operation
         }
         if (message.action === 'worldbook') {
+          const operation = runtime.queue.then(async () => {
           const value = await api('/compat/worldbook', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, ...(args.request || {}) }) })
           const fresh = await api(`/compat/runtime?sessionId=${encodeURIComponent(runtime.id)}`)
           set(runtime.id, fresh)
           return value
+          })
+          runtime.queue = operation.catch(error => { runtime.writeError = error })
+          return operation
         }
         if (message.action === 'replaceRegexes') {
           const operation = runtime.queue.then(async () => {
@@ -1558,15 +1626,25 @@ self.onmessage = event => {
             broadcastEvent(runtime, 'chat_id_changed', [runtime.id])
             return value
           })
-          runtime.queue = operation.catch(() => undefined)
+          runtime.queue = operation.catch(error => { runtime.writeError = error })
           return operation
         }
-        if (message.action === 'flushWrites') return runtime.queue
+        if (message.action === 'flushWrites') return drainWrites(runtime)
         if (message.action === 'event') return api('/event', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, operation: args.operation || {} }) })
-        if (message.action === 'triggerSlash') return api('/compat/slash', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, command: String(args.command || '') }) })
+        if (message.action === 'triggerSlash') {
+          const operation = runtime.queue.then(() => api('/compat/slash', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, command: String(args.command || '') }) }))
+          runtime.queue = operation.catch(error => { runtime.writeError = error })
+          return operation
+        }
         if (message.action === 'generate') {
-          const started = await api('/compat/generation/start', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, mode: args.mode === 'raw' ? 'raw' : 'preset', config: args.config || {} }) })
-          const generationId = String(started.generationId)
+          await drainWrites(runtime)
+          const generationId = String(args.config?.generation_id || `generation-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+          runtime.generations ||= new Set()
+          runtime.generations.add(generationId)
+          patchSnapshot(runtime, { activeGenerationIds: [...runtime.generations] })
+          try {
+          await api('/compat/generation/start', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, mode: args.mode === 'raw' ? 'raw' : 'preset', config: { ...(args.config || {}), generation_id: generationId } }) })
+          set(runtime.id, await api(`/compat/runtime?sessionId=${encodeURIComponent(runtime.id)}`))
           broadcastEvent(runtime, 'js_generation_started', [generationId])
           broadcastEvent(runtime, 'generation_started', ['normal', {}, false])
           let previous = ''
@@ -1588,6 +1666,10 @@ self.onmessage = event => {
             broadcastEvent(runtime, 'generation_ended', [null])
             return Array.isArray(state.toolCalls) && state.toolCalls.length > 0 ? { content: full, tool_calls: state.toolCalls } : full
           }
+          } finally {
+            runtime.generations.delete(generationId)
+            patchSnapshot(runtime, { activeGenerationIds: [...runtime.generations] })
+          }
         }
         if (message.action === 'stopGeneration') return api('/compat/generation/stop', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, generationId: args.generationId }) })
         if (message.action === 'stopAllGeneration') return api('/compat/generation/stop-all', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id }) })
@@ -1603,6 +1685,15 @@ self.onmessage = event => {
         if (!message || message.__dshSillyTavern !== true || typeof message.channel !== 'string') return
         const registration = frames.get(message.channel)
         if (registration === undefined || event.source !== registration.getWindow()) return
+        if (message.event === 'compat-call-result') {
+          const call = frameCalls.get(message.payload?.id)
+          if (!call || call.channel !== registration.channel) return
+          frameCalls.delete(message.payload.id)
+          window.clearTimeout(call.timer)
+          if (message.payload.error) call.reject(new Error(message.payload.error))
+          else call.resolve(message.payload.result)
+          return
+        }
         if (message.event === 'frame-resize') {
           const height = Math.ceil(Number(message.payload?.height))
           if (Number.isFinite(height) && height > 0) registration.onResize?.(height)
@@ -1643,11 +1734,28 @@ self.onmessage = event => {
         setComposer(sessionId, composer) { const runtime = sessionFor(sessionId); runtime.composer = composer; return () => { if (runtime.composer === composer) runtime.composer = null } },
         register(registration) {
           frames.set(registration.channel, registration)
-          sessionFor(registration.sessionId).frames.add(registration.channel)
-          return () => { frames.delete(registration.channel); sessions.get(String(registration.sessionId))?.frames.delete(registration.channel) }
+          const runtime = sessionFor(registration.sessionId)
+          runtime.frames.add(registration.channel)
+          window.clearTimeout(runtime.pollTimer)
+          void pollLifecycle(runtime)
+          return () => {
+            frames.delete(registration.channel)
+            runtime.frames.delete(registration.channel)
+            for (const [id, call] of frameCalls) if (call.channel === registration.channel) { window.clearTimeout(call.timer); frameCalls.delete(id); call.reject(new Error('script callback owner was destroyed')) }
+            if (runtime.frames.size === 0) {
+              window.clearTimeout(runtime.pollTimer)
+              void api('/compat/lifecycle/disconnect', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, clientId: lifecycleClientId }) }).catch(error => console.error(error))
+            }
+          }
         },
         reset() {
           removeWindowListener?.()
+          for (const runtime of sessions.values()) {
+            window.clearTimeout(runtime.pollTimer)
+            if (runtime.frames.size) void api('/compat/lifecycle/disconnect', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, clientId: lifecycleClientId }) }).catch(error => console.error(error))
+          }
+          for (const call of frameCalls.values()) { window.clearTimeout(call.timer); call.reject(new Error('compatibility runtime disposed')) }
+          frameCalls.clear()
           frames.clear()
           sessions.clear()
         },
@@ -2631,7 +2739,11 @@ self.onmessage = event => {
         if (type === 'global') return snapshot.variableScopes?.global ?? snapshot.globalVariables ?? {}
         if (type === 'preset') return maps.presets?.[presetKey()] ?? snapshot.variableScopes?.preset ?? {}
         if (type === 'character') return maps.characters?.[String(snapshot.cardRecord?.id || '')] ?? snapshot.variableScopes?.character ?? {}
-        if (type === 'script') return maps.scripts?.[scriptKey()] ?? snapshot.variableScopes?.script ?? {}
+        if (type === 'script') {
+          if (Object.hasOwn(maps.scripts || {}, scriptKey())) return maps.scripts[scriptKey()]
+          const imported = snapshot.cardRecord?.scripts?.find(script => script.id === metadata?.scriptId)
+          return imported?.data ?? snapshot.variableScopes?.script ?? {}
+        }
         if (type === 'extension') {
           const extensionId = String(option?.extension_id || '')
           if (extensionId === '') throw new TypeError('extension_id is required for extension variables')
@@ -2787,15 +2899,15 @@ self.onmessage = event => {
         return { ...clone(config || {}), __dshEligibleInjectionIds: eligibleInjectionIds }
       }
       const runGeneration = async (mode, config = {}) => {
-        const prepared = await prepareGenerationConfig(config)
+        const images = Array.isArray(config.image) ? config.image : config.image === undefined ? [] : [config.image]
+        if (images.some(image => typeof image !== 'string')) throw new TypeError('File image inputs are unavailable; use an image URL or data URL string')
+        const prepared = clone(config || {})
         const generationId = String(prepared.generation_id || `dsh-generation-${Date.now()}-${Math.random().toString(36).slice(2)}`)
         prepared.generation_id = generationId
         if (activeGenerations.has(generationId)) throw new Error(`generation ${generationId} is already active`)
         activeGenerations.add(generationId)
         try {
           const result = await rpc('generate', { mode, config: prepared }, 5 * 60 * 1000)
-          const onceIds = (snapshot.scriptInjections || []).filter(item => item.once === true && prepared.__dshEligibleInjectionIds.includes(String(item.id))).map(item => String(item.id))
-          if (onceIds.length > 0) uninjectPrompts(onceIds)
           return result
         } finally { activeGenerations.delete(generationId) }
       }
@@ -2803,12 +2915,12 @@ self.onmessage = event => {
       const generateRaw = config => runGeneration('raw', config)
       const stopGenerationById = generationId => {
         const id = String(generationId ?? '')
-        if (!activeGenerations.has(id)) return false
+        if (!activeGenerations.has(id) && !(snapshot.activeGenerationIds || []).includes(id)) return false
         void rpc('stopGeneration', { generationId: id }).catch(reportWriteError)
         return true
       }
       const stopAllGeneration = () => {
-        if (activeGenerations.size === 0) return false
+        if (activeGenerations.size === 0 && (snapshot.activeGenerationIds || []).length === 0) return false
         void rpc('stopAllGeneration').catch(reportWriteError)
         return true
       }
@@ -3331,7 +3443,7 @@ self.onmessage = event => {
       const helper = {
         compatibility: deepFreeze(clone(snapshot.compatibility || {})),
         getCompatibility,
-        getTavernHelperVersion: () => '4.9.3',
+        getTavernHelperVersion: () => '4.9.4',
         getScriptId: () => metadata?.scriptId || channel,
         getVariables, replaceVariables, updateVariablesWith, insertOrAssignVariables, insertVariables, deleteVariable, getAllVariables,
         injectPrompts, uninjectPrompts,
@@ -3343,7 +3455,7 @@ self.onmessage = event => {
         registerMacroLike, unregisterMacroLike, formatAsTavernRegexedString, getTavernRegexes, replaceTavernRegexes, updateTavernRegexesWith, isCharacterTavernRegexesEnabled,
         playAudio, pauseAudio, getAudioList, replaceAudioList, appendAudioList, getAudioSettings, setAudioSettings, getCurrentAudio,
         copyText, callGenericPopup, Popup, POPUP_TYPE, POPUP_RESULT,
-        generate, generateRaw, stopGenerationById, stopAllGeneration, getModelList, getProxyPresetNames: () => (snapshot.state?.templates || []).map(item => String(item.name || item.id)),
+        generate, generateRaw, stopGenerationById, stopAllGeneration, getModelList, getProxyPresetNames: unavailable('getProxyPresetNames', 'DSH proxy presets are not implemented'),
         getState, getCharacterCard,
         setVariables: variables => { replaceVariables(variables); return dsh.flushWrites() },
         event: dsh.event,
@@ -3409,6 +3521,33 @@ self.onmessage = event => {
       root.addEventListener('message', event => {
         const message = event.data
         if (event.source !== root.parent || !message || message.__dshSillyTavern !== true || message.channel !== channel) return
+        if (message.event === 'compat-call') {
+          const request = message.payload || {}
+          void (async () => {
+            let result, error
+            try {
+              if (request.kind === 'barrier') result = await rpc('flushWrites')
+              else if (request.kind === 'filters') {
+                const eligibleInjectionIds = []
+                for (const item of snapshot.scriptInjections || []) {
+                  if (item.ownerFrameId !== channel || item.hasFilter !== true) continue
+                  const filter = injectionFilters.get(String(item.id))
+                  if (typeof filter !== 'function') throw new Error(`injection filter ${item.id} is no longer registered`)
+                  if (await filter()) eligibleInjectionIds.push(String(item.id))
+                }
+                result = { eligibleInjectionIds }
+              } else if (request.kind === 'macros') {
+                result = { texts: request.texts.map(input => {
+                  let text = String(input)
+                  for (const item of macroLikes) text = text.replace(new RegExp(item.regex.source, item.regex.flags), (substring, ...args) => String(item.replace(macroContext({}), substring, ...args)))
+                  return text
+                }) }
+              } else throw new Error(`unknown script callback ${request.kind}`)
+            } catch (failure) { error = failure?.message || String(failure) }
+            root.parent.postMessage({ __dshSillyTavern: true, channel, event: 'compat-call-result', payload: { id: request.id, result, error } }, '*')
+          })()
+          return
+        }
         if (message.replyTo) {
           const item = pending.get(message.replyTo)
           if (!item) return
@@ -3435,7 +3574,7 @@ self.onmessage = event => {
           try { root.parent.postMessage({ __dshSillyTavern: true, channel, id: ++seq, action: 'uninjectPrompts', args: { ids: [...ownedInjectionIds] } }, '*') } catch {}
         }
         if (activeGenerations.size > 0) {
-          try { root.parent.postMessage({ __dshSillyTavern: true, channel, id: ++seq, action: 'stopAllGeneration', args: {} }, '*') } catch {}
+          for (const generationId of activeGenerations) try { root.parent.postMessage({ __dshSillyTavern: true, channel, id: ++seq, action: 'stopGeneration', args: { generationId } }, '*') } catch {}
         }
         injectionFilters.clear(); ownedInjectionIds.clear(); activeGenerations.clear()
         disposed = true
@@ -3628,7 +3767,10 @@ self.onmessage = event => {
         : { id: crypto.randomUUID(), name: 'New Regex', kind: 'regex', enabled: false, approvedHash: null, source: '', findRegex: '', trimStrings: [], placement: [1, 2], markdownOnly: false, promptOnly: false, runOnEdit: false, substituteRegex: 0, minDepth: null, maxDepth: null }))
       return h('div', null,
         h('div', { className: 'dst-section-title' }, '执行脚本'),
-        h('p', { className: 'dst-warning' }, '导入脚本默认启用；已确认的 JavaScript 会作为当前会话的后台脚本自动运行，Regex 在对应文本阶段运行，HTML 可在管理页预览。系统不审查或过滤替换内容与脚本源码，启用前请自行验证。编辑规则、源码或类型后会自动停用。'),
+        h('p', { className: 'dst-warning' }, '标准脚本保留原始启用状态，并遵循所属文件夹的启用状态；已确认的 JavaScript 会作为当前会话的后台脚本自动运行，Regex 在对应文本阶段运行，HTML 可在管理页预览。系统不审查或过滤替换内容与脚本源码，启用前请自行验证。编辑规则、源码或类型后会自动停用。'),
+        record.scriptImportReport ? h('details', { className: 'dst-script-import-report' },
+          h('summary', null, `最近导入：发现 ${record.scriptImportReport.found.length} 项，转换 ${record.scriptImportReport.converted.length} 项，跳过 ${record.scriptImportReport.skipped.length} 项`),
+          h('ul', null, [...record.scriptImportReport.skipped, ...record.scriptImportReport.losses].map((item, index) => h('li', { key: index }, `${item.path}：${item.reason}`)))) : null,
         h('div', { className: 'dst-actions' }, ...[['global', 'Global'], ['preset', 'Preset'], ['scoped', 'Scoped（角色卡）']].map(([id, label]) => h(Button, { key: id, className: `${scopeKind === id ? 'active' : 'secondary'} small`, onClick: () => { setRunningIds(new Set()); setScopeKind(id) } }, label))),
         scripts.map((script, index) => {
           const running = runningIds.has(script.id)

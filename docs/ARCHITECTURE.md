@@ -63,7 +63,7 @@ Host 监听父会话成功的 `turn/end`，先通过 `sessions.flush(session)` �
 
 世界书只在 Prompt 组装阶段执行，不在导入阶段改写；运行时读取独立世界书资源，不读取角色卡内置 `character_book`。默认管理路径由 Session `binding.worldbookId` 指向一套书，角色卡的 `defaultWorldbookId` 仅在 Session 首条真实用户消息时初始化该引用；TavernHelper 绑定另外按工作区全局、当前角色 primary/additional、当前 Session 的顺序合并，重复资源按 ID 去重，组合条目获得带来源 ID 的稳定复合 ID。`constant`、关键词、四种 selective secondary logic、概率、正则、全词匹配与 Order 均由运行时处理。启用 `recursive_scanning` 后，已接纳条目的宏/Regex 最终内容会加入下一轮扫描，支持 per-entry `scan_depth`、`exclude_recursion`、`prevent_recursion` 和 `delay_until_recursion`，并由有界最大步数终止；即使中间没有新 frontier，也会推进到仍待处理的显式延迟层级。候选先按 constant、再按高 Order 进入预算评估；首个普通条目达到预算后不再回填普通条目，但仍可扫描并接纳 `ignore_budget`；最终每个区段按低到高 Order 构建，使高 Order 靠近区段末尾。内容先展开宏并执行 WORLD_INFO Regex，再按模型路由使用与 SillyTavern 同系的 tiktoken、HF tokenizer JSON 或 SentencePiece 计数；预算默认是当前模型真实上下文窗口的 25%，可配置比例与 cap，未知/资源故障才警告并回退字节估算。卡片自己的 `token_budget` 作为附加上限取更小值，缺失表示不额外限制，显式 0 阻止普通条目而不影响 `ignore_budget` 条目。
 
-V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同名字段只作兼容回退；缺省 position 按 After Char 处理。Before/After Character、AN Top/Bottom 和 EM Top/Bottom 分别落到独立 Prompt 锚点；命名 Outlet 只由 `{{outlet::Name}}` 在宏感知模板中消费，并兼容 `outlet_name`、`outletName`、`outlet`；at-depth 内容经 Host 的 `llm/stream` 投影插入当次不可变请求副本，保持指定 system/user/assistant role 与相对历史 depth，不追加 Session 事件。仅当本轮存在 `@depth` 投影时才生成请求绑定 ID，只有携带该私有 marker 的确切系统提示请求可以取得对应投影；没有 `@depth` 条目时系统提示保持原样，避免随机 marker 造成无意义的提示词缓存失效。Host 在重派发/adapter 前移除 marker，路由不一致则跳过并告警。未知 position 与空名称 Outlet 均跳过并告警，未知 decorator/content 原样保留。最近一次成功组装的活动条目、预算和警告保存在 Host 的会话级弱引用诊断快照，通过 `/session` 显示，但不写入 Session 事件，也不返回 Prompt 或扫描原文。扫描文本/深度、角色卡输入和最终 Prompt 仍受各自的通用数据预算约束；在这些通用边界内，世界书正则直接使用原生 JavaScript RegExp，不再施加正则专用长度上限，也不限制分组、交替、量词、前后查找、反向引用或 flags，不设置执行 deadline，数据与执行安全性由用户负责。EJS 模板在独立 resource-limited Worker 的禁用字符串代码生成 VM 中执行，50 ms VM timeout + 500 ms Worker deadline 后强制终止；本轮 AbortSignal 会立即 terminate Worker 并停止后续模板。模板只收到受预算的最小 scope。
+V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同名字段只作兼容回退；缺省 position 按 After Char 处理。Before/After Character、AN Top/Bottom 和 EM Top/Bottom 分别落到独立 Prompt 锚点；命名 Outlet 只由 `{{outlet::Name}}` 在宏感知模板中消费，并兼容 `outlet_name`、`outletName`、`outlet`；at-depth 内容经 Host 的 `llm/stream` 投影插入当次不可变请求副本，保持指定 system/user/assistant role 与相对历史 depth，不追加 Session 事件。本轮存在 `@depth` 投影或原生消息账本时生成请求绑定 ID，只有携带该私有 marker 的确切系统提示请求可以取得对应不可变投影；两者均不存在时系统提示保持原样。Host 在重派发/adapter 前移除 marker，路由不一致则跳过并告警。未知 position 与空名称 Outlet 均跳过并告警，未知 decorator/content 原样保留。最近一次成功组装的活动条目、预算和警告保存在 Host 的会话级弱引用诊断快照，通过 `/session` 显示，但不写入 Session 事件，也不返回 Prompt 或扫描原文。扫描文本/深度、角色卡输入和最终 Prompt 仍受各自的通用数据预算约束；在这些通用边界内，世界书正则直接使用原生 JavaScript RegExp，不再施加正则专用长度上限，也不限制分组、交替、量词、前后查找、反向引用或 flags，不设置执行 deadline，数据与执行安全性由用户负责。EJS 模板在独立 resource-limited Worker 的禁用字符串代码生成 VM 中执行，50 ms VM timeout + 500 ms Worker deadline 后强制终止；本轮 AbortSignal 会立即 terminate Worker 并停止后续模板。模板只收到受预算的最小 scope。
 
 ### 剧情开始时间写入约束
 
@@ -81,7 +81,7 @@ V3 定位优先读取 `extensions.position/depth/role/ignore_budget`，顶层同
 
 Client 的 `src/client/event-explorer-source.cjs` 是符合标准 HookSource 契约的共享数据源：首个订阅启动顺序轮询、revision 未变保持 snapshot 引用、最后一个订阅卸载时取消定时器和请求并释放文档，页面可见性控制后续轮询；错误保留上次成功数据。每个 session 的源相互独立，不会混入迟到的跨会话响应。
 
-`src/client/event-explorer-model.cjs` 按 `eventId` 构建索引并聚合 rows，保留每条独立 storyTime，按 timeline 分组；未分组 rows 单列。图布局根据已保存的 `precedes` 作拓扑分层，独立连通分量分开排布，不推断新关系，不按召回条件或搜索结果删除节点。`src/client/event-explorer-ui.cjs` 使用 React + HTML/SVG 渲染：顶部独立时间轴甘特图、主区域可平移缩放的关系图、右侧原生 dialog 详情；搜索仅高亮和定位。模型与布局通过 memo 按文档引用缓存。
+`src/client/event-explorer-model.cjs` 按 `eventId` 构建索引并聚合 rows，保留每条独立 storyTime，按 timeline 分组；未分组 rows 单列。图布局根据已保存的 `precedes` 作拓扑分层，独立连通分量分开排布，不推断新关系，不按召回条件或搜索结果删除节点。`src/client/event-explorer-ui.cjs` 使用 React + HTML/SVG 渲染：顶部独立时间轴甘特图、主区域可平移缩放的关系图、右侧原生 dialog 详情；搜索仅高亮和定位。结束时间为 null 的记录只在甘特图中延伸至同 timeline 的最新已知剧情时间，并以开放态样式区分；持久化值、查询区间语义和详情仍保留 null，不推断或写回结束时间。模型与布局通过 memo 按文档引用缓存。
 
 这三个 CJS 模块由 `pnpm run build:events` 内联进 `client.cjs` 的标记区，浏览器无新增包加载依赖。`pnpm run check` 先核对生成内容与源文件一致，再执行语法检查和回归测试；修改 UI 后需要重新生成 bundle，并重启 DSH 应用更新。
 
@@ -122,7 +122,7 @@ Host 的 `agent/pre-step` 在原生 UserMessage 入日志前执行原始 User In
 
 ## TavernHelper 阶段 0–5 契约
 
-兼容目标固定为 TavernHelper 4.9.3 commit `e559c5a13f6337b2ac1a1086c69587793beb3823` 与 SillyTavern 1.18.0 release commit `8172dcd0ee672d3cd9a5e5f7af134f91a45cd2b8`。`src/compatibility.js` 是机器可读能力清单和 Host snapshot normalizer；`GET /compatibility` 返回构建能力，`GET /compat/runtime` 返回当前 Session 的完整首屏快照。空白 Session 使用与 `/greeting` 相同的工作区候选角色，不会因尚未提交 binding 而给开场脚本返回空卡。
+兼容目标固定为 TavernHelper 4.9.4 commit `8c1f159388e216b52bff0e0995f371a8c9861bca` 与 SillyTavern 1.18.0 release commit `8172dcd0ee672d3cd9a5e5f7af134f91a45cd2b8`。ST-Prompt-Template 的核心模板语义以 1.17.9 为对照，尚未覆盖完整生命周期。`src/compatibility.js` 是机器可读能力清单和 Host snapshot normalizer；`GET /compatibility` 返回构建能力，`GET /compat/runtime` 返回当前 Session 的完整首屏快照。空白 Session 使用与 `/greeting` 相同的工作区候选角色，不会因尚未提交 binding 而给开场脚本返回空卡。
 
 Client 的 `compatRuntime` 按 Session 保存一份可见快照、串行写入队列、composer bridge、frame 注册表与订阅者；整个 Bundle 只注册一个父窗口 `message` listener，并继续校验 channel 和 `event.source`。iframe 首次挂载分为注册 transport 与加载 `srcDoc` 两步，确保角色脚本第一行执行前已经获得内联 snapshot；后续更新以 `runtimeRevision` 推送，旧 revision 被忽略，不把 revision 加入 `srcDoc` 依赖，因而状态变化不会重载并重复执行角色脚本。
 
@@ -140,6 +140,12 @@ Client 的 `compatRuntime` 按 Session 保存一份可见快照、串行写入�
 能力清单把 API 分为 `exact/emulated/degraded/unavailable`。`degraded` 代表契约可用但受 DSH 宿主边界影响，例如非当前角色世界书绑定、原生弹窗样式、浏览器自动播放或 SillyTavern 私有生成参数；`unavailable` 用于角色/预设/persona 完整 CRUD、扩展安装、脚本树 UI 等没有可靠宿主等价物的能力。兼容层已经占用的不可用入口会显式抛出 `CompatibilityUnavailableError`，其余未投影的上游专用入口保持不存在；两种情况都不会用成功空值掩盖能力缺失。
 
 ## 生命周期
+
+0.10.0 的生成准备由 `src/compat-lifecycle.js` 协调：Host 通过 `/compat/lifecycle` 向活跃浏览器发出 prepare 请求；父 Client 让所有 iframe 完成写入屏障，执行注入 owner 的 filter，并排空持久化队列。Host 再固定 Prompt 状态与消息投影、执行 EJS、请求 owner 宏、复核模板状态 revision 并提交，最后消费一次性注入。`/compat/lifecycle/result` 返回结果，`/compat/lifecycle/disconnect` 释放所有者；超时、错误和取消均会结束对应准备请求。变量作用域与其背后的 binding/regex/chat 资源共用 CAS revision，Client 同步更新两种视图。
+
+`src/template-runtime.js` 为一次 Prompt 组装创建一个可取消 Worker，`src/template-worker.cjs` 使用 EJS 3.1.10 编译异步函数。模板、角色字段和激活世界书共享定义及缓存，返回 text/mutations/injections/diagnostics/baseRevisions。同步 VM 调用保留 50 ms 超时，异步工作由 Worker deadline 负责终止；VM 与 Node 使用可正常衔接的 Promise 队列，支持异步嵌套 include 和 Host 适配器。`commitTemplateResult` 统一锁定涉及的文件并先检查所有 revision，普通写入失败回滚，尚未实现进程崩溃后的跨文件事务恢复。具体支持范围和依赖见 [0.10.0 兼容性说明](COMPATIBILITY-0.10.md)。
+
+`src/compat-chat-projection.js` 以账本 ID/原生来源序号构建最终请求副本，保留非文本块及相关工具结果。本轮存在深度条目或原生消息账本时，Host 都会绑定请求快照并在 adapter 前去除 marker。独立生成由 `src/compat-prompt-builder.js` 按参数组装，broker 请求带有内部身份，不再经过原生账本二次投影。
 
 - Host 启动先通过 `agentPresets.copy()` 探测部署的可写用户根，再以隐藏 staging 目录原子安装包内 `sillytavern` 预设。不能在同一 Host Fiber 的 `apply()` 返回前调用 `standingKeyFor()`：该阶段 `sillyTavern` Service 尚未完成激活；预设由 DSH 在正常选择/创建会话路径中挂载。托管 fingerprint 只允许升级未被用户修改的副本。
 - Host route、Service、Prompt、Tool、Command、Slot 和样式均由 Cordis fiber/effect 所有。

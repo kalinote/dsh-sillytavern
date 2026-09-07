@@ -11,9 +11,12 @@ import { countModelTokens } from './src/tokenizer.js'
 import { buildCompatibilitySnapshot, compatibilityManifest } from './src/compatibility.js'
 import { execute as executeCompatSlash, registry as compatSlashRegistry } from './src/compat-slash.js'
 import { CompatibilityGenerationBroker } from './src/compat-generation.js'
+import { projectCompatibilityChat } from './src/compat-chat-projection.js'
+import { CompatibilityLifecycle } from './src/compat-lifecycle.js'
+import { buildCompatibilityGenerationOptions, compatibilityPromptState } from './src/compat-prompt-builder.js'
 
 export const name = 'dsh-sillytavern'
-export const VERSION = '0.9.0'
+export const VERSION = '0.10.0'
 export const inject = ['agents', 'agentPresets', 'llm', 'sessions', 'subagents']
 
 const REQUEST_BINDING_PATTERN = /<!-- dsh-sillytavern-request:([0-9a-f-]{36}) -->/gi
@@ -37,56 +40,16 @@ function contentText(content) {
   return content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n')
 }
 
-function projectCompatibilityChat(options, agent, projection) {
-  if (!Array.isArray(options?.messages) || !Array.isArray(projection?.messages)) return options
-  const idBySeq = new Map()
-  for (const event of sessionEvents(agent.session)) {
-    const message = event?.type === 'user/message' ? event.data : event?.type === 'assistant/message' ? event.data?.message : null
-    if (message && typeof message.id === 'string') idBySeq.set(event.seq, message.id)
-  }
-  const overlayById = new Map()
-  const syntheticBefore = new Map()
-  const syntheticAfter = []
-  let pendingSynthetic = []
-  for (const item of projection.messages) {
-    const id = idBySeq.get(item.sourceSeq)
-    if (id === undefined) pendingSynthetic.push(item)
-    else {
-      overlayById.set(id, item)
-      if (pendingSynthetic.length > 0) syntheticBefore.set(id, pendingSynthetic.splice(0))
-    }
-  }
-  syntheticAfter.push(...pendingSynthetic)
-  const asMessage = item => ({
-    id: `dsh-sillytavern-compat-${item.uid ?? randomUUID()}`,
-    role: item.role,
-    content: [{ type: 'text', text: String(item.message ?? '') }],
-    source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'compatibility-message' },
-  })
-  const messages = options.messages.flatMap(message => {
-    const overlay = overlayById.get(message?.id)
-    if (overlay === undefined) return [message]
-    const before = (syntheticBefore.get(message.id) ?? []).filter(item => item.is_hidden !== true).map(asMessage)
-    if (overlay.is_hidden === true) return before
-    return [...before, { ...message, role: overlay.role, content: [{ type: 'text', text: String(overlay.message ?? '') }] }]
-  })
-  const existingText = new Set(messages.map(message => `${message.role}\u0000${contentText(message.content)}`))
-  for (const item of syntheticAfter) {
-    if (item.is_hidden === true) continue
-    const key = `${item.role}\u0000${String(item.message ?? '')}`
-    if (existingText.has(key)) continue
-    messages.push(asMessage(item))
-  }
-  return { ...options, messages }
-}
-
 export async function apply(ctx, config = {}) {
   const presetInstall = config.autoInstallPreset === false
     ? { status: 'disabled', presetId: 'sillytavern', version: VERSION }
     : await installBundledPreset(ctx.agentPresets, { version: VERSION })
   const store = new SillyTavernStore(config)
   await store.ready
-  const generationBroker = new CompatibilityGenerationBroker(options => ctx.llm.stream(options), {
+  const lifecycle = new CompatibilityLifecycle()
+  const compatibilityRequests = new WeakSet()
+  const preparingGenerations = new Map()
+  const generationBroker = new CompatibilityGenerationBroker(options => { compatibilityRequests.add(options); return ctx.llm.stream(options) }, {
     maxResults: config.compatibilityGenerationResults ?? 100,
     ttlMs: config.compatibilityGenerationTtlMs ?? 5 * 60 * 1000,
   })
@@ -126,6 +89,9 @@ export async function apply(ctx, config = {}) {
   }
   ctx.effect(() => async () => {
     active = false
+    lifecycle.dispose()
+    for (const pending of preparingGenerations.values()) pending.controller.abort(new Error('plugin disposed'))
+    preparingGenerations.clear()
     generationBroker.stopAll()
     await eventMaintenance.dispose()
   })
@@ -154,6 +120,8 @@ export async function apply(ctx, config = {}) {
     eligible,
     ensure,
     async promptFor(agent, signal, route = {}) {
+      const preparedClients = await lifecycle.request(agent.id, 'prepare', {}, signal)
+      await store.waitCompatibilityWrites(agent, signal)
       const diagnosticGeneration = (worldbookDiagnosticSequences.get(agent) ?? 0) + 1
       worldbookDiagnosticSequences.set(agent, diagnosticGeneration)
       await ensure(agent, signal)
@@ -192,10 +160,13 @@ export async function apply(ctx, config = {}) {
           console.warn(`[dsh-sillytavern] could not read event maintenance fallback; story generation will continue: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
-      const promptState = store.promptState(agent)
+      const promptState = compatibilityPromptState(structuredClone(store.promptState(agent)), route.promptOverrides)
+      const compatProjection = structuredClone(store.compatChatProjection(agent))
       const lorebookSettings = promptState?.lorebookSettings ?? {}
-      const eligibleInjectionIds = new Set(Array.isArray(route.eligibleInjectionIds) ? route.eligibleInjectionIds.map(String) : [])
-      const injections = (promptState?.binding?.scriptInjections ?? []).filter(item => item.hasFilter !== true || eligibleInjectionIds.has(String(item.id)))
+      const eligibleInjectionIds = new Set(preparedClients.flatMap(result => result?.eligibleInjectionIds ?? []).map(String))
+      const missingOwners = (promptState?.binding?.scriptInjections ?? []).filter(item => item.hasFilter === true && !preparedClients.some(result => result?.ownerFrameIds?.includes(item.ownerFrameId)))
+      if (missingOwners.length) throw new Error(`prompt injection callback owner is unavailable: ${missingOwners.map(item => item.id).join(', ')}`)
+      const injections = [...(promptState?.binding?.scriptInjections ?? []).filter(item => item.hasFilter !== true || eligibleInjectionIds.has(String(item.id))), ...(Array.isArray(route.generationInjections) ? route.generationInjections : [])]
       const prompt = await assembleSillyTavernPrompt(agent, promptState, signal, {
         compactedSeqs,
         pendingEventFallback,
@@ -205,8 +176,30 @@ export async function apply(ctx, config = {}) {
         scanDepth: lorebookSettings.scan_depth,
         fallbackTokenBudget: config.worldInfoFallbackTokenBudget ?? 2048,
         injections,
+        promptOverrides: route.promptOverrides,
         countTokens: text => countModelTokens(provider, model, text, signal),
       })
+      const templateErrors = (prompt.template?.diagnostics ?? []).filter(item => item.severity === 'error')
+      if (templateErrors.length) {
+        const error = new Error(templateErrors.map(item => `${item.source}: ${item.message}`).join('\n'))
+        error.code = 'template-evaluation-failed'
+        error.details = { diagnostics: templateErrors }
+        throw error
+      }
+      const namedKeys = Object.keys(prompt.renderedNamedPrompts ?? {})
+      const depthCount = (prompt.worldbookDepthEntries ?? []).length
+      let texts = [prompt.system, ...(prompt.worldbookDepthEntries ?? []).map(entry => entry.content), ...namedKeys.map(key => prompt.renderedNamedPrompts[key])]
+      for (const clientId of lifecycle.clients(agent.id)) {
+        const [result] = await lifecycle.request(agent.id, 'macros', { texts }, signal, [clientId])
+        texts = result.texts
+      }
+      prompt.system = texts[0]
+      prompt.worldbookDepthEntries = (prompt.worldbookDepthEntries ?? []).map((entry, index) => ({ ...entry, content: texts[index + 1] }))
+      for (let index = 0; index < namedKeys.length; index += 1) prompt.renderedNamedPrompts[namedKeys[index]] = texts[1 + depthCount + index]
+      if (prompt.template) await store.commitTemplateResult(agent, prompt.template, signal)
+      const onceIds = injections.filter(item => item.once === true).map(item => String(item.id))
+      if (onceIds.length) await store.consumeOnceInjections(agent, onceIds, store.sessionView(agent).binding.revision, signal)
+      prompt.compatProjection = compatProjection
       if (diagnosticGeneration > (worldbookDiagnosticSuccesses.get(agent) ?? 0)) {
         const budget = prompt.worldbookBudget ?? {}
         worldbookDiagnosticSuccesses.set(agent, diagnosticGeneration)
@@ -226,7 +219,7 @@ export async function apply(ctx, config = {}) {
       return prompt
     },
     bindPromptToRequest(agent, prompt, route = {}) {
-      if (!Array.isArray(prompt.worldbookDepthEntries) || prompt.worldbookDepthEntries.length === 0) return prompt.system
+      if ((!Array.isArray(prompt.worldbookDepthEntries) || prompt.worldbookDepthEntries.length === 0) && !(prompt.compatProjection?.seenSourceSeqs?.length > 0)) return prompt.system
       const id = randomUUID()
       let bindings = requestBindings.get(agent)
       if (bindings === undefined) {
@@ -292,13 +285,16 @@ export async function apply(ctx, config = {}) {
   ctx.on('llm/stream', (options, next) => {
     const agent = ctx.agents.currentInitiator()
     if (agent === undefined || !eligible(agent)) return next()
+    if (compatibilityRequests.has(options)) return next()
     const state = store.promptState(agent)
     if (state === undefined) return next()
     const history = sessionMessages(agent)
     if (regexRequests.has(options)) return transformRawAssistantStream(next(), state, history)
     const marker = stripRequestBinding(options.system)
     let depthProjected = marker.system === options.system ? options : { ...options, system: marker.system }
-    depthProjected = projectCompatibilityChat(depthProjected, agent, store.compatChatProjection(agent))
+    const preparedBinding = marker.id === undefined ? undefined : requestBindings.get(agent)?.get(marker.id)
+    const chatProjection = preparedBinding?.provider === options.provider && preparedBinding?.model === options.model ? preparedBinding.prompt.compatProjection : undefined
+    depthProjected = projectCompatibilityChat(depthProjected, sessionEvents(agent.session), chatProjection ?? store.compatChatProjection(agent))
     if (marker.id !== undefined) {
       const prepared = requestBindings.get(agent)?.get(marker.id)
       if (prepared === undefined) {
@@ -562,68 +558,16 @@ export async function apply(ctx, config = {}) {
   }
 
   const compatibilityGenerationOptions = async (agent, mode, generationConfig, signal) => {
-    const request = generationConfig && typeof generationConfig === 'object' && !Array.isArray(generationConfig) ? generationConfig : {}
-    const custom = request.custom_api && typeof request.custom_api === 'object' ? request.custom_api : {}
-    if (typeof custom.apiurl === 'string' && custom.apiurl.trim() !== '') {
-      const error = new Error('custom_api.apiurl is unavailable in DSH compatibility mode; configure a DSH provider and select it by source/model')
-      error.code = 'generation-custom-api-unavailable'
-      throw error
-    }
-    await store.refreshCompatChat(agent, signal)
-    const state = store.promptState(agent)
-    if (state === undefined) throw new Error('current session has no selected character')
-    const provider = String(custom.source ?? agent.options?.provider ?? '').trim()
-    const model = String(custom.model ?? agent.options?.model ?? '').trim()
-    if (provider === '' || model === '') throw new Error('generation requires a configured provider and model')
-    const prepared = await service.promptFor(agent, signal, { provider, model, eligibleInjectionIds: request.__dshEligibleInjectionIds })
-    const historyLimit = request.max_chat_history === 'all' || request.max_chat_history === undefined
-      ? Number.MAX_SAFE_INTEGER
-      : Math.max(0, Math.trunc(Number(request.max_chat_history) || 0))
-    const history = store.compatChatProjection(agent).messages.filter(item => item.is_hidden !== true).slice(-historyLimit).map(item => ({
-      id: `dsh-sillytavern-generate-${item.uid ?? item.message_id}`,
-      role: item.role,
-      content: [{ type: 'text', text: String(item.message ?? '') }],
-      source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'compatibility-generation-history' },
-    }))
-    const userInput = String(request.user_input ?? '')
-    const imageValues = Array.isArray(request.image) ? request.image : request.image === undefined ? [] : [request.image]
-    const userBlocks = [...(userInput === '' ? [] : [{ type: 'text', text: userInput }]), ...imageValues.filter(value => typeof value === 'string').map(value => ({ type: 'image', url: value }))]
-    const card = state.record.card.data
-    const persona = state.binding.userPersona
-    const named = {
-      world_info_before: request.overrides?.world_info_before,
-      persona_description: request.overrides?.persona_description ?? persona.description,
-      char_description: request.overrides?.char_description ?? card.description,
-      char_personality: request.overrides?.char_personality ?? card.personality,
-      scenario: request.overrides?.scenario ?? card.scenario,
-      world_info_after: request.overrides?.world_info_after,
-      dialogue_examples: request.overrides?.dialogue_examples ?? card.mes_example,
-    }
-    let messages = history
-    let system = prepared.system
-    if (mode === 'raw' && Array.isArray(request.ordered_prompts)) {
-      messages = []
-      const systemParts = []
-      for (const item of request.ordered_prompts) {
-        if (typeof item === 'string') {
-          if (item === 'chat_history') messages.push(...(request.overrides?.chat_history?.prompts ?? history).map((entry, index) => entry?.content ? { id: `raw-history-${index}`, role: entry.role, content: [{ type: 'text', text: String(entry.content) }], source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'raw-history' } } : entry))
-          else if (item === 'user_input' && userBlocks.length > 0) messages.push({ id: `raw-user-${randomUUID()}`, role: 'user', content: userBlocks, source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'raw-user-input' } })
-          else if (named[item] !== undefined && String(named[item]).trim() !== '') systemParts.push(String(named[item]))
-        } else if (item && typeof item === 'object' && ['system', 'assistant', 'user'].includes(item.role)) messages.push({ id: `raw-role-${randomUUID()}`, role: item.role, content: [{ type: 'text', text: String(item.content ?? '') }], source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'raw-role-prompt' } })
-      }
-      system = systemParts.join('\n\n')
-    } else if (userBlocks.length > 0) messages.push({ id: `generate-user-${randomUUID()}`, role: 'user', content: userBlocks, source: { kind: 'plugin', plugin: 'dsh-sillytavern', form: 'generation-user-input' } })
-    messages = injectWorldbookDepthMessages({ messages }, prepared.worldbookDepthEntries, randomUUID).messages
-    const result = { provider, model, system, messages }
-    if (request.tools !== undefined) result.tools = request.tools
-    if (request.tool_choice !== undefined) result.toolChoice = request.tool_choice
-    if (request.json_schema !== undefined) result.jsonSchema = request.json_schema
-    for (const [from, to] of [['temperature', 'temperature'], ['top_p', 'topP'], ['top_k', 'topK'], ['frequency_penalty', 'frequencyPenalty'], ['presence_penalty', 'presencePenalty']]) {
-      const value = custom[from]
-      if (typeof value === 'number' && Number.isFinite(value)) result[to] = value
-    }
-    if (typeof custom.max_tokens === 'number' && Number.isFinite(custom.max_tokens)) result.maxTokens = Math.max(1, Math.trunc(custom.max_tokens))
-    return result
+    return buildCompatibilityGenerationOptions({
+      agent,
+      mode,
+      generationConfig,
+      signal,
+      store,
+      service,
+      injectDepthMessages: injectWorldbookDepthMessages,
+      createId: randomUUID,
+    })
   }
 
   const handler = async (req, res) => {
@@ -637,6 +581,11 @@ export async function apply(ctx, config = {}) {
       }
       if (req.method === 'GET' && route === '/compatibility') {
         sendJson(res, 200, { ok: true, value: compatibilityManifest() })
+        return
+      }
+      if (req.method === 'GET' && route === '/compat/lifecycle') {
+        const agent = await agentFor(url.searchParams.get('sessionId'), false)
+        sendJson(res, 200, { ok: true, value: lifecycle.poll(agent.id, String(url.searchParams.get('clientId'))) })
         return
       }
       if (req.method === 'GET' && route === '/library') {
@@ -738,6 +687,14 @@ export async function apply(ctx, config = {}) {
         return
       }
       const body = await readJsonBody(req)
+      if (route === '/compat/lifecycle/result' || route === '/compat/lifecycle/disconnect') {
+        const agent = await agentFor(body.sessionId, false)
+        const value = route.endsWith('/disconnect')
+          ? lifecycle.disconnect(agent.id, String(body.clientId))
+          : lifecycle.complete(agent.id, String(body.clientId), String(body.id), body.result, body.error)
+        sendJson(res, 200, { ok: true, value: value ?? null })
+        return
+      }
       if (route === '/regex-sources') {
         const agent = await agentFor(body.sessionId)
         sendJson(res, 200, { ok: true, value: await store.saveRegexSources({ ...(Object.hasOwn(body, 'global') ? { global: body.global } : {}), ...(Object.hasOwn(body, 'preset') ? { preset: body.preset } : {}), ...(Object.hasOwn(body, 'variables') ? { variables: body.variables } : {}) }, undefined, agent) })
@@ -875,8 +832,15 @@ export async function apply(ctx, config = {}) {
       }
       if (route === '/compat/generation/start') {
         const agent = await agentFor(body.sessionId)
-        const options = await compatibilityGenerationOptions(agent, body.mode === 'raw' ? 'raw' : 'preset', body.config ?? {})
-        const started = generationBroker.start({ sessionId: agent.id, generationId: body.config?.generation_id, options })
+        const generationId = String(body.config?.generation_id || randomUUID())
+        if (preparingGenerations.has(generationId) || generationBroker.get(generationId)?.active) throw new Error(`generation ${generationId} is already active`)
+        const controller = new AbortController()
+        preparingGenerations.set(generationId, { sessionId: String(agent.id), controller })
+        let options
+        try { options = await compatibilityGenerationOptions(agent, body.mode === 'raw' ? 'raw' : 'preset', body.config ?? {}, controller.signal); controller.signal.throwIfAborted() }
+        finally { preparingGenerations.delete(generationId) }
+        compatibilityRequests.add(options)
+        const started = generationBroker.start({ sessionId: agent.id, generationId, options })
         void started.done.catch(() => undefined)
         sendJson(res, 202, { ok: true, value: { generationId: started.generationId } })
         return
@@ -884,13 +848,16 @@ export async function apply(ctx, config = {}) {
       if (route === '/compat/generation/stop') {
         const agent = await agentFor(body.sessionId, false)
         const current = generationBroker.get(body.generationId)
-        const stopped = current?.sessionId === String(agent.id) && generationBroker.stopById(body.generationId)
+        let stopped = current?.sessionId === String(agent.id) && generationBroker.stopById(body.generationId)
+        const preparing = preparingGenerations.get(String(body.generationId))
+        if (preparing?.sessionId === String(agent.id)) { preparing.controller.abort(new Error('generation stopped during preparation')); stopped = true }
         sendJson(res, 200, { ok: true, value: stopped === true })
         return
       }
       if (route === '/compat/generation/stop-all') {
         const agent = await agentFor(body.sessionId, false)
         let stopped = false
+        for (const pending of preparingGenerations.values()) if (pending.sessionId === String(agent.id)) { pending.controller.abort(new Error('generation stopped during preparation')); stopped = true }
         for (const item of generationBroker.list({ sessionId: agent.id, activeOnly: true })) stopped = generationBroker.stopById(item.generationId) || stopped
         sendJson(res, 200, { ok: true, value: stopped })
         return
@@ -1014,6 +981,9 @@ export async function apply(ctx, config = {}) {
     if (agent !== undefined) return recoverAgent(agent, 'preset selection')
   })
   ctx.on('agent/disposed', ({ agent }) => {
+    lifecycle.dispose(agent.id)
+    for (const pending of preparingGenerations.values()) if (pending.sessionId === String(agent.id)) pending.controller.abort(new Error('session disposed'))
+    for (const generation of generationBroker.list({ sessionId: agent.id, activeOnly: true })) generationBroker.stopById(generation.generationId)
     openingSelections.delete(String(agent.session.id))
     pendingOpenings.delete(String(agent.session.id))
     eventMaintenance.stopAgent(agent)

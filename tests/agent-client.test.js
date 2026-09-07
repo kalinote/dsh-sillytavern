@@ -109,9 +109,9 @@ test('agent face registers validated tools and loads session state inside prompt
   await assert.rejects(tools[0].execute({}, { agent: child, signal: controller.signal }), /unavailable outside/)
 })
 
-test('0.9.0 manifest targets the DSH 0.1.2 Client dependency graph', async () => {
+test('0.10.0 manifest targets the DSH 0.1.2 Client dependency graph', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(manifest.version, '0.9.0')
+  assert.equal(manifest.version, '0.10.0')
   assert.equal(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-chat'), true)
   assert.equal(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-runtime'), false)
   assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-client-ui-chat'], '^0.1.2-alpha.1')
@@ -181,7 +181,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     const swipeId = JSON.parse(options.body).swipeId
     return { ok: true, status: 200, async json() { return { ok: true, value: { swipeId } } } }
   }
-  globalThis.window = { __ModuleLoader__: { load(value) { definition = value } } }
+  globalThis.window = { setTimeout, clearTimeout, __ModuleLoader__: { load(value) { definition = value } } }
   try {
     await import(new URL(`../client.cjs?test=${Date.now()}`, import.meta.url).href)
     assert.equal(definition.id, 'dsh-sillytavern')
@@ -629,7 +629,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(nextRunningIds.size, 0)
     assert.equal(nextScopeKind, 'global')
     assert.match(scriptsTabSource, /'执行脚本'/)
-    assert.match(scriptsTabSource, /导入脚本默认启用/)
+    assert.match(scriptsTabSource, /标准脚本保留原始启用状态/)
     assert.equal(scriptsTabSource.includes('酒馆助手'), false)
     assert.equal(scriptsTabSource.includes('TavernHelper'), false)
     assert.equal(scriptsTabSource.includes('导入脚本默认禁用'), false)

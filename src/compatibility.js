@@ -1,4 +1,4 @@
-const TAVERN_HELPER_REVISION = 'e559c5a13f6337b2ac1a1086c69587793beb3823'
+const TAVERN_HELPER_REVISION = '8c1f159388e216b52bff0e0995f371a8c9861bca'
 const SILLY_TAVERN_REVISION = '8172dcd0ee672d3cd9a5e5f7af134f91a45cd2b8'
 
 export const TAVERN_EVENTS = Object.freeze({
@@ -110,6 +110,9 @@ const capability = (id, kind, level, timing, signature, extra = {}) => Object.fr
 const unavailable = (id, kind, signature, reason) => capability(id, kind, 'unavailable', 'async', signature, { reason })
 
 const CAPABILITIES = {
+  'resource.scriptImport': capability('resource.scriptImport', 'resource', 'emulated', 'async', 'importCard(bytes): CardRecord', { reason: 'Standard content scripts and legacy exports retain IDs, enablement, data, buttons and folder metadata; tree editing and button execution remain unavailable.', parameters: ['content', 'id', 'enabled', 'data', 'button', 'export_with', 'folder'], tests: ['tests/script-importer.test.js'] }),
+  'runtime.preparation': capability('runtime.preparation', 'runtime', 'degraded', 'async', 'prepare(session): Snapshot', { reason: 'Native prompt preparation and script generation drain accepted writes and call live filter owners; browser owners must be connected. Notification events do not reproduce mutable SillyTavern transform-event objects.', tests: ['tests/compat-lifecycle.test.js', 'tests/compat-client-lifecycle.test.js'] }),
+  'template.ejs': capability('template.ejs', 'template', 'degraded', 'async', 'evaluatePromptTemplate(source, scope, options): Result', { reason: 'EJS 3.1.10 supplies async execution, print/include/define and structured variable changes in a prompt-build lifecycle. Full upstream GENERATE/RENDER hooks, initial-worldbook loading, preset resources and display projections are not implemented.', contexts: ['standalone-template', 'character-prompt', 'active-worldbook-prompt'], tests: ['tests/template-runtime.test.js', 'tests/template-state-commit.test.js'] }),
   'global.TavernHelper': capability('global.TavernHelper', 'global', 'emulated', 'sync', 'TavernHelper', { reason: 'Implemented by a session-scoped DSH compatibility runtime rather than the native extension.' }),
   'global.SillyTavern': capability('global.SillyTavern', 'global', 'degraded', 'sync', 'SillyTavern & { getContext(): Context }', { reason: 'Chat, character, metadata, settings, events, macros and common helpers are projected; private SillyTavern UI and backend services are unavailable.' }),
   'global.eventSource': capability('global.eventSource', 'global', 'emulated', 'event', 'EventSource', { reason: 'Delivery covers compatible frames in one DSH Session, not arbitrary native extensions.' }),
@@ -156,7 +159,8 @@ const CAPABILITIES = {
   'function.worldbookBindings': capability('function.worldbookBindings', 'function', 'degraded', 'hybrid', 'global/character/chat worldbook binding APIs', { reason: 'Global, current-character and current-chat bindings are persisted and all bound books feed prompting; non-current character mutation and native UI selection are unavailable.' }),
   'function.getLorebook': capability('function.getLorebook', 'function', 'emulated', 'async', 'getLorebook(name): Promise<WorldbookEntry[]>', { reason: 'Legacy lorebook names alias the named DSH worldbook implementation.' }),
   'function.getLorebookSettings': capability('function.getLorebookSettings', 'function', 'degraded', 'sync', 'getLorebookSettings(): LorebookSettings', { reason: 'Settings are persistent and affect scan depth and budget; native group-scoring UI and all recursion policies are not fully represented.' }),
-  'function.registerMacroLike': capability('function.registerMacroLike', 'function', 'degraded', 'sync', 'registerMacroLike(regex, replace): {unregister(): void}', { reason: 'Registered replacements participate in iframe substituteParams calls; they cannot patch DSH or third-party prompt pipelines globally.' }),
+  'function.registerMacroLike': capability('function.registerMacroLike', 'function', 'degraded', 'sync', 'registerMacroLike(regex, replace): {unregister(): void}', { reason: 'Live owner callbacks participate in iframe substitution, prepared system/depth prompts and raw named prompts. Native history, rendered messages and third-party pipelines do not share this macro registry.' }),
+  'function.getProxyPresetNames': unavailable('function.getProxyPresetNames', 'function', 'getProxyPresetNames(): string[]', 'DSH does not provide SillyTavern proxy preset resources.'),
   'function.audio': capability('function.audio', 'function', 'degraded', 'sync', 'playAudio/pauseAudio/list/settings APIs', { reason: 'Per-frame BGM and ambient playlists use browser Audio; native shared SillyTavern playback state and autoplay guarantees are unavailable.' }),
   'function.copyText': capability('function.copyText', 'function', 'degraded', 'hybrid', 'copyText(text): void|Promise<void>', { reason: 'Uses the iframe Clipboard API or document fallback and remains subject to browser gesture permissions.' }),
   'function.callGenericPopup': capability('function.callGenericPopup', 'function', 'degraded', 'async', 'callGenericPopup(content, type, inputValue?, options?): Promise<unknown>', { reason: 'Text, confirm, input and display map to browser dialogs; native custom buttons, hooks and crop UI are unavailable.' }),
@@ -197,10 +201,11 @@ for (const [name, level, reason] of [
 
 const MANIFEST = Object.freeze({
   schemaVersion: 1,
-  implementation: Object.freeze({ name: 'dsh-sillytavern', version: '0.9.0', phase: 5 }),
+  implementation: Object.freeze({ name: 'dsh-sillytavern', version: '0.10.0', phase: 5 }),
   upstream: Object.freeze({
-    tavernHelper: Object.freeze({ repository: 'https://github.com/N0VI028/JS-Slash-Runner', version: '4.9.3', revision: TAVERN_HELPER_REVISION }),
+    tavernHelper: Object.freeze({ repository: 'https://github.com/N0VI028/JS-Slash-Runner', version: '4.9.4', revision: TAVERN_HELPER_REVISION }),
     sillyTavern: Object.freeze({ repository: 'https://github.com/SillyTavern/SillyTavern', version: '1.18.0', revision: SILLY_TAVERN_REVISION }),
+    promptTemplate: Object.freeze({ repository: 'https://github.com/zonde306/ST-Prompt-Template', version: '1.17.9', revision: 'd6f520d149aba146305b0b781ddd691d449c28d2', runtime: 'ejs@3.1.10' }),
   }),
   capabilities: Object.freeze(CAPABILITIES),
 })

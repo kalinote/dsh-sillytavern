@@ -50,6 +50,7 @@ function fixture() {
     row('a1', 'a', normalized('主线', 10, 20)),
     row('a2', 'a', normalized('主线', 20)),
     row('b', 'b', normalized('独立时间线', 500, null)),
+    row('b-current', 'b', normalized('独立时间线', 600)),
     row('c', 'c', { state: 'label-only', label: '翌日', timeline: null, start: null, end: null }),
     row('d', 'd', { state: 'unknown', label: null, timeline: null, start: null, end: null }),
     row('loose', undefined, { state: 'unknown', label: null, timeline: null, start: null, end: null }),
@@ -57,11 +58,12 @@ function fixture() {
 }
 
 test('event view renders every grouped node and independent timeline, with clickable endpoint/instant bars', () => {
-  const result = render(fixture())
+  const document = fixture()
+  const result = render(document)
   assert.equal(result.byClass('dst-explorer-root')[0].props['data-conversation-composer-overlay'], '', 'uses the public fixed-height View contract')
   assert.equal(result.byClass('dst-explorer-graph-node').length, 4)
   assert.equal(result.byClass('dst-explorer-edge').length, 1)
-  assert.equal(result.byClass('dst-explorer-bar').length, 3)
+  assert.equal(result.byClass('dst-explorer-bar').length, 4)
   assert.equal(result.byClass('dst-explorer-untimed-item').length, 2)
   assert.equal(result.byClass('search-match').length, 0, 'empty searches do not highlight every event')
   assert.match(result.text, /标题-a1/)
@@ -72,12 +74,17 @@ test('event view renders every grouped node and independent timeline, with click
   assert.ok(bars.every(bar => bar.type === 'button' && typeof bar.props.onClick === 'function'))
   assert.equal(bars[1].props.style.left, '100%')
   assert.equal(bars[1].props.style.transform, 'translateX(-100%)')
-  assert.equal(bars[2].props.style.left, '50%')
-  assert.equal(result.byClass('point').length, 1, 'a known zero-duration event keeps its circular point marker')
-  assert.equal(result.byClass('end-unrecorded').length, 1, 'a missing end uses a distinct marker')
+  assert.equal(bars[2].props.style.left, '0%')
+  assert.equal(bars[2].props.style.width, '100%', 'a missing end reaches the latest known point on its timeline')
+  assert.equal(bars[3].props.style.left, '100%')
+  assert.equal(result.byClass('point').length, 2, 'known zero-duration events keep their circular point markers')
+  assert.equal(result.byClass('end-unrecorded').length, 1, 'a missing end uses a distinct ongoing interval style')
+  assert.equal(result.byClass('current').length, 2, 'every independent timeline labels its latest known point as current')
   assert.ok(bars[2].props.className.includes('end-unrecorded'))
   assert.ok(!bars[2].props.className.includes('point'))
+  assert.equal(document.rows[2].storyTime.end, null, 'display extension does not synthesize a persisted end')
   assert.match(bars[2].props.title, /结束时间未记录/)
+  assert.match(bars[2].props.title, /图示延伸至当前剧情时间 600/)
   assert.match(result.text, /结束时间未记录/)
   bars[0].props.onClick({ currentTarget: {} })
   assert.deepEqual(result.changes.find(change => change.index === 0), { index: 0, value: 'a' })
@@ -101,6 +108,24 @@ test('search highlights instead of removing graph nodes and details retain full 
   const missingEnd = render(fixture(), ['b'])
   const missingEndDialog = missingEnd.elements.find(element => element.type === 'dialog')
   assert.match(missingEnd.content(missingEndDialog.children), /结束时间[^]*结束时间未记录/)
+})
+
+test('open intervals use later starts as current without inventing time beyond the only known point', () => {
+  const multipleOpen = fixture()
+  multipleOpen.rows[3].storyTime.end = null
+  const multipleResult = render({ ...multipleOpen, rows: multipleOpen.rows.slice(2, 4), eventEdges: [] })
+  const multipleBars = multipleResult.byClass('dst-explorer-bar')
+  assert.equal(multipleBars[0].props.style.width, '100%')
+  assert.equal(multipleBars[1].props.style.left, '100%')
+  assert.equal(multipleBars[1].props.style.width, undefined)
+
+  const singleOpen = fixture()
+  const singleResult = render({ ...singleOpen, rows: [singleOpen.rows[2]], eventEdges: [] })
+  const onlyBar = singleResult.byClass('dst-explorer-bar')[0]
+  assert.equal(onlyBar.props.style.left, '50%')
+  assert.equal(onlyBar.props.style.width, undefined)
+  assert.ok(onlyBar.props.className.includes('end-unrecorded'))
+  assert.match(singleResult.text, /当前 500/)
 })
 
 test('empty, loading, and recoverable-error states are explicit', () => {

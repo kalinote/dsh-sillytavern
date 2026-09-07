@@ -6,9 +6,10 @@ import { hostname } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { parseCardBytes, validateCardV3 } from './card-v3.js'
 import { createChatMessages, createCompatChat, deleteChatMessages, getChatMessages, inspectCompatChat, mergeNativeMessages, rotateChatMessages, setChatMessages, switchSwipe } from './compat-chat.js'
-import { emptyCompatibilityWorkspace, normalizeCompatibilityWorkspace, readWorkspaceVariableScope, replaceWorkspaceVariableScope } from './compatibility-state.js'
+import { compatibilityScriptKey, emptyCompatibilityWorkspace, normalizeCompatibilityWorkspace, readWorkspaceVariableScope, replaceWorkspaceVariableScope } from './compatibility-state.js'
 import { applyEventOperation, assertMemoryKeywordsInSource, emptyEventDocument, normalizeEventDocument, queryEventGraph } from './event.js'
 import { initialGreetingView, sessionEvents, sessionTranscriptMessages } from './prompt.js'
+import { extractCardScriptImports, preserveImportedScriptMetadata } from './script-importer.js'
 import {
   createWorldbookEntries as appendTavernWorldbookEntries,
   deleteWorldbookEntries as removeTavernWorldbookEntries,
@@ -86,6 +87,7 @@ function normalizeStoredScript(script, index, forceDisable = false) {
     approvedHash: trusted ? approvedHash : null,
     source,
     ...(regex ?? {}),
+    ...(kind === 'regex' ? {} : preserveImportedScriptMetadata(script, source)),
   }
 }
 function normalizeScriptList(scripts, forceDisable = false) {
@@ -209,28 +211,21 @@ async function withFileLock(target, operation, signal) {
   throw new Error(`timed out acquiring file lock for ${target}`)
 }
 
+async function withFileLocks(targets, operation, signal, index = 0) {
+  if (index >= targets.length) return operation()
+  return withFileLock(targets[index], () => withFileLocks(targets, operation, signal, index + 1), signal)
+}
+
 function extractScripts(card) {
   const scripts = []
-  const seen = new Set()
-  const addGeneric = (source, name = 'Imported script', kind = 'javascript') => {
-    if (scripts.length >= 32 || typeof source !== 'string' || source.trim() === '') return
-    const normalizedKind = kind === 'html' ? 'html' : 'javascript'
-    const key = `${normalizedKind}\0${source}`
-    if (seen.has(key)) return
-    seen.add(key)
-    scripts.push({ id: createHash('sha256').update(key).digest('hex').slice(0, 16), name, kind: normalizedKind, enabled: true, approvedHash: scriptHash(normalizedKind, source), source })
-  }
   const regexScripts = Array.isArray(card?.data?.extensions?.regex_scripts) ? card.data.extensions.regex_scripts : []
-  for (let index = 0; index < regexScripts.length && scripts.length < 32; index += 1) {
+  for (let index = 0; index < regexScripts.length; index += 1) {
     const rule = regexScripts[index]
     if (rule === null || typeof rule !== 'object' || Array.isArray(rule)) continue
     const source = String(rule.replaceString ?? '')
     const regex = normalizeRegexMetadata(rule)
     if (regex.findRegex.trim() === '') continue
     const id = String(rule.id ?? createHash('sha256').update(`${regex.findRegex}\0${source}`).digest('hex').slice(0, 16))
-    const key = `regex\0${id}\0${regex.findRegex}\0${source}`
-    if (seen.has(key)) continue
-    seen.add(key)
     const enabled = rule.disabled !== true
     scripts.push({
       id,
@@ -242,30 +237,35 @@ function extractScripts(card) {
       ...regex,
     })
   }
-  const visit = (value, path, depth = 0, eligible = false) => {
-    if (depth > 8 || value === null || value === undefined || scripts.length >= 32) return
-    if (typeof value === 'string') {
-      if (eligible) addGeneric(value, path.split('.').at(-1) ?? 'Imported script', /<html|<body|<!doctype/i.test(value) ? 'html' : 'javascript')
-      return
+  const imported = extractCardScriptImports(card).scripts
+  for (const script of imported) {
+    const approvedHash = script.enabled === true ? scriptHash(script.kind, script.source, script) : null
+    scripts.push({ ...script, approvedHash })
+  }
+  return scripts
+}
+
+function reconcileDiscoveredScripts(stored, discovered) {
+  const output = [...stored]
+  const consumed = new Set()
+  for (const imported of discovered) {
+    let index = output.findIndex((script, candidateIndex) => !consumed.has(candidateIndex)
+      && script.kind === imported.kind
+      && (script.id === imported.id || (script.name === imported.name && script.source === imported.source)))
+    if (index < 0) {
+      output.push(imported)
+      consumed.add(output.length - 1)
+      continue
     }
-    if (Array.isArray(value)) {
-      value.forEach((item, index) => visit(item, `${path}[${index}]`, depth + 1, eligible))
-      return
-    }
-    if (typeof value !== 'object') return
-    if (typeof value.source === 'string' || typeof value.code === 'string' || typeof value.script === 'string' || typeof value.html === 'string') {
-      const source = value.source ?? value.code ?? value.script ?? value.html
-      addGeneric(source, String(value.name ?? value.label ?? path.split('.').at(-1) ?? 'Imported script'), typeof value.html === 'string' ? 'html' : 'javascript')
-      return
-    }
-    for (const [key, child] of Object.entries(value)) {
-      if (key === 'regex_scripts') continue
-      const childEligible = /^(?:scripts?|javascript|html|renderer|slash)$/i.test(key)
-      visit(child, `${path}.${key}`, depth + 1, childEligible)
+    const existing = output[index]
+    consumed.add(index)
+    output[index] = {
+      ...imported,
+      ...existing,
+      ...preserveImportedScriptMetadata(imported, existing.source),
     }
   }
-  visit(card?.data?.extensions, 'extensions')
-  return scripts
+  return normalizeScriptList(output)
 }
 
 function scriptsForRecord(record) {
@@ -498,18 +498,30 @@ export class SillyTavernStore {
     return awaitWithSignal(current, signal)
   }
 
+  async waitCompatibilityWrites(agent, signal) {
+    const workspace = this.workspaceOf(agent)
+    const root = this.rootForWorkspace(workspace)
+    const keys = [`compat-chat:${workspace}:${agent.id}`, ...['regex', 'compatibility', 'resources', 'selection', 'bindings', 'templates'].map(type => `${type}:${root}`)]
+    // Snapshot the accepted writes; later writes belong to the next snapshot.
+    const pending = keys.map(key => this.tails.get(key)).filter(Boolean)
+    await awaitWithSignal(Promise.all(pending), signal)
+  }
+
   async loadCardRecord(path, expectedId, persist = false, signal) {
     const raw = await readJson(path, null, MAX_CARD_READ_BYTES)
     signal?.throwIfAborted()
     if (raw === null || raw.id !== expectedId || ![1, 2, 3, 4].includes(Number(raw.schemaVersion))) return undefined
     const card = snapshot(raw.card)
     if (card?.data && Object.hasOwn(card.data, 'character_book')) delete card.data.character_book
+    const scriptImport = extractCardScriptImports(card)
+    const storedScripts = scriptsForRecord(raw)
     const record = {
       ...raw,
       schemaVersion: 4,
       card,
       defaultWorldbookId: typeof raw.defaultWorldbookId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(raw.defaultWorldbookId) ? raw.defaultWorldbookId : null,
-      scripts: scriptsForRecord(raw),
+      scripts: raw.scriptImportReport === undefined ? reconcileDiscoveredScripts(storedScripts, extractScripts(card)) : storedScripts,
+      scriptImportReport: raw.scriptImportReport ?? scriptImport.report,
     }
     assertJsonBytes(record, MAX_CARD_RECORD_BYTES, 'card record')
     if (persist && JSON.stringify(record) !== JSON.stringify(raw)) await atomicJson(path, record, () => signal?.throwIfAborted())
@@ -734,7 +746,7 @@ export class SillyTavernStore {
         swipes_info: snapshot(internal.swipes_info),
       }
     })
-    return { revision: session.compatChat.revision, messages }
+    return { revision: session.compatChat.revision, seenSourceSeqs: snapshot(state.seenSourceSeqs), messages }
   }
 
   async refreshCompatChat(agent, signal) {
@@ -747,7 +759,7 @@ export class SillyTavernStore {
       } catch {
         current = emptyCompatChatDocument(session.agentId, sessionTranscriptMessages(agent))
       }
-      if (current.chat.entries.length === 0 && session.binding !== null) {
+      if (current.chat.entries.length === 0 && current.chat.nextSyntheticUid === 1 && current.chat.seenSourceSeqs.length === 0 && session.binding !== null) {
         const promptState = this.promptState(agent)
         const greeting = promptState === undefined ? null : initialGreetingView(promptState, Number(session.binding.openingSwipeId ?? 0))
         if (greeting !== null) {
@@ -1058,6 +1070,7 @@ export class SillyTavernStore {
       importedAt: record.importedAt,
       updatedAt: record.updatedAt,
       scriptCount: record.scripts.length,
+      scriptImportSummary: record.scriptImportReport?.summary ?? null,
       defaultWorldbookId: record.defaultWorldbookId,
     })).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
   }
@@ -1338,6 +1351,32 @@ export class SillyTavernStore {
     }, signal), signal)
   }
 
+  async initializeImportedScriptData(state, cardId, scripts, signal) {
+    const initializers = scripts.filter(script => script?.tavernHelper && script.data !== null && typeof script.data === 'object' && !Array.isArray(script.data))
+    if (initializers.length === 0) return
+    const path = join(state.root, 'compatibility.json')
+    await this.serial(`compatibility:${state.root}`, () => withFileLock(path, async () => {
+      const current = normalizeCompatibilityWorkspace(await readJson(path, emptyCompatibilityWorkspace(), 16 * 1024 * 1024))
+      const next = snapshot(current)
+      let changed = false
+      for (const script of initializers) {
+        const key = compatibilityScriptKey(cardId, script.id)
+        if (Object.hasOwn(next.variables.scripts, key)) continue
+        next.variables.scripts[key] = snapshot(script.data)
+        changed = true
+      }
+      if (!changed) {
+        state.compatibility = current
+        return
+      }
+      next.revision = current.revision + 1
+      next.updatedAt = new Date().toISOString()
+      assertSafeOwnedJson(next, 16 * 1024 * 1024, 'compatibility workspace state')
+      await atomicJson(path, next, () => signal?.throwIfAborted())
+      state.compatibility = next
+    }, signal), signal)
+  }
+
   async importCard(bytes, metadata = {}, signal, context) {
     if (signal !== undefined && !isAbortSignal(signal)) { context = signal; signal = undefined }
     context ??= metadata.context ?? metadata.workspace
@@ -1346,6 +1385,7 @@ export class SillyTavernStore {
     const parsed = parseCardBytes(bytes, { strict: true })
     const id = createHash('sha256').update(bytes).digest('hex')
     const card = snapshot(parsed.card)
+    const scriptImport = extractCardScriptImports(parsed.card)
     const embeddedWorldbook = card.data.character_book === null || typeof card.data.character_book !== 'object' || Array.isArray(card.data.character_book)
       ? null
       : snapshot(card.data.character_book)
@@ -1363,7 +1403,7 @@ export class SillyTavernStore {
         name: metadata.worldbookName ?? embeddedWorldbook.name ?? `${card.data.name} Worldbook`,
       })
     }
-    return this.serial(`resources:${state.root}`, async () => {
+    const record = await this.serial(`resources:${state.root}`, async () => {
       const path = join(state.root, 'cards', `${id}.json`)
       return withFileLock(path, async () => {
         const timestamp = new Date().toISOString()
@@ -1380,6 +1420,7 @@ export class SillyTavernStore {
           card,
           defaultWorldbookId: importedWorldbook?.id ?? existing?.defaultWorldbookId ?? null,
           scripts: existing?.scripts ?? normalizeScriptList(extractScripts(parsed.card)),
+          scriptImportReport: existing?.scriptImportReport ?? scriptImport.report,
         }
         assertJsonBytes(record, MAX_CARD_RECORD_BYTES, 'card record')
         await atomicJson(path, record, () => signal?.throwIfAborted())
@@ -1388,6 +1429,8 @@ export class SillyTavernStore {
         return snapshot(record)
       }, signal)
     }, signal)
+    await this.initializeImportedScriptData(state, id, record.scripts, signal)
+    return record
   }
 
   async updateCard(id, patch, signal, context) {
@@ -1424,7 +1467,7 @@ export class SillyTavernStore {
         if (patch.characterBook !== undefined) record.defaultWorldbookId = patch.characterBook === null ? null : characterBookId
         validateCardV3(record.card)
         if (patch.scripts !== undefined) {
-          if (!Array.isArray(patch.scripts) || patch.scripts.length > 32) throw new Error('scripts must be an array with at most 32 entries')
+          if (!Array.isArray(patch.scripts)) throw new Error('scripts must be an array')
           assertSafeOwnedJson(patch.scripts, 8 * 1024 * 1024, 'scripts')
           record.scripts = normalizeScriptList(patch.scripts)
         }
@@ -1839,6 +1882,235 @@ export class SillyTavernStore {
     }, signal), signal)
   }
 
+  async commitTemplateResult(agent, result, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    if (session.binding === null) throw new Error('current session has no selected character')
+    if (result === null || typeof result !== 'object' || Array.isArray(result)) throw new TypeError('template result must be an object')
+    if (!Array.isArray(result.mutations)) throw new TypeError('template result mutations must be an array')
+    if (result.scopes === null || typeof result.scopes !== 'object' || Array.isArray(result.scopes)) throw new TypeError('template result scopes must be an object')
+    const durableScopes = new Set()
+    for (const [index, mutation] of result.mutations.entries()) {
+      if (mutation === null || typeof mutation !== 'object' || Array.isArray(mutation)) throw new TypeError(`template mutation ${index} must be an object`)
+      const scope = String(mutation.scope ?? '')
+      if (scope === 'initial') continue
+      if (!['local', 'global', 'message'].includes(scope)) throw new TypeError(`template mutation ${index} has unsupported durable scope ${scope}`)
+      durableScopes.add(scope)
+    }
+    const orderedScopes = ['local', 'global', 'message'].filter(scope => durableScopes.has(scope))
+    if (orderedScopes.length === 0) {
+      return {
+        committed: false,
+        scopes: [],
+        revisions: {
+          chat: Number(session.binding.revision ?? 0),
+          global: Number(session.state.regexRevision ?? 0),
+          workspace: Number(session.state.compatibility.revision ?? 0),
+          message: Number(session.compatChat.revision ?? 0),
+        },
+      }
+    }
+    for (const scope of orderedScopes) {
+      const value = result.scopes[scope]
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`template ${scope} scope must be an object`)
+      assertSafeOwnedJson(value, scope === 'message' || scope === 'local' ? 1024 * 1024 : 16 * 1024 * 1024, `template ${scope} scope`)
+    }
+    const revisionField = { local: 'chat', global: 'global', message: 'message' }
+    const expected = {}
+    for (const scope of orderedScopes) {
+      const field = revisionField[scope]
+      const value = Number(result.baseRevisions?.[field])
+      if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`template base revision ${field} must be a non-negative safe integer`)
+      expected[field] = value
+    }
+
+    const state = session.state
+    const paths = {
+      local: join(state.root, 'bindings.json'),
+      global: join(state.root, 'regex-scripts.json'),
+      message: session.compatChatPath,
+    }
+    const serialKeys = {
+      local: `bindings:${state.root}`,
+      global: `regex:${state.root}`,
+      message: `compat-chat:${session.workspace}:${session.agentId}`,
+    }
+    const keys = orderedScopes.map(scope => serialKeys[scope]).sort()
+    const lockPaths = orderedScopes.map(scope => paths[scope]).sort()
+    const runSerial = (index, operation) => index >= keys.length
+      ? operation()
+      : this.serial(keys[index], () => runSerial(index + 1, operation), signal)
+
+    return runSerial(0, () => withFileLocks(lockPaths, async () => {
+      this.assertAgentActive(agent, session)
+      const current = {}
+      const existed = {}
+      const exists = async path => {
+        try { await readFile(path); return true } catch (error) {
+          if (error?.code === 'ENOENT') return false
+          throw error
+        }
+      }
+      if (durableScopes.has('local')) {
+        existed.local = await exists(paths.local)
+        current.local = normalizeBindingsDocument(await readJson(paths.local, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+      }
+      if (durableScopes.has('global')) {
+        existed.global = await exists(paths.global)
+        current.global = normalizeRegexSourcesDocument(await readJson(paths.global, { schemaVersion: 1, revision: 0, global: [], preset: [], variables: {} }, 16 * 1024 * 1024))
+      }
+      if (durableScopes.has('message')) {
+        existed.message = await exists(paths.message)
+        current.message = normalizeCompatChatDocument(
+          await readJson(paths.message, emptyCompatChatDocument(session.agentId), 20 * 1024 * 1024),
+          session.agentId,
+          sessionTranscriptMessages(agent),
+        )
+      }
+
+      const conflicts = []
+      if (current.local !== undefined) {
+        const binding = current.local.sessions[session.agentId]
+        if (binding === undefined) throw new Error('current session has no selected character')
+        if (binding.revision !== expected.chat) conflicts.push({ scope: 'local', revision: 'chat', expected: expected.chat, current: binding.revision })
+      }
+      if (current.global !== undefined && current.global.revision !== expected.global) conflicts.push({ scope: 'global', revision: 'global', expected: expected.global, current: current.global.revision })
+      if (current.message !== undefined && current.message.revision !== expected.message) conflicts.push({ scope: 'message', revision: 'message', expected: expected.message, current: current.message.revision })
+      if (conflicts.length > 0) {
+        const error = new Error(`template state changed before commit: ${conflicts.map(item => `${item.scope} ${item.expected} -> ${item.current}`).join(', ')}`)
+        error.code = 'template-state-conflict'
+        error.details = { conflicts }
+        throw error
+      }
+
+      const next = {}
+      if (current.local !== undefined) {
+        next.local = snapshot(current.local)
+        const binding = snapshot(next.local.sessions[session.agentId])
+        binding.variables = snapshot(result.scopes.local)
+        binding.revision += 1
+        next.local.sessions[session.agentId] = binding
+        assertJsonBytes(next.local, 16 * 1024 * 1024, 'template bindings commit')
+      }
+      if (current.global !== undefined) {
+        next.global = {
+          ...snapshot(current.global),
+          revision: current.global.revision + 1,
+          variables: snapshot(result.scopes.global),
+          updatedAt: new Date().toISOString(),
+        }
+        assertSafeOwnedJson(next.global, 16 * 1024 * 1024, 'template global commit')
+      }
+      let messageTarget = null
+      if (current.message !== undefined) {
+        const entries = current.message.chat.entries
+        if (entries.length === 0) throw new RangeError('template message scope has no target message')
+        const messageMutations = result.mutations.filter(mutation => mutation.scope === 'message')
+        const resolveMessageId = value => {
+          if (value === undefined) return entries.length - 1
+          if (!Number.isSafeInteger(value)) throw new TypeError('template messageId must be a safe integer')
+          const id = value < 0 ? entries.length + value : value
+          if (id < 0 || id >= entries.length) throw new RangeError(`template messageId ${value} is outside the chat`)
+          return id
+        }
+        const messageIds = [...new Set(messageMutations.map(mutation => resolveMessageId(mutation.messageId)))]
+        if (messageIds.length !== 1) throw new Error('one template result cannot replace more than one message scope')
+        const messageId = messageIds[0]
+        const entry = entries[messageId]
+        const resolveSwipeId = value => {
+          if (value === undefined) return entry.swipe_id
+          if (!Number.isSafeInteger(value)) throw new TypeError('template swipeId must be a safe integer')
+          if (value < 0 || value >= entry.swipes.length) throw new RangeError(`template swipeId ${value} is outside message ${messageId}`)
+          return value
+        }
+        const swipeIds = [...new Set(messageMutations.map(mutation => resolveSwipeId(mutation.swipeId)))]
+        if (swipeIds.length !== 1) throw new Error('one template result cannot replace more than one message swipe scope')
+        const swipeId = swipeIds[0]
+        const swipesData = snapshot(entry.swipes_data)
+        swipesData[swipeId] = snapshot(result.scopes.message)
+        const chat = setChatMessages(current.message.chat, [{ message_id: messageId, swipes_data: swipesData }])
+        next.message = {
+          ...snapshot(current.message),
+          revision: current.message.revision + 1,
+          chat: inspectCompatChat(chat),
+          updatedAt: new Date().toISOString(),
+        }
+        assertSafeOwnedJson(next.message, 20 * 1024 * 1024, 'template message commit')
+        messageTarget = { messageId, swipeId }
+      }
+
+      const documents = orderedScopes.map(scope => ({ scope, path: paths[scope], before: current[scope], after: next[scope], existed: existed[scope] }))
+        .sort((left, right) => left.path.localeCompare(right.path))
+      const written = []
+      try {
+        for (const document of documents) {
+          await atomicJson(document.path, document.after, () => {
+            signal?.throwIfAborted()
+            this.assertAgentActive(agent, session)
+          })
+          written.push(document)
+        }
+      } catch (error) {
+        const rollbackFailures = []
+        for (const document of written.reverse()) {
+          try {
+            if (document.existed) await atomicJson(document.path, document.before)
+            else await rm(document.path, { force: true })
+          } catch (rollbackError) {
+            rollbackFailures.push({ scope: document.scope, message: rollbackError instanceof Error ? rollbackError.message : String(rollbackError) })
+          }
+        }
+        if (rollbackFailures.length > 0) {
+          const wrapped = new Error(`template state commit failed and rollback was incomplete: ${error instanceof Error ? error.message : String(error)}`)
+          wrapped.code = 'template-state-rollback-failed'
+          wrapped.cause = error
+          wrapped.details = { rollbackFailures }
+          throw wrapped
+        }
+        if (error && typeof error === 'object') error.templateCommit = { rolledBack: true }
+        throw error
+      }
+
+      if (next.local !== undefined) {
+        state.bindings = next.local
+        session.binding = snapshot(next.local.sessions[session.agentId])
+      }
+      if (next.global !== undefined) {
+        state.globalRegexScripts = next.global.global
+        state.presetRegexScripts = next.global.preset
+        state.globalVariables = next.global.variables
+        state.regexRevision = next.global.revision
+        state.compatibility.variables.global = snapshot(next.global.variables)
+      }
+      if (next.message !== undefined) session.compatChat = next.message
+      return {
+        committed: true,
+        scopes: orderedScopes,
+        revisions: {
+          chat: Number(session.binding.revision ?? 0),
+          global: Number(state.regexRevision ?? 0),
+          workspace: Number(state.compatibility.revision ?? 0),
+          message: Number(session.compatChat.revision ?? 0),
+        },
+        message: messageTarget,
+      }
+    }, signal))
+  }
+
+  async consumeOnceInjections(agent, ids, expectedRevision, signal) {
+    if (!Array.isArray(ids)) throw new TypeError('once injection ids must be an array')
+    const requested = new Set(ids.map(String))
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    if (session.binding === null) throw new Error('current session has no selected character')
+    const removedIds = session.binding.scriptInjections
+      .filter(item => item.once === true && requested.has(item.id))
+      .map(item => item.id)
+    const view = await this.updateSession(agent, {
+      expectedRevision,
+      scriptInjections: session.binding.scriptInjections.filter(item => !removedIds.includes(item.id)),
+    }, signal)
+    return { removedIds, session: view }
+  }
+
   effectiveWorldbook(state, binding, card) {
     if (binding === null || card === undefined) return null
     const id = binding.startedAt === null && binding.worldbookExplicit !== true ? card.defaultWorldbookId : binding.worldbookId
@@ -1963,7 +2235,7 @@ export class SillyTavernStore {
     const selected = session.binding.templateIds.length === 0
       ? session.state.templates.filter(template => template.enabled !== false)
       : session.state.templates.filter(template => session.binding.templateIds.includes(template.id) && template.enabled !== false)
-    return { record, binding: session.binding, worldbook: this.compatibilityPromptWorldbook(session.state, session.binding, record), event: session.event, templates: selected, globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables, compatMessages: this.compatChatProjection(agent).messages, lorebookSettings: session.state.compatibility.lorebookSettings }
+    return { record, binding: session.binding, worldbook: this.compatibilityPromptWorldbook(session.state, session.binding, record), event: session.event, templates: selected, globalRegexScripts: session.state.globalRegexScripts, presetRegexScripts: session.state.presetRegexScripts, globalVariables: session.state.globalVariables, compatMessages: this.compatChatProjection(agent).messages, compatibilityVariables: this.compatibilityVariableSnapshot(agent), lorebookSettings: session.state.compatibility.lorebookSettings }
   }
 
   regexEntries(agent) {

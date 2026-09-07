@@ -7,7 +7,9 @@ test('phase-5 compatibility manifest pins upstream revisions and reports honest 
   assert.equal(manifest.schemaVersion, 1)
   assert.match(manifest.upstream.tavernHelper.revision, /^[a-f0-9]{40}$/)
   assert.match(manifest.upstream.sillyTavern.revision, /^[a-f0-9]{40}$/)
-  assert.equal(manifest.upstream.tavernHelper.version, '4.9.3')
+  assert.equal(manifest.upstream.tavernHelper.version, '4.9.4')
+  assert.equal(manifest.upstream.promptTemplate.version, '1.17.9')
+  assert.match(manifest.upstream.promptTemplate.revision, /^[a-f0-9]{40}$/)
   assert.equal(manifest.upstream.sillyTavern.version, '1.18.0')
   const levels = new Set(['exact', 'emulated', 'degraded', 'unavailable'])
   for (const [id, capability] of Object.entries(manifest.capabilities)) {
