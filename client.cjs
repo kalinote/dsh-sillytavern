@@ -802,7 +802,7 @@ window.__ModuleLoader__.load({
               h(MemoryDetail, { key: text(row?.id || index), row, index }))))
         }
 
-        function EventExplorerView({ document: eventDocument, loading = false, refreshing = false, error = null, onRefresh, sessionId }) {
+        function EventExplorerView({ document: eventDocument, loading = false, refreshing = false, error = null, onRefresh, onEdit, sessionId }) {
           const [selectedId, setSelectedId] = React.useState(null)
           const [query, setQuery] = React.useState('')
           const [searchCursor, setSearchCursor] = React.useState(-1)
@@ -1004,8 +1004,8 @@ window.__ModuleLoader__.load({
           return h('div', { className: 'dst-explorer-root', 'data-session-id': text(sessionId), 'data-conversation-composer-overlay': '' },
             h('header', { className: 'dst-explorer-toolbar' },
               h('div', { className: 'dst-explorer-heading' },
-                h('span', { className: 'dst-explorer-kicker' }, 'SillyTavern 事件'),
-                h('h1', null, '剧情事件探索器'),
+                h('span', { className: 'dst-explorer-kicker' }, 'SillyTavern'),
+                h('h1', null, '剧情时间线'),
                 h('span', { className: 'dst-explorer-revision' }, `修订 ${computed.model?.revision ?? eventDocument?.revision ?? 0}`)),
               h('div', { className: 'dst-explorer-search' },
                 h('label', null,
@@ -1020,6 +1020,7 @@ window.__ModuleLoader__.load({
                 h('output', { 'aria-live': 'polite' }, normalizedQuery ? `${matchPosition}/${matches.length}` : `${searchEntries.length} 个事件`),
                 h('button', { type: 'button', disabled: !normalizedQuery || !matches.length, onClick: () => locateMatch(-1), 'aria-label': '上一个搜索结果' }, '↑'),
                 h('button', { type: 'button', disabled: !normalizedQuery || !matches.length, onClick: () => locateMatch(1), 'aria-label': '下一个搜索结果' }, '↓')),
+              typeof onEdit === 'function' ? h('button', { type: 'button', onClick: onEdit }, '编辑事件') : null,
               h('button', { type: 'button', className: 'dst-explorer-refresh', disabled: refreshing || typeof onRefresh !== 'function', onClick: () => onRefresh?.() }, refreshing ? '刷新中…' : '刷新')),
             shownError ? h('div', { className: 'dst-explorer-error', role: 'alert' },
               h('span', null, text(shownError)),
@@ -1081,7 +1082,7 @@ window.__ModuleLoader__.load({
     const API = '/api/dsh-sillytavern'
 
     const overlay = (() => {
-      let state = { open: false, mode: 'manager', sessionId: null, version: 0 }
+      let state = { open: false, mode: 'manager', sessionId: null, version: 0, dataVersion: 0 }
       const listeners = new Set()
       const publish = next => {
         state = { ...state, ...next, version: state.version + 1 }
@@ -1092,7 +1093,7 @@ window.__ModuleLoader__.load({
         subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
         open(mode, sessionId = null) { publish({ open: true, mode, sessionId }) },
         close() { publish({ open: false }) },
-        changed() { publish({}) },
+        changed() { publish({ dataVersion: state.dataVersion + 1 }) },
         reset() { publish({ open: false, mode: 'manager', sessionId: null }) },
       }
     })()
@@ -3737,9 +3738,10 @@ self.onmessage = event => {
       return h(React.Fragment, null, warning, h(RenderedScriptSegments, { sessionId, seq: `preview-${script.id}`, text: rendered.text, eventState, label: `${script.name} 预览` }))
     }
 
-    function ScriptsTab({ session, reload }) {
+    function ScriptsTab({ session, reload, scope = 'card' }) {
       const record = session.card
-      const [scopeKind, setScopeKind] = React.useState('scoped')
+      const cardScope = scope === 'card'
+      const [scopeKind, setScopeKind] = React.useState(cardScope ? 'scoped' : 'global')
       const [sources, setSources] = React.useState(() => ({ scoped: structuredClone(record?.scripts || []), global: structuredClone(session.globalRegexScripts || []), preset: structuredClone(session.presetRegexScripts || []) }))
       const scripts = sources[scopeKind]
       const setScripts = update => setSources(previous => ({ ...previous, [scopeKind]: typeof update === 'function' ? update(previous[scopeKind]) : update }))
@@ -3748,11 +3750,14 @@ self.onmessage = event => {
       const [runningIds, setRunningIds] = React.useState(() => new Set())
       const [previewInputs, setPreviewInputs] = React.useState(() => new Map())
       const approvalAttempts = React.useRef(new Map())
-      if (!record) return h('p', { className: 'dst-muted' }, '当前会话尚未绑定角色。')
+      if (cardScope && !record) return h('p', { className: 'dst-muted' }, '当前会话尚未绑定角色。')
       const save = async () => {
         try {
-          await api('/card/update', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, cardId: record.id, patch: { scripts: sources.scoped } }) })
-          await api('/regex-sources', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, global: sources.global, preset: sources.preset }) })
+          if (cardScope) {
+            await api('/card/update', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, cardId: record.id, patch: { scripts: sources.scoped } }) })
+          } else {
+            await api('/regex-sources', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, global: sources.global, preset: sources.preset }) })
+          }
           setStatus('已保存'); overlay.changed(); reload()
         } catch (error) { setStatus(error.message) }
       }
@@ -3767,11 +3772,12 @@ self.onmessage = event => {
         : { id: crypto.randomUUID(), name: 'New Regex', kind: 'regex', enabled: false, approvedHash: null, source: '', findRegex: '', trimStrings: [], placement: [1, 2], markdownOnly: false, promptOnly: false, runOnEdit: false, substituteRegex: 0, minDepth: null, maxDepth: null }))
       return h('div', null,
         h('div', { className: 'dst-section-title' }, '执行脚本'),
+        h('p', { className: 'dst-muted' }, cardScope ? '角色卡脚本随角色卡共享。工作区的 Global / Preset 规则位于对话旁的“脚本”标签页。' : 'Global / Preset 规则在当前工作区内共享。角色卡自带的脚本仍在“管理酒馆模式”中编辑。'),
         h('p', { className: 'dst-warning' }, '标准脚本保留原始启用状态，并遵循所属文件夹的启用状态；已确认的 JavaScript 会作为当前会话的后台脚本自动运行，Regex 在对应文本阶段运行，HTML 可在管理页预览。系统不审查或过滤替换内容与脚本源码，启用前请自行验证。编辑规则、源码或类型后会自动停用。'),
-        record.scriptImportReport ? h('details', { className: 'dst-script-import-report' },
+        cardScope && record?.scriptImportReport ? h('details', { className: 'dst-script-import-report' },
           h('summary', null, `最近导入：发现 ${record.scriptImportReport.found.length} 项，转换 ${record.scriptImportReport.converted.length} 项，跳过 ${record.scriptImportReport.skipped.length} 项`),
           h('ul', null, [...record.scriptImportReport.skipped, ...record.scriptImportReport.losses].map((item, index) => h('li', { key: index }, `${item.path}：${item.reason}`)))) : null,
-        h('div', { className: 'dst-actions' }, ...[['global', 'Global'], ['preset', 'Preset'], ['scoped', 'Scoped（角色卡）']].map(([id, label]) => h(Button, { key: id, className: `${scopeKind === id ? 'active' : 'secondary'} small`, onClick: () => { setRunningIds(new Set()); setScopeKind(id) } }, label))),
+        h('div', { className: 'dst-actions' }, ...(cardScope ? [['scoped', 'Scoped（角色卡）']] : [['global', 'Global'], ['preset', 'Preset']]).map(([id, label]) => h(Button, { key: id, className: `${scopeKind === id ? 'active' : 'secondary'} small`, onClick: () => { setRunningIds(new Set()); setScopeKind(id) } }, label))),
         scripts.map((script, index) => {
           const running = runningIds.has(script.id)
           return h('section', { className: 'dst-script', key: script.id },
@@ -3832,31 +3838,56 @@ self.onmessage = event => {
         h('div', { className: 'dst-actions' }, h(Button, { onClick: () => void save() }, '保存模板'), h('label', null, h('input', { type: 'checkbox', checked: selected.enabled, onChange: event => setSelected(previous => ({ ...previous, enabled: event.target.checked })) }), ' 启用'), h('span', { className: 'dst-muted' }, status)))
     }
 
-    function ManagerContent({ sessionId }) {
+    function useTavernSettings(sessionId) {
       const [revision, setRevision] = React.useState(0)
-      const reload = () => setRevision(value => value + 1)
-      const libraryState = useAsync(() => sessionId ? api(`/library?sessionId=${encodeURIComponent(sessionId)}`) : null, [sessionId, revision])
-      const sessionState = useAsync(() => sessionId ? api(`/session?sessionId=${encodeURIComponent(sessionId)}`) : null, [sessionId, revision, useOverlay().version])
+      const dataVersion = useOverlay().dataVersion
+      const reload = React.useCallback(() => setRevision(value => value + 1), [])
+      const state = useAsync(async signal => {
+        if (!sessionId) return null
+        const query = `sessionId=${encodeURIComponent(sessionId)}`
+        const [library, session] = await Promise.all([
+          api(`/library?${query}`, { signal }),
+          api(`/session?${query}`, { signal }),
+        ])
+        return { library, session }
+      }, [sessionId, revision, dataVersion])
+      return { ...state, reload }
+    }
+
+    function ManagerContent({ sessionId }) {
+      const state = useTavernSettings(sessionId)
       const [tab, setTab] = React.useState('library')
-      const [worldbookEditorId, setWorldbookEditorId] = React.useState(null)
       if (!sessionId) return h('div', { className: 'dst-warning' }, '酒馆数据按工作区隔离。请从一个具体 Session 的角色菜单打开管理页。')
-      if (libraryState.loading || sessionState.loading) return h('div', { className: 'dst-loading' }, '正在读取酒馆数据…')
-      if (libraryState.error) return h('div', { className: 'dst-error' }, libraryState.error)
-      if (sessionId && sessionState.error) return h('div', { className: 'dst-error' }, sessionState.error)
-      const library = libraryState.value
-      const session = sessionState.value
-      const tabs = [['library', '角色库'], ['card', '角色卡'], ['worldbook', '世界书'], ['persona', '用户设定/变量'], ['event', '事件'], ['scripts', '脚本'], ['templates', '提示词模板']]
+      if (state.loading) return h('div', { className: 'dst-loading' }, '正在读取酒馆数据…')
+      if (state.error) return h('div', { className: 'dst-error' }, state.error)
+      if (!state.value) return null
+      const { library, session } = state.value
+      const { reload } = state
+      const tabs = [['library', '角色库'], ['card', '角色卡'], ['scripts', '角色脚本']]
       return h('div', { className: 'dst-manager-content' },
         session?.card ? h('div', { className: 'dst-current' }, `当前角色：${session.card.card.data.nickname || session.card.card.data.name}`) : sessionId ? h('div', { className: 'dst-current empty' }, '当前会话尚未绑定角色') : null,
+        h('p', { className: 'dst-manager-hint' }, '世界书、用户设定/变量、工作区脚本和提示词模板已移到对话旁的标签页；事件在“时间线”中查看和编辑。'),
         h('nav', { className: 'dst-tabs' }, tabs.map(([id, label]) => h(Button, { key: id, className: tab === id ? 'tab active' : 'tab', onClick: () => { if (id === tab) return; setTab(id); if (tab === 'scripts') reload() } }, label))),
         h('div', { className: 'dst-tab-body' },
           tab === 'library' ? h(LibraryTab, { library, session, reload }) : null,
           tab === 'card' && session ? h(CardEditTab, { key: `${session.card?.id}:${session.card?.updatedAt}`, session, library, reload }) : null,
-          tab === 'worldbook' && session ? h(WorldbookTab, { key: session.sessionId, session, library, editorSelection: worldbookEditorId, onEditorSelection: setWorldbookEditorId, reload }) : null,
-          tab === 'persona' && session ? h(PersonaTab, { key: `${session.sessionId}:${session.binding?.revision ?? session.binding?.boundAt}`, session, reload }) : null,
-          tab === 'event' && session ? h(EventTab, { key: `${session.sessionId}:${session.event?.revision}`, session, reload }) : null,
-          tab === 'scripts' && session ? h(ScriptsTab, { key: `${session.card?.id}:${session.card?.updatedAt}`, session, reload }) : null,
-          tab === 'templates' ? h(TemplatesTab, { key: library.templates.map(item => `${item.id}:${item.order}:${item.enabled}`).join('|'), library, sessionId, reload }) : null))
+          tab === 'scripts' && session ? h(ScriptsTab, { key: `${session.card?.id}:${session.card?.updatedAt}`, session, scope: 'card', reload }) : null))
+    }
+
+    function SessionSettingsContent({ sessionId, page, onSaved }) {
+      const state = useTavernSettings(sessionId)
+      const [worldbookEditorId, setWorldbookEditorId] = React.useState(null)
+      const reload = React.useCallback(() => { state.reload(); onSaved?.() }, [state.reload, onSaved])
+      if (state.loading) return h('div', { className: 'dst-loading', role: 'status' }, '正在读取酒馆数据…')
+      if (state.error) return h('div', { className: 'dst-error', role: 'alert' }, state.error, h(Button, { className: 'secondary small', onClick: reload }, '重试'))
+      if (!state.value) return null
+      const { library, session } = state.value
+      return h('div', { className: 'dst-session-content' },
+        page === 'worldbook' ? h(WorldbookTab, { key: sessionId, session, library, editorSelection: worldbookEditorId, onEditorSelection: setWorldbookEditorId, reload }) : null,
+        page === 'persona' ? h(PersonaTab, { key: `${sessionId}:${session.binding?.revision ?? 0}:${session.regexRevision ?? 0}`, session, reload }) : null,
+        page === 'event' ? h(EventTab, { key: `${sessionId}:${session.event?.revision ?? 0}`, session, reload }) : null,
+        page === 'scripts' ? h(ScriptsTab, { key: `${sessionId}:${session.regexRevision ?? 0}`, session, scope: 'workspace', reload }) : null,
+        page === 'templates' ? h(TemplatesTab, { library, sessionId, reload }) : null)
     }
 
     function OverlaySurface() {
@@ -3868,11 +3899,11 @@ self.onmessage = event => {
           ? h('div', { className: 'dst-dialog-wrap' }, h(ImportDialog, { sessionId: state.sessionId, close: overlay.close }))
           : h('aside', { className: 'dst-manager', role: 'dialog', 'aria-modal': true, 'aria-label': '酒馆模式管理' },
               h('header', null, h('div', null, h('strong', null, '酒馆模式'), h('span', null, 'dsh-sillytavern')), h(Button, { className: 'secondary small', onClick: overlay.close }, '关闭')),
-              h(ManagerContent, { sessionId: state.sessionId })))
+              h(ManagerContent, { key: state.sessionId, sessionId: state.sessionId })))
     }
 
     function SettingsSection() {
-      return h('section', { className: 'dst-settings' }, h('h2', null, '酒馆模式'), h('p', { className: 'dst-muted' }, '角色库、世界书、脚本和提示词模板均按工作区隔离。请从目标 Session 的角色菜单打开全屏管理页。'))
+      return h('section', { className: 'dst-settings' }, h('h2', null, '酒馆模式'), h('p', { className: 'dst-muted' }, '从角色菜单的“管理酒馆模式”管理角色库、角色卡和角色脚本。世界书、用户设定/变量、工作区脚本与提示词模板位于对话旁的标签页，事件在“时间线”中查看和编辑。数据仍按工作区保存。'))
     }
 
     function cardLabel(card) {
@@ -4369,14 +4400,31 @@ self.onmessage = event => {
 
     function TavernEventsSession(props) {
       const state = props.useEventExplorer(value => value)
-      return h(eventExplorerUI.EventExplorer, { ...state, sessionId: props.sessionId, onRefresh: props.refreshEvents })
+      const [editing, setEditing] = React.useState(false)
+      if (editing) return h('section', { className: 'dst-session-page', 'data-session-id': props.sessionId, 'data-conversation-composer-overlay': '' },
+        h('header', { className: 'dst-session-header' }, h('h1', null, '编辑事件'), h(Button, { className: 'secondary small', onClick: () => { props.refreshEvents(); setEditing(false) } }, '返回时间线')),
+        h(SessionSettingsContent, { key: props.sessionId, sessionId: props.sessionId, page: 'event', onSaved: props.refreshEvents }))
+      return h(eventExplorerUI.EventExplorer, { ...state, sessionId: props.sessionId, onRefresh: props.refreshEvents, onEdit: () => setEditing(true) })
     }
 
     function TavernEventsView(props) {
       const agentPreset = props.useSessions(state => sessionAgentPreset(state.byId[props.sessionId]))
-      if (agentPreset !== 'sillytavern') return h('div', { className: 'dst-explorer-unavailable' }, '事件视图用于酒馆模式会话。请选择一个酒馆会话查看剧情事件。')
+      if (agentPreset !== 'sillytavern') return h('div', { className: 'dst-explorer-unavailable' }, '时间线用于酒馆模式会话。请选择一个酒馆会话查看剧情事件。')
       return h(TavernEventsSession, { ...props, key: props.sessionId })
     }
+
+    function TavernSettingsView({ page, title, ...props }) {
+      const agentPreset = props.useSessions(state => sessionAgentPreset(state.byId[props.sessionId]))
+      if (agentPreset !== 'sillytavern') return h('div', { className: 'dst-explorer-unavailable' }, `${title}用于酒馆模式会话。请选择一个酒馆会话。`)
+      return h('section', { className: 'dst-session-page', 'data-session-id': props.sessionId, 'data-conversation-composer-overlay': '' },
+        h('header', { className: 'dst-session-header' }, h('h1', null, title)),
+        h(SessionSettingsContent, { key: `${props.sessionId}:${page}`, sessionId: props.sessionId, page }))
+    }
+
+    function TavernWorldbookView(props) { return h(TavernSettingsView, { ...props, page: 'worldbook', title: '世界书' }) }
+    function TavernPersonaView(props) { return h(TavernSettingsView, { ...props, page: 'persona', title: '用户设定/变量' }) }
+    function TavernScriptsView(props) { return h(TavernSettingsView, { ...props, page: 'scripts', title: '脚本' }) }
+    function TavernTemplatesView(props) { return h(TavernSettingsView, { ...props, page: 'templates', title: '提示词模板' }) }
 
     function ComposerCharacterSelect(props) {
       const agentPreset = props.useSessions(state => sessionAgentPreset(state.byId[props.sessionId]))
@@ -4565,10 +4613,25 @@ self.onmessage = event => {
       return h(TavernOpeningGreetingContent, { key: sessionId, sessionId, version })
     }
 
+    function BlankSessionSettings({ sessionId }) {
+      const [page, setPage] = React.useState('opening')
+      const pages = [['opening', '开场'], ['worldbook', '世界书'], ['persona', '用户设定/变量'], ['scripts', '脚本'], ['templates', '提示词模板']]
+      return h('section', { className: 'dst-blank-settings', 'aria-label': '酒馆会话设置' },
+        h('nav', { className: 'dst-tabs', 'aria-label': '酒馆会话页面' }, pages.map(([id, label]) => h(Button, {
+          key: id,
+          className: page === id ? 'tab active' : 'tab',
+          'aria-pressed': page === id,
+          onClick: () => setPage(id),
+        }, label))),
+        page === 'opening'
+          ? h(TavernOpeningGreeting, { sessionId })
+          : h(SessionSettingsContent, { key: `${sessionId}:${page}`, sessionId, page }))
+    }
+
     function ComposerOpeningGreeting(props) {
       const agentPreset = props.useSessions(state => sessionAgentPreset(state.byId[props.sessionId]))
       if (agentPreset !== 'sillytavern' || props.session?.blank !== true) return null
-      return h(TavernOpeningGreeting, { key: props.sessionId, sessionId: props.sessionId })
+      return h(BlankSessionSettings, { key: props.sessionId, sessionId: props.sessionId })
     }
 
     function TavernNarratorMessage({ node, sessionId }) {
@@ -4598,6 +4661,16 @@ self.onmessage = event => {
       return h('article', { className: 'dst-opening-message', 'aria-label': '角色开场' }, h(RegexGreetingContent, { sessionId, text, depth }))
     }
 
+    const SESSION_CSS = `
+.dst-manager-hint{flex:none;margin:0;padding:10px 16px;color:var(--dsw-alias-label-secondary,#64748b);font-size:12px;line-height:1.6}
+.dst-session-page{box-sizing:border-box;display:flex;flex-direction:column;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;padding-bottom:calc(var(--dsh-composer-height,152px) + 8px);background:var(--dsw-alias-bg-base,#fff);color:var(--dsw-alias-label-primary,#182033);font:14px/1.5 system-ui,sans-serif}
+.dst-session-header{display:flex;flex:none;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--dsw-alias-border-l2,#e2e8f0)}.dst-session-header h1{margin:0;font-size:18px}
+.dst-session-content{box-sizing:border-box;min-width:0;min-height:0;flex:1;overflow:auto;padding:16px;scrollbar-gutter:stable}.dst-session-content .dst-worldbook-controls{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
+.dst-session-page .dst-confirm-layer,.dst-blank-settings .dst-confirm-layer{z-index:100}
+.dst-blank-settings{box-sizing:border-box;display:flex;flex:0 0 auto;flex-direction:column;width:100%;min-width:0;color:var(--dsw-alias-label-primary,#182033);font:14px/1.5 system-ui,sans-serif}.dst-blank-settings>.dst-tabs{flex:none;padding:8px 0}.dst-blank-settings .dst-tabs button{white-space:nowrap}.dst-blank-settings>.dst-session-content{flex:none;height:max(280px,calc(100dvh - 310px))}.dst-blank-settings .dst-opening-greeting{height:max(280px,calc(100dvh - 310px))}
+@media(max-width:900px){.dst-session-content .dst-worldbook-controls{grid-template-columns:1fr}}@media(max-width:560px){.dst-blank-settings>.dst-session-content,.dst-blank-settings .dst-opening-greeting{height:max(280px,calc(100dvh - 350px))}.dst-session-header{padding:10px 14px}.dst-session-content{padding:12px}.dst-session-content .dst-worldbook-save{bottom:-12px;margin:16px -12px -12px;padding:10px 12px}}
+`
+
     const CSS = `
 .dst-event-context-form{margin-top:14px;padding:12px;border:1px solid #dce3ed;border-radius:10px}.dst-event-context-form>.dst-section-title{font-size:14px;margin-bottom:4px}.dst-memory-context{display:flex;flex-wrap:wrap;gap:6px 14px;color:#475569;font-size:12px}.dst-memory-context>span{overflow-wrap:anywhere}
 .dst-overlay{position:fixed;inset:0;z-index:90;pointer-events:none;font:14px/1.45 system-ui,sans-serif;color:#182033}.dst-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.42);pointer-events:auto}.dst-dialog-wrap{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}.dst-dialog-card{width:min(520px,calc(100vw - 32px));background:var(--dsh-surface,#fff);border:1px solid #ccd5e3;border-radius:16px;padding:20px;box-shadow:0 24px 70px #0f172a55;pointer-events:auto}.dst-dialog-title{font-size:18px;font-weight:750;margin-bottom:8px}.dst-manager{position:absolute;inset:0;width:100vw;height:100dvh;box-sizing:border-box;background:var(--dsh-surface,#fff);border:0;border-radius:0;box-shadow:none;overflow:hidden;pointer-events:auto;display:flex;flex-direction:column}.dst-manager>header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #e2e8f0}.dst-manager>header strong{display:block;font-size:17px}.dst-manager>header span{display:block;color:#64748b;font-size:12px}.dst-manager-content{min-height:0;display:flex;flex-direction:column;flex:1}.dst-manager .dst-manager-content{overflow:hidden}.dst-settings .dst-manager-content{min-height:520px}.dst-current{padding:9px 16px;background:#eef6ff;color:#24548a}.dst-current.empty{background:#fff7db;color:#76520b}.dst-tabs{display:flex;gap:5px;padding:10px 12px;border-bottom:1px solid #e2e8f0;overflow-x:auto}.dst-tab-body{padding:16px;overflow:auto;flex:1}.dst-button{border:0;border-radius:9px;padding:8px 12px;background:#326fd1;color:white;cursor:pointer;font:inherit}.dst-button:disabled{opacity:.5;cursor:not-allowed}.dst-button.secondary,.dst-button.tab{background:#eef2f7;color:#334155}.dst-button.active,.dst-button.tab.active{background:#dcecff;color:#174c8d}.dst-button.small{padding:5px 9px;font-size:12px}.dst-button.danger{background:#fee2e2;color:#a51f2a}.dst-header-button{padding:5px 9px;background:#f3e8ff;color:#6b21a8;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-actions{display:flex;align-items:center;gap:8px;margin:10px 0;flex-wrap:wrap}.dst-field{display:flex;flex-direction:column;gap:5px;margin:9px 0;min-width:0;flex:1}.dst-field>span{font-size:12px;font-weight:650;color:#475569}.dst-field input,.dst-field textarea,.dst-field select{box-sizing:border-box;width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:8px;background:var(--dsh-surface,#fff);color:inherit;font:inherit}.dst-field textarea{resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.dst-inline-fields{display:flex;gap:10px}.dst-section-title{font-size:16px;font-weight:750;margin-bottom:10px}.dst-muted{color:#64748b;font-size:12px}.dst-warning{background:#fff4d6;border:1px solid #f0cb69;color:#744d00;padding:9px;border-radius:8px}.dst-status{min-height:20px}.dst-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}.dst-card{border:1px solid #dce3ed;border-radius:11px;padding:12px;display:flex;flex-direction:column;gap:6px}.dst-tags,.dst-memory-keywords{display:flex;gap:4px;flex-wrap:wrap}.dst-tags span,.dst-memory-keywords span{font-size:11px;background:#f1f5f9;padding:2px 6px;border-radius:999px}.dst-memory-table{display:flex;flex-direction:column;gap:7px;margin-top:12px}.dst-memory-row{display:flex;justify-content:space-between;gap:12px;border:1px solid #dce3ed;border-radius:9px;padding:9px}.dst-memory-row pre{margin:5px 0 0;white-space:pre-wrap;font-size:11px}.dst-script{border:1px solid #dce3ed;border-radius:10px;padding:12px;margin:12px 0}.dst-trusted-frame,.dst-turn-render iframe{width:100%;min-height:260px;border:1px solid #cbd5e1;border-radius:8px;background:white}.dst-template-list{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px}.dst-turn-render{margin:8px 0;padding:8px;border:1px solid #e2e8f0;border-radius:9px}.dst-turn-render summary{cursor:pointer;color:#6b21a8}.dst-settings{padding:8px 4px}.dst-settings h2{margin-top:0}.dst-loading,.dst-error{padding:20px}.dst-error{color:#b91c1c}.dst-confirm-layer{position:fixed;inset:0;z-index:8;display:grid;place-items:center;padding:16px;background:#0f172a66;pointer-events:auto}.dst-confirm-card{box-sizing:border-box;width:min(600px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;padding:20px;border:1px solid #ccd5e3;border-radius:14px;background:var(--dsh-surface,#fff);box-shadow:0 24px 70px #0f172a66}.dst-reference-list{margin:10px 0;padding:10px 12px;border:1px solid #dce3ed;border-radius:9px}.dst-reference-list ul{margin:6px 0 0;padding-left:20px}.dst-worldbook-controls{display:grid;grid-template-columns:minmax(260px,1fr) auto minmax(260px,1fr);align-items:end;gap:12px;margin-bottom:14px;padding:12px;border:1px solid #dce3ed;border-radius:11px}.dst-worldbook-controls>.dst-muted{grid-column:1/-1;margin:0}.dst-worldbook-resource-actions{align-self:end;margin:9px 0}.dst-worldbook-resource-actions .dst-button{white-space:nowrap}@media(max-width:900px){.dst-worldbook-controls{grid-template-columns:1fr}.dst-worldbook-controls>.dst-muted{grid-column:auto}}@media(max-width:640px){.dst-inline-fields{display:block}.dst-manager{inset:0;width:100vw;height:100dvh}.dst-card-grid{grid-template-columns:1fr}}
@@ -4617,7 +4690,7 @@ self.onmessage = event => {
       if (conversation === undefined) return
       const style = document.createElement('style')
       style.dataset.dshSillyTavern = 'true'
-      style.textContent = `${CSS}${RUNTIME_CSS}${eventExplorerUI.css}`
+      style.textContent = `${CSS}${RUNTIME_CSS}${eventExplorerUI.css}${SESSION_CSS}`
       document.head.appendChild(style)
       ctx.effect(() => () => style.remove())
       ctx.effect(() => () => overlay.reset())
@@ -4626,7 +4699,7 @@ self.onmessage = event => {
       const eventSources = new Map()
       ctx.effect(() => () => { for (const source of eventSources.values()) source.dispose(); eventSources.clear() })
       const registerEventView = () => ctx.slots.inject('conversation.view', () => ctx.slots.register({
-        name: 'conversation.view', id: 'sillytavern-events', order: 20, label: '事件',
+        name: 'conversation.view', id: 'sillytavern-events', order: 20, label: '时间线',
         inject: sessionId => {
           let source = eventSources.get(sessionId)
           if (source === undefined) {
@@ -4660,7 +4733,7 @@ self.onmessage = event => {
           async options() {
             return [
               { id: 'file', label: '导入 V3 角色卡', detail: 'PNG、APNG 或 JSON；绑定到当前会话' },
-              { id: 'manager', label: '打开酒馆管理', detail: '角色库、角色设定、事件、脚本与提示词模板' },
+              { id: 'manager', label: '打开酒馆管理', detail: '角色库、角色卡与角色脚本' },
             ]
           },
           onSelect(option, session) {
@@ -4676,6 +4749,12 @@ self.onmessage = event => {
       ctx.slots.inject('conversation.chat.commandview', () => ctx.slots.register({ name: 'conversation.chat.commandview', key: 'st-opening' }, TavernOpeningMessage))
       ctx.slots.inject('conversation.chat.commandview', () => ctx.slots.register({ name: 'conversation.chat.commandview', key: 'narrator' }, TavernNarratorMessage))
       registerEventView()
+      for (const [id, order, label, component] of [
+        ['sillytavern-worldbook', 21, '世界书', TavernWorldbookView],
+        ['sillytavern-persona', 22, '用户设定/变量', TavernPersonaView],
+        ['sillytavern-scripts', 23, '脚本', TavernScriptsView],
+        ['sillytavern-templates', 24, '提示词模板', TavernTemplatesView],
+      ]) ctx.slots.inject('conversation.view', () => ctx.slots.register({ name: 'conversation.view', id, order, label }, component))
     }
 
     exports.apply = apply

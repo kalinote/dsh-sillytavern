@@ -3,7 +3,7 @@ import { estimateTokens } from './tokenizer.js'
 const MAX_SCAN_CHARS = 16 * 1024
 const MAX_SCAN_DEPTH = 100
 const DEFAULT_SCAN_DEPTH = 8
-const DEFAULT_TOKEN_BUDGET = 2048
+export const DEFAULT_FALLBACK_TOKEN_BUDGET = 250_000
 const DEFAULT_BUDGET_PERCENT = 25
 const DEFAULT_DEPTH = 4
 
@@ -188,8 +188,8 @@ export function worldbookTokenBudget(options = {}, book = undefined) {
   const percent = Number.isFinite(percentValue) && percentValue > 0 ? Math.min(percentValue, 100) : DEFAULT_BUDGET_PERCENT
   let budget = Number.isSafeInteger(contextWindow) && contextWindow > 0
     ? Math.max(1, Math.round(contextWindow * percent / 100))
-    : Number(options.fallbackTokenBudget ?? options.tokenBudget ?? DEFAULT_TOKEN_BUDGET)
-  if (!Number.isSafeInteger(budget) || budget <= 0) budget = DEFAULT_TOKEN_BUDGET
+    : Number(options.fallbackTokenBudget ?? options.tokenBudget ?? DEFAULT_FALLBACK_TOKEN_BUDGET)
+  if (!Number.isSafeInteger(budget) || budget <= 0) budget = DEFAULT_FALLBACK_TOKEN_BUDGET
   const bookBudget = Number(book?.token_budget ?? options.bookTokenBudget)
   if (Number.isSafeInteger(bookBudget) && bookBudget >= 0) budget = Math.min(budget, bookBudget)
   const cap = Number(options.budgetCap)

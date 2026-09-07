@@ -410,7 +410,7 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
         h(MemoryDetail, { key: text(row?.id || index), row, index }))))
   }
 
-  function EventExplorerView({ document: eventDocument, loading = false, refreshing = false, error = null, onRefresh, sessionId }) {
+  function EventExplorerView({ document: eventDocument, loading = false, refreshing = false, error = null, onRefresh, onEdit, sessionId }) {
     const [selectedId, setSelectedId] = React.useState(null)
     const [query, setQuery] = React.useState('')
     const [searchCursor, setSearchCursor] = React.useState(-1)
@@ -612,8 +612,8 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
     return h('div', { className: 'dst-explorer-root', 'data-session-id': text(sessionId), 'data-conversation-composer-overlay': '' },
       h('header', { className: 'dst-explorer-toolbar' },
         h('div', { className: 'dst-explorer-heading' },
-          h('span', { className: 'dst-explorer-kicker' }, 'SillyTavern 事件'),
-          h('h1', null, '剧情事件探索器'),
+          h('span', { className: 'dst-explorer-kicker' }, 'SillyTavern'),
+          h('h1', null, '剧情时间线'),
           h('span', { className: 'dst-explorer-revision' }, `修订 ${computed.model?.revision ?? eventDocument?.revision ?? 0}`)),
         h('div', { className: 'dst-explorer-search' },
           h('label', null,
@@ -628,6 +628,7 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
           h('output', { 'aria-live': 'polite' }, normalizedQuery ? `${matchPosition}/${matches.length}` : `${searchEntries.length} 个事件`),
           h('button', { type: 'button', disabled: !normalizedQuery || !matches.length, onClick: () => locateMatch(-1), 'aria-label': '上一个搜索结果' }, '↑'),
           h('button', { type: 'button', disabled: !normalizedQuery || !matches.length, onClick: () => locateMatch(1), 'aria-label': '下一个搜索结果' }, '↓')),
+        typeof onEdit === 'function' ? h('button', { type: 'button', onClick: onEdit }, '编辑事件') : null,
         h('button', { type: 'button', className: 'dst-explorer-refresh', disabled: refreshing || typeof onRefresh !== 'function', onClick: () => onRefresh?.() }, refreshing ? '刷新中…' : '刷新')),
       shownError ? h('div', { className: 'dst-explorer-error', role: 'alert' },
         h('span', null, text(shownError)),

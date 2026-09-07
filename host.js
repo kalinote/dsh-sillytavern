@@ -8,6 +8,7 @@ import { installBundledPreset } from './src/preset-installer.js'
 import { promptRegexRequest, transformRawAssistantStream, transformRawUserMessages } from './src/regex-pipeline.js'
 import { getRegexedString, REGEX_PLACEMENT, regexRulesForState, runRegexScript, regexScopeForState } from './src/regex.js'
 import { countModelTokens } from './src/tokenizer.js'
+import { DEFAULT_FALLBACK_TOKEN_BUDGET } from './src/worldbook.js'
 import { buildCompatibilitySnapshot, compatibilityManifest } from './src/compatibility.js'
 import { execute as executeCompatSlash, registry as compatSlashRegistry } from './src/compat-slash.js'
 import { CompatibilityGenerationBroker } from './src/compat-generation.js'
@@ -174,7 +175,7 @@ export async function apply(ctx, config = {}) {
         budgetPercent: lorebookSettings.context_percentage ?? config.worldInfoBudgetPercent ?? 25,
         budgetCap: lorebookSettings.budget_cap ?? config.worldInfoBudgetCap ?? 0,
         scanDepth: lorebookSettings.scan_depth,
-        fallbackTokenBudget: config.worldInfoFallbackTokenBudget ?? 2048,
+        fallbackTokenBudget: config.worldInfoFallbackTokenBudget ?? DEFAULT_FALLBACK_TOKEN_BUDGET,
         injections,
         promptOverrides: route.promptOverrides,
         countTokens: text => countModelTokens(provider, model, text, signal),
@@ -618,8 +619,8 @@ export async function apply(ctx, config = {}) {
         const delta = sessionEventDelta(agent, after)
         const projected = store.compatChatProjection(agent).messages
         const history = after < 0
-          ? projected.map(message => ({ role: message.role, text: message.message.slice(-8192), seq: message.sourceSeq ?? message.message_id, message_id: message.message_id }))
-          : delta.history.map(message => ({ ...message, text: message.text.slice(-8192) }))
+          ? projected.map(message => ({ role: message.role, text: message.message, seq: message.sourceSeq ?? message.message_id, message_id: message.message_id }))
+          : delta.history
         sendJson(res, 200, { ok: true, value: { card: view.card === null ? null : { id: view.card.id, name: view.card.card.data.nickname || view.card.card.data.name }, history, messages: projected, cursor: delta.cursor, hasMore: delta.hasMore, compatChatRevision: store.compatChatProjection(agent).revision } })
         return
       }

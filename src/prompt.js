@@ -10,9 +10,6 @@ function promptRegex(text, placement, sources, options, phase) {
   return result.text
 }
 
-const MAX_MESSAGE_CHARS = 32 * 1024
-const MAX_SECTION_CHARS = 32 * 1024
-const MAX_PROMPT_CHARS = 200 * 1024
 const MAX_AUTO_RECALL_ROWS = 24
 const MAX_EVENT_TEXT_CHARS = 28 * 1024
 const MAX_PENDING_EVENT_TEXT_CHARS = 24 * 1024
@@ -32,7 +29,7 @@ function messageFromEvent(event) {
   const role = event.type === 'user/message' ? 'user' : event.type === 'assistant/message' ? 'assistant' : undefined
   if (role === undefined) return undefined
   const content = role === 'user' ? event.data?.content : event.data?.message?.content
-  const text = blockText(content).slice(-MAX_MESSAGE_CHARS)
+  const text = blockText(content)
   return text === '' ? undefined : { role, text, seq: event.seq }
 }
 
@@ -273,8 +270,8 @@ function boundedObjects(values, maxChars) {
 function scopeFor(state, messages, compactedSeqs = new Set()) {
   const card = state.record.card
   const data = card.data
-  const text = value => String(value ?? '').slice(0, MAX_SECTION_CHARS)
-  const scopedMessages = messages.slice(-20).map(message => ({ role: message.role, text: message.text.slice(-8192), seq: message.seq }))
+  const text = value => String(value ?? '')
+  const scopedMessages = messages.slice(-20).map(message => ({ role: message.role, text: message.text, seq: message.seq }))
   const character = {
     name: text(data.nickname || data.name),
     description: text(data.description),
@@ -314,7 +311,7 @@ function scopeFor(state, messages, compactedSeqs = new Set()) {
     currentSwipeId: Number(state.binding.openingSwipeId ?? 0),
     event: boundedObjects(selectAutoRecallRows(state.event, messages, compactedSeqs), 256 * 1024),
     messages: scopedMessages,
-    history: scopedMessages.map(message => `${message.role}: ${message.text}`).join('\n').slice(-256 * 1024),
+    history: scopedMessages.map(message => `${message.role}: ${message.text}`).join('\n'),
   }
 }
 
@@ -325,7 +322,7 @@ export function initialGreetingView(state, swipeId = 0) {
   const swipeCount = alternates.length + 1
   if (swipeId >= swipeCount) throw new RangeError(`opening swipeId ${swipeId} is outside 0..${swipeCount - 1}`)
   const scope = scopeFor(state, [])
-  const render = value => renderMacros(String(value ?? '').slice(0, MAX_SECTION_CHARS), scope, MAX_SECTION_CHARS)
+  const render = value => renderMacros(String(value ?? ''), scope)
   let text
   try { text = render(swipeId === 0 ? state.record.card.data.first_mes : alternates[swipeId - 1]).trim() } catch { return null }
   if (text === '') return null
@@ -392,7 +389,7 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
   const templateDiagnostics = []
   const renderTemplateSource = async (value, source, renderScope = scope, fallback = '[content omitted: template evaluation failed]') => {
     try {
-      return (await templateRuntime.render(String(value ?? '').slice(0, MAX_SECTION_CHARS), renderScope, { source, stage: 'generate' }, signal)).text
+      return (await templateRuntime.render(String(value ?? ''), renderScope, { source, stage: 'generate' }, signal)).text
     } catch (error) {
       if (signal?.aborted) throw (signal.reason ?? error)
       templateDiagnostics.push(error?.diagnostic ?? {
@@ -417,7 +414,7 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     scanDepth: options.scanDepth,
     fallbackTokenBudget: options.fallbackTokenBudget,
     countTokens: options.countTokens,
-    renderKey: key => renderMacros(String(key ?? '').slice(0, MAX_SECTION_CHARS), scope, MAX_SECTION_CHARS),
+    renderKey: key => renderMacros(String(key ?? ''), scope),
     render: async (content, entry) => {
       const sourceName = `worldbook:${String(state.worldbook?.book?.name ?? state.worldbook?.name ?? 'current')}/${String(entry?.comment ?? entry?.name ?? entry?.id ?? entry?.uid ?? 'entry')}`
       const rendered = await renderTemplateSource(content, sourceName, { ...scope, world_info: entry })
@@ -462,21 +459,16 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     personaName: await renderTemplateSource(state.binding.userPersona.name, 'persona:name', cardScope),
     personaDescription: await renderTemplateSource(state.binding.userPersona.description, 'persona:description', cardScope),
   }
-  let worldChars = 0
-  const boundedWorld = values => values.flatMap(value => {
-    if (worldChars >= MAX_SECTION_CHARS) return []
-    const text = String(value ?? '').slice(0, MAX_SECTION_CHARS - worldChars)
-    worldChars += text.length
-    return text === '' ? [] : [text]
-  })
+  // Activation already budgets the rendered worldbook content in tokens.
+  // Preserve accepted entries across positions, including the later @depth projection.
   const renderedWorld = {
-    before: boundedWorld(world.before),
-    after: boundedWorld(world.after),
-    middle: boundedWorld(world.middle),
-    exampleTop: boundedWorld(world.exampleTop ?? []),
-    exampleBottom: boundedWorld(world.exampleBottom ?? []),
-    authorNoteTop: boundedWorld(world.authorNoteTop ?? []),
-    authorNoteBottom: boundedWorld(world.authorNoteBottom ?? []),
+    before: world.before,
+    after: world.after,
+    middle: world.middle,
+    exampleTop: world.exampleTop ?? [],
+    exampleBottom: world.exampleBottom ?? [],
+    authorNoteTop: world.authorNoteTop ?? [],
+    authorNoteBottom: world.authorNoteBottom ?? [],
   }
   const promptOverrides = options.promptOverrides ?? {}
   if (Object.hasOwn(promptOverrides, 'world_info_before')) renderedWorld.before = [await renderTemplateSource(promptOverrides.world_info_before, 'override:world_info_before')]
@@ -496,8 +488,8 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     world_info_after: [...renderedWorld.after, ...renderedWorld.middle].join('\n'),
   }
   const worldbookDepthEntries = [...world.depthEntries, ...injectionProjection.messages].flatMap(item => {
-    const rendered = boundedWorld([item.content])
-    return rendered.length === 0 ? [] : [{ ...item, content: rendered[0] }]
+    const content = String(item.content ?? '')
+    return content === '' ? [] : [{ ...item, content }]
   })
   const template = await templateRuntime.snapshot(signal)
   template.diagnostics.push(...templateDiagnostics)
@@ -505,7 +497,7 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
   const templateAfter = []
   const templatePostHistory = []
   for (const item of template.injections) {
-    const text = String(item.text ?? '').slice(0, MAX_SECTION_CHARS)
+    const text = String(item.text ?? '')
     if (text.trim() === '') continue
     if (item.position === 'before') templateBefore.push(text)
     else if (item.position === 'after') templateAfter.push(text)
@@ -549,12 +541,7 @@ export async function assembleSillyTavernPrompt(agent, state, signal, options = 
     section('Post-history instructions', [renderedCard.postHistory, ...postTemplates, ...templatePostHistory].filter(value => value.trim() !== '').join('\n\n')),
     ...renderedWorld.authorNoteBottom,
   ].filter(value => String(value).trim() !== '')
-  const boundedParts = parts.map(value => {
-    const text = String(value)
-    return text.length <= MAX_SECTION_CHARS ? text : `${text.slice(0, MAX_SECTION_CHARS)}\n[section truncated]`
-  })
-  let system = boundedParts.join('\n\n')
-  if (system.length > MAX_PROMPT_CHARS) system = `${system.slice(0, MAX_PROMPT_CHARS - 32 * 1024)}\n\n[prompt middle truncated]\n\n${system.slice(-32 * 1024)}`
+  const system = parts.join('\n\n')
   return {
     system: neutralizeDshTemplates(system),
     postHistory: '',

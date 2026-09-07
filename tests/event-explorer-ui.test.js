@@ -138,3 +138,12 @@ test('empty, loading, and recoverable-error states are explicit', () => {
   assert.match(failed.text, /读取失败/)
   assert.match(failed.text, /重试/)
 })
+
+test('timeline exposes its existing event editor through one edit action', () => {
+  let edits = 0
+  const result = render(fixture(), [], { onEdit: () => { edits += 1 } })
+  const edit = result.elements.find(element => element.type === 'button' && result.content(element.children) === '编辑事件')
+  assert.ok(edit)
+  edit.props.onClick()
+  assert.equal(edits, 1)
+})

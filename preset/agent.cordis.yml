@@ -11,3 +11,21 @@
 
 - id: dsh-sillytavern-agent
   name: 'dsh-sillytavern/agent'
+
+# 复用 DSH 的历史压缩与工具结果裁剪及其默认配置。
+# 两个服务共享预设内的 realm；tokenMeter 继续使用 Host 实例。
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'

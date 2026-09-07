@@ -234,7 +234,19 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
       },
     })
     assert.equal(decoration.name, 'st-import')
-    assert.deepEqual(slots, ['conversation.input.left', 'conversation.input.dock', 'shell.overlay', 'settings.section', 'conversation.chat.commandview', 'conversation.chat.commandview', 'conversation.view'])
+    assert.deepEqual(slots, [
+      'conversation.input.left',
+      'conversation.input.dock',
+      'shell.overlay',
+      'settings.section',
+      'conversation.chat.commandview',
+      'conversation.chat.commandview',
+      'conversation.view',
+      'conversation.view',
+      'conversation.view',
+      'conversation.view',
+      'conversation.view',
+    ])
     assert.deepEqual(slotOptions.map(option => [option.name, option.id, option.order, option.priority]), [
       ['conversation.input.left', 'sillytavern-character', 25, undefined],
       ['conversation.input.dock', 'sillytavern-opening-greeting', -10, undefined],
@@ -243,19 +255,17 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
       ['conversation.chat.commandview', undefined, undefined, undefined],
       ['conversation.chat.commandview', undefined, undefined, undefined],
       ['conversation.view', 'sillytavern-events', 20, undefined],
+      ['conversation.view', 'sillytavern-worldbook', 21, undefined],
+      ['conversation.view', 'sillytavern-persona', 22, undefined],
+      ['conversation.view', 'sillytavern-scripts', 23, undefined],
+      ['conversation.view', 'sillytavern-templates', 24, undefined],
     ])
     assert.equal(slotOptions[4].key, 'st-opening')
     assert.equal(slotOptions[5].key, 'narrator')
     assert.equal(slotOptions[1].inject, undefined)
-    hookStates = [
-      null,
-      { loading: false, error: null, value: { binding: { cardId: 'card-a' }, card: { card: { data: { name: 'Alice' } } } } },
-      { loading: false, error: null, value: { schemaVersion: 1, runtimeRevision: 0, sessionId: 'session-a', bindingRevision: 0, state: { sessionId: 'session-a', binding: { variables: {} }, history: [] }, cardRecord: { id: 'card-a' }, characterCard: { data: { name: 'Alice' } }, character: { name: 'Alice' }, persona: { name: 'User' }, variables: {}, globalVariables: {}, scriptInjections: [], messages: [], context: { chatId: 'session-a', characterId: 'card-a', name1: 'User', name2: 'Alice', chatMetadata: {} }, compatibility: {} } },
-      { loading: false, error: null, value: { cards: [{ id: 'card-a', name: 'Alice' }] } },
-      false,
-    ]
     const sessionState = { byId: { 'session-a': { projectionValues: { agentPreset: 'sillytavern' } } } }
-    assert.equal(slotOptions[6].label, '事件')
+    assert.deepEqual(slotOptions.slice(6, 11).map(option => option.label), ['时间线', '世界书', '用户设定/变量', '脚本', '提示词模板'])
+    assert.deepEqual(slotComponents.slice(6, 11).map(component => component.name), ['TavernEventsView', 'TavernWorldbookView', 'TavernPersonaView', 'TavernScriptsView', 'TavernTemplatesView'])
     const eventView = slotComponents[6]({ sessionId: 'session-a', useSessions: selector => selector(sessionState) })
     assert.equal(eventView.type.name, 'TavernEventsSession')
     const eventState = { document: { revision: 0, rows: [], eventEdges: [] }, loading: false, refreshing: false, error: null }
@@ -263,6 +273,13 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(eventsElement.props.document, eventState.document)
     const notTavern = slotComponents[6]({ sessionId: 'other', useSessions: selector => selector({ byId: { other: { agentPreset: 'standard' } } }) })
     assert.match(notTavern.children.join(''), /酒馆模式会话/)
+    hookStates = [
+      null,
+      { loading: false, error: null, value: { binding: { cardId: 'card-a' }, card: { card: { data: { name: 'Alice' } } } } },
+      { loading: false, error: null, value: { schemaVersion: 1, runtimeRevision: 0, sessionId: 'session-a', bindingRevision: 0, state: { sessionId: 'session-a', binding: { variables: {} }, history: [] }, cardRecord: { id: 'card-a' }, characterCard: { data: { name: 'Alice' } }, character: { name: 'Alice' }, persona: { name: 'User' }, variables: {}, globalVariables: {}, scriptInjections: [], messages: [], context: { chatId: 'session-a', characterId: 'card-a', name1: 'User', name2: 'Alice', chatMetadata: {} }, compatibility: {} } },
+      { loading: false, error: null, value: { cards: [{ id: 'card-a', name: 'Alice' }] } },
+      false,
+    ]
     const inputState = { draft: '已有草稿', phase: 'plain' }
     const useInput = selector => selector(inputState)
     let nextDraft
@@ -466,8 +483,13 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(tavernSvg.props.viewBox, '0 0 16 16')
     assert.equal(characterView.props.anchor.children[1].children[0], 'Alice')
     assert.equal(slotComponents[0]({ sessionId: 'session-b', blocks: conversation.blocks, useInput: selector => selector({ draft: '', phase: 'plain' }), inputActions: { setDraft() {} }, useSessions: selector => selector({ byId: { 'session-b': { projectionValues: { agentPreset: 'cat' } } } }) }), null)
-    hookStates = [null, null, { loading: true, error: null, value: { characterName: 'Alice', text: 'Welcome, User.', swipeId: 0, swipeCount: 2 } }]
-    const openingElement = slotComponents[1]({ sessionId: 'session-a', session: { blank: true }, useSessions: selector => selector(sessionState) })
+    hookStates = ['opening', null, null, { loading: true, error: null, value: { characterName: 'Alice', text: 'Welcome, User.', swipeId: 0, swipeCount: 2 } }]
+    const blankSettingsElement = slotComponents[1]({ sessionId: 'session-a', session: { blank: true }, useSessions: selector => selector(sessionState) })
+    assert.equal(blankSettingsElement.type.name, 'BlankSessionSettings')
+    const blankSettings = blankSettingsElement.type(blankSettingsElement.props)
+    assert.equal(blankSettings.props['aria-label'], '酒馆会话设置')
+    assert.deepEqual(blankSettings.children[0].children[0].map(item => item.children[0]), ['开场', '世界书', '用户设定/变量', '脚本', '提示词模板'])
+    const openingElement = blankSettings.children[1]
     assert.equal(openingElement.type.name, 'TavernOpeningGreeting')
     const openingContent = openingElement.type(openingElement.props)
     assert.equal(openingContent.type.name, 'TavernOpeningGreetingContent')
@@ -793,6 +815,6 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(slotComponents[2](), null, 'plugin disposal must reset module-scoped overlay state')
     assert.equal(removed, true)
     assert.equal(commandDisposed, 1)
-    assert.equal(slotsDisposed, 12)
+    assert.equal(slotsDisposed, 16)
   } finally { globalThis.window = previous; globalThis.document = previousDocument; globalThis.fetch = previousFetch }
 })

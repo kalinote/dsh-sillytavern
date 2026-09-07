@@ -65,10 +65,10 @@ test('session messages follow native Surface replacement semantics', () => {
   ])
 })
 
-test('initial greeting omits empty or macro-overflow content', () => {
+test('initial greeting omits empty content and preserves macro expansion beyond 32 KiB', () => {
   assert.equal(initialGreetingView(greetingState('   ')), null)
-  const huge = 'x'.repeat(32 * 1024)
-  assert.equal(initialGreetingView(greetingState('{{getvar::huge}}{{getvar::huge}}', { huge })), null)
+  const huge = `${'x'.repeat(33 * 1024)}<GREETING-MACRO-END>`
+  assert.equal(initialGreetingView(greetingState('{{getvar::huge}}', { huge }))?.text, huge)
 })
 
 test('assembles ST world-info anchors separately and resolves named outlets only in macro-aware templates', async () => {

@@ -430,6 +430,17 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.equal(eventState.body.value.history[0].role, 'assistant', 'the selected opening is a durable projected floor before the first user message')
   assert.equal('event' in eventState.body.value, false)
   assert.ok(JSON.stringify(eventState.body).length < 2048, 'event polling response stays lightweight')
+
+  const longHistoryAgent = fakeAgent(join(root, 'workspace'), 'session-http-long-history')
+  agents.set(longHistoryAgent.id, longHistoryAgent)
+  const longHistoryText = `HISTORY-HEAD\n${'H'.repeat(36 * 1024)}\nHISTORY-TAIL`
+  longHistoryAgent.session.append('user/message', { content: [{ type: 'text', text: 'earlier' }] }, { surfaceOp: 'append' })
+  longHistoryAgent.session.append('user/message', { content: [{ type: 'text', text: longHistoryText }] }, { surfaceOp: 'append' })
+  for (const after of [-1, 0]) {
+    const polled = await invoke(route, 'GET', `/api/dsh-sillytavern/event-state?sessionId=${longHistoryAgent.id}&after=${after}`)
+    assert.equal(polled.status, 200)
+    assert.equal(polled.body.value.history.find(message => message.seq === 1)?.text, longHistoryText, 'initial and incremental polling preserve the complete history text')
+  }
   const traversal = await invoke(route, 'POST', '/api/dsh-sillytavern/card/update', { sessionId: live.id, cardId: '../escape', patch: { cardData: { name: 'x' } } })
   assert.equal(traversal.status, 400)
   assert.match(traversal.body.error, /SHA-256/)

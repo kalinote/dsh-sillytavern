@@ -6,17 +6,21 @@
 
 - 从输入框左下角“+”导入 V3 PNG、APNG 或 JSON；角色卡内携带的世界书会作为独立世界书资源一并导入；
 - V3 `ccv3` CRC/Base64/UTF-8/JSON 分层校验，V2-only 明确拒绝；对生态中常见但不规范的缺失 `group_only_greetings`/世界书 `extensions` 安全补空并给出警告；
-- 角色卡、用户设定/变量、首条问候、独立的结构化 Character Book V3 世界书管理和 system-role post-history 注入；角色卡可绑定一套默认世界书，Session 在首次真实用户消息时以其初始化自身的世界书引用，之后可独立修改该引用；TavernHelper API 还可绑定工作区全局书及当前角色的 primary/additional 书，生成时按全局→角色→当前会话去重合并。世界书支持常驻/关键词/向量标记策略、Secondary Logic、概率、原生 JavaScript 正则、多级递归、Order、0–7 Position、`@depth`、Outlet 与递归控制，并在宏及 WORLD_INFO Regex 展开后按本轮模型真实 tokenizer 与上下文窗口比例（默认 25%）预算；卡内 `token_budget` 可进一步收紧该预算，最近一次激活条目、预算与运行时警告可在管理页查看；纯向量相似度激活仍需要未来接入 embedding retriever；
+- 角色卡、用户设定/变量、首条问候、独立的结构化 Character Book V3 世界书管理和 system-role post-history 注入；角色卡可绑定一套默认世界书，Session 在首次真实用户消息时以其初始化自身的世界书引用，之后可独立修改该引用；TavernHelper API 还可绑定工作区全局书及当前角色的 primary/additional 书，生成时按全局→角色→当前会话去重合并。世界书支持常驻/关键词/向量标记策略、Secondary Logic、概率、原生 JavaScript 正则、多级递归、Order、0–7 Position、`@depth`、Outlet 与递归控制，并在宏及 WORLD_INFO Regex 展开后按本轮模型真实 tokenizer 与上下文窗口比例（默认 25%）预算；无法识别模型上下文窗口时使用 250,000 tokens 的回退上限；卡内 `token_budget` 可进一步收紧该预算，最近一次激活条目、预算与运行时警告可在管理页查看；纯向量相似度激活仍需要未来接入 embedding retriever；
 - EJS 3.1.10 异步提示词模板、共享变量缓存与提交，以及 `{{char}}`、`{{user}}`、`{{getvar::name}}`；
 - 生成前自动召回 + 主模型按需只读查询的事件：主 Agent 只负责剧情生成，只暴露 `st_event_query` 和 `st_event_graph_query`。普通完成回合在后台进行增量维护，仅向独立事件维护 Agent 提供该轮最后一条真实用户消息、最终助手正文和关键词命中的相关 memory rows；每 10 个完整回合自动进行一次定期整理，用重叠 1 轮的完整上下文归并、纠错和补全事件关系，再由 Host 原子提交结构化 patch；
-- 工作区角色库、独立世界书库、角色编辑、模板、事件和脚本管理 UI；管理页使用全屏弹窗；
-- 对话页“对话 / 轨迹”旁新增“事件”视图：上方剧情时间甘特图、下方完整事件关系图，点击时间条或节点打开右侧详情；支持搜索定位、缩放、拖动画布和自动刷新；
+- 工作区角色库、独立世界书库、角色编辑、模板、事件和脚本管理 UI；管理页使用全屏弹窗。入口上，Manager 保留角色库、角色卡和角色脚本（Scoped）；工作区与当前 Session 共用同一层 `conversation.view` 标签，放置时间线、世界书、用户设定/变量、脚本（Global/Preset）和提示词模板；
+- 对话页“对话 / 轨迹”旁新增“时间线”视图（标签 ID 仍为 `sillytavern-events`）：上方剧情时间甘特图、下方完整事件关系图，点击时间条或节点打开右侧详情；支持搜索定位、缩放、拖动画布和自动刷新，并可切换原事件编辑器；
 - 面向 TavernHelper 4.9.4 / SillyTavern 1.18.0 固定基线的 Session 级兼容运行时：所有 iframe 在角色代码执行前获得同步状态快照，共享 `TavernHelper`、`SillyTavern.getContext()`、变量、消息、事件、注入、生成、世界书、Regex 与常见前端生态 facade；已确认的 JavaScript 作为会话后台脚本持续运行；能力清单可从 `GET /api/dsh-sillytavern/compatibility` 读取；
 - 角色、变量、Prompt、事件（由多条 memory rows 聚合而成）、增量事件 API 与 opaque-origin iframe 前端渲染；助手正文使用 DSH 原生 GFM Markdown，并兼容传统独占行 `<font color>`；状态栏等自定义标签只按角色卡或其他 Regex 来源实际定义的规则渲染，插件不猜测未命中标签的含义；
 - 将 `extensions.regex_scripts` 作为完整的 `findRegex → replaceString` 规则导入；支持 Global → Preset → Scoped 顺序、用户/助手/Slash/世界书/Reasoning placement、原始/显示/Prompt/Edit 阶段、depth、Trim Out、NONE/RAW/ESCAPED 宏替换以及 `/narrator`、`/regex`、`/regex-state`、`/regex-toggle`；导入规则默认启用，编辑执行材料后自动停用；
 - 所有插件数据均在工作区的 `.dsh/sillytavern/` 持久化；会话绑定、事件与全局资源在该工作区内隔离，支持跨 Store 刷新、dead-owner lock 恢复与 dispose 提交屏障。
 
 当前不支持 V1/V2、群聊、自动创建新会话和向量语义检索。
+
+提示词组装不再施加 32,768 字符的段落/世界书共享上限或 204,800 字符的总 system 截断；已选历史消息、模板 history 和事件轮询历史也保留完整文本。完整 system 和消息继续通过 DSH 公共 LLM 服务发送，模型上下文大小来自 `llm.resolveModelInfo()`。世界书仍按完整宏/Regex 展开内容执行 SillyTavern 的 token 预算、Order 和扫描深度规则；历史条数选择与事件召回预算仍属于插件业务规则。
+
+酒馆预设挂载 DSH 原生 `compaction-basic`、`command-compact` 与 `tool-result-pruner`，直接使用它们的默认配置和 Host 的 `tokenMeter`。自动压缩作用于原生已记录历史，不保证压缩静态 system、后置 `@depth`/兼容消息投影或独立 `generate/generateRaw` 请求；`llm.stream()` 本身不做输入裁剪，首次或本轮新增的超长输入仍可能超过模型容量。EJS 仍使用插件自身的有状态运行时及其模板输入/输出、scope 和执行额度；DSH 没有可直接替代它的 EJS 会话接口。
 
 ## 安装
 
@@ -29,22 +33,22 @@ dsh plugin --profile web add .
 
 Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的用户预设根目录；无需用户点击或手工复制。DSH 会在用户选择该预设并创建会话时按正常流程挂载验证。相同的手工安装会被安全接管，后续未修改的托管预设随 Bundle 更新；若同名预设已被用户修改或由系统根提供，插件拒绝覆盖并以明确错误停止启动。
 
-重启当前 DSH Web 进程，在新会话中选择“酒馆模式”。不要启动第二个 Web server；Client bundle 由现有 DSH Web URL 提供。
+入口变更后需用户自行重启当前 DSH Web 进程，在新会话中选择“酒馆模式”。不要启动第二个 Web server；Client bundle 由现有 DSH Web URL 提供。
 
 ## 使用
 
 1. 用户在左侧自行新建或打开会话；
 2. 使用 DSH 原生 Agent 预设菜单选择“酒馆模式”；最近一次选择的工作区角色会在首次真实用户消息前作为候选角色；第一条真实用户消息才提交角色与默认世界书的 Session 引用；
-3. 会话开始前，角色卡的 `first_mes` 会显示在输入框上方；仅在酒馆模式空白会话中，Logo、开场内容与原生编辑框共同占据完整动态视口，开场内容弹性使用扣除 Logo/编辑区后的主要剩余高度，且不显示额外的“开场预览”徽标；Markdown 使用 DSH 原生渲染器，HTML 围栏/文档在 opaque-origin iframe 中按原样运行，插件不删除远程资源、脚本、内联事件、meta、iframe 或 CSS，也不注入 CSP；开场、消息 HTML、预览和后台脚本使用同一兼容桥，提供 `setChatMessages` 的 message 0 swipe、`triggerSlash('/echo ...')` 和常见 `#send_textarea`/`#send_but` 输入代理；选择本身不调用模型，用户仍在原生输入框中发送第一条回复；Host 会在原生用户消息进入日志前写入一个持久的 `st-opening` 展示节点，Client 通过官方 additive command-view Slot 将最终开场显示在对话顶部，原生用户消息只写入一次；模型每轮均从系统上下文读取同一已选开场，不增加模型调用；
+3. 会话开始前，角色卡的 `first_mes` 会显示在输入框上方；Harness 在空白会话隐藏原生标签栏时，开场区域通过既有 `conversation.input.dock` 提供“开场 / 世界书 / 用户设定/变量 / 脚本 / 提示词模板”切换入口，其中用户设定与变量合并为一个标签；首条消息后回到对话旁的正式标签，不替换 Hero 或原生 Composer。仅在酒馆模式空白会话中，Logo、开场内容与原生编辑框共同占据完整动态视口，开场内容弹性使用扣除 Logo/编辑区后的主要剩余高度，且不显示额外的“开场预览”徽标；Markdown 使用 DSH 原生渲染器，HTML 围栏/文档在 opaque-origin iframe 中按原样运行，插件不删除远程资源、脚本、内联事件、meta、iframe 或 CSS，也不注入 CSP；开场、消息 HTML、预览和后台脚本使用同一兼容桥，提供 `setChatMessages` 的 message 0 swipe、`triggerSlash('/echo ...')` 和常见 `#send_textarea`/`#send_but` 输入代理；选择本身不调用模型，用户仍在原生输入框中发送第一条回复；Host 会在原生用户消息进入日志前写入一个持久的 `st-opening` 展示节点，Client 通过官方 additive command-view Slot 将最终开场显示在对话顶部，原生用户消息只写入一次；模型每轮均从系统上下文读取同一已选开场，不增加模型调用；
 4. 输入框工具行左侧会出现带酒杯线框图标的系统风格角色卡菜单；没有绑定时显示“选择角色卡”，窄窗口会自动折叠文字以减少工具行换行；
 5. 未开始对话的会话可从下拉中选择工作区角色；首条真实用户消息后角色与世界书引用冻结，不能再换角色。所选角色也会成为以后新酒馆会话的默认角色；
 6. 若角色尚未导入，点击输入框左下角“+”，选择 `st-import` →“导入 V3 角色卡”，再选择 PNG/APNG/JSON；
-7. 从角色卡菜单底部的“管理酒馆模式”进入全屏管理页，管理角色设定、persona、世界书、事件、脚本和模板。“事件”页可录入剧情时间状态与时间轴范围、从大到小的地点路径、在场人物、召回策略和可选事件组 ID；一个事件通过 `eventId` 聚合多条 memory rows，并按事件聚合展示直接前置/后续关系及来源。同一事件涉及多个地点时每个地点单独一行，并使用不同 key。世界书是独立全局资源：编辑器下拉框选择要编辑的书，默认选中当前 Session 引用的书；另一个下拉框仅选择当前 Session 引用的书，两者互不等同。当前每张角色卡和每个 Session 均暂限一套世界书，未来可扩展为多书引用。世界书页以结构化条目编辑器管理激活策略、关键字、概率、Order 与 Position，并原样保留未展示的扩展字段；已确认并启用的 JavaScript 会在当前 Session 持续挂载为后台脚本，Regex 仍按文本阶段运行，管理页“运行预览”只创建额外的临时预览；
+7. 从角色卡菜单底部的“管理酒馆模式”进入全屏管理页；Manager 保留角色库、角色卡和角色脚本（Scoped）。工作区与当前 Session 视作同一层的 `conversation.view` 入口，提供时间线、世界书、用户设定/变量（含会话与工作区变量）、脚本（Global/Preset）和提示词模板（共享定义）。世界书是独立全局资源；世界书视图把共享资源编辑和当前 Session 引用选择放在一起，编辑器下拉框默认选中当前 Session 引用的书，另一个下拉框仅选择当前 Session 引用的书，两者互不等同。当前每张角色卡和每个 Session 均暂限一套世界书，未来可扩展为多书引用。世界书页以结构化条目编辑器管理激活策略、关键字、概率、Order 与 Position，并原样保留未展示的扩展字段；已确认并启用的 JavaScript 会在当前 Session 持续挂载为后台脚本，Regex 仍按文本阶段运行，管理页“运行预览”只创建额外的临时预览。以上只是前端入口变化：数据 scope、处理和保存语义不变，不新增 API-only 数据编辑器；全局管理仍从 Session 的角色菜单进入，角色卡默认世界书字段保持不变；
 8. 酒馆会话处于前台时，Client 仅对该会话临时接管 assistant/user/steering 及过程展示 renderer：显示阶段 Regex 在按次创建、可由组件卸载取消且没有代码内容过滤或执行时限的 Worker 中运行；Host 在用户入日志前执行原始 User Input 规则，在模型流持久化前执行原始 AI/Reasoning 规则，并通过一次受控的公共 LLM 重派发把 promptOnly 历史投影给模型而不改写持久日志。匹配结果精确替换对应 text/reasoning block，HTML 在 opaque-origin iframe 中交互运行，并通过已校验的消息桥按实际内容高度自适应。共享 Regex 引擎已实现 `isEdit`/`runOnEdit` 语义；当前 DSH 尚无原生持久消息编辑事件，因此会话 UI 暂无可接入的编辑阶段触发器。DSH 原生 `turnProcess` 折叠在酒馆对话中显示为“剧情推进”，仍由原生状态控制思考过程、工具调用和多层工具调用；系统提示词行仅从酒馆对话视图隐藏，不影响实际模型提示词。最终剧情正文、图片、Regex/HTML 渲染结果和状态栏保持可见。
 
-### 对话页的“事件”标签
+### 对话页的“时间线”标签
 
-已有消息的酒馆会话可在“对话 / 轨迹 / 事件”中切换。这里展示当前 Session 事件文档中的全部剧情事件，不是 DSH 的工具调用、流式片段等运行日志，也不受自动召回数量、重要度或 compact 状态限制。管理弹窗中原有的“事件”编辑页保持不变。
+已有消息的酒馆会话可在“对话 / 轨迹 / 时间线”中切换。该 `conversation.view` 标签继续使用 ID `sillytavern-events`，只将显示名称改为“时间线”。这里展示当前 Session 事件文档中的全部剧情事件，不是 DSH 的工具调用、流式片段等运行日志，也不受自动召回数量、重要度或 compact 状态限制；保留原事件图与详情，并通过时间线顶部的“编辑事件”按钮切换到原事件编辑器。
 
 - 同一 `eventId` 的多条 memory rows 聚合为一个节点；箭头只表示已保存的 `precedes`（前置 → 后续），不会根据时间或关键词猜测关系。
 - 甘特图按 `storyTime` 排列，不同 `timeline` 各用独立刻度；同一事件的不同时间记录分别展示，不把不连续时间合并成长区间。结束时间未记录时以条纹进度条从已知开始位置延伸至该时间线的当前剧情时间（最新已知时间点），仅作为图示范围且不写回结束时间；确定的零时长事件仍显示为圆点。历史文字标签或时间未知的记录另列，且仍显示在关系图里。
@@ -66,11 +70,11 @@ Bundle 在 Host 启动时会把包内 `preset/` 自动安装到部署配置的�
 
 ## 数据
 
-全部插件数据按工作区隔离，保存在 `<workspace>/.dsh/sillytavern/`；不再使用 `${DSH_HOME}/data/dsh-sillytavern/`，也不存在跨工作区共享的插件数据。角色库、原始导入文件、独立世界书、模板、选择状态、Regex 与全局变量、会话绑定、事件及后台维护队列均属于当前工作区。
+全部插件数据按工作区隔离，保存在 `<workspace>/.dsh/sillytavern/`；不再使用 `${DSH_HOME}/data/dsh-sillytavern/`，也不存在跨工作区共享的插件数据。角色库、原始导入文件、独立世界书、模板、选择状态、Regex 与全局变量、会话绑定、事件及后台维护队列均属于当前工作区。入口拆分只改变前端组织；工作区资源仍按 workspace 隔离，会话数据仍按 Session 隔离，处理与保存语义不变。
 
 每个 Session 的事件模块数据文档保存为 `event/<sha256(sessionId)>.json`，后台维护队列保存为 `event-maintenance/<sha256(sessionId)>.json`。一份事件文档可以包含多个 `eventId`；每个逻辑事件通过 `eventId` 聚合多条 memory rows。模板上下文中的 `event` 字段仍是自动召回的 memory rows 列表，不改变 rows 或 `eventEdges` 的结构。
 
-在同一工作区内，角色卡内容及其 Scoped 脚本、世界书内容、模板定义、Global/Preset Regex 与全局变量是共享资源；角色卡/世界书引用、persona、会话变量、模板选择、prompt injections、开场 swipe 与事件表按 Session 隔离。因此两个 Session 可使用同一角色卡但绑定不同世界书并维护不同用户设定、变量、模板选择、prompt injections 与事件。管理器“脚本”页编辑的是共享的角色卡或工作区脚本，不会为每个 Session 复制一份；Session 私有 prompt injections 由兼容 API 写入。
+在同一工作区内，角色卡内容及其 Scoped 脚本、世界书内容、模板定义、Global/Preset Regex 与全局变量是共享资源；角色卡/世界书引用、persona、会话变量、模板选择、prompt injections、开场 swipe 与事件表按 Session 隔离。因此两个 Session 可使用同一角色卡但绑定不同世界书并维护不同用户设定、变量、模板选择、prompt injections 与事件。管理器角色脚本页编辑 Scoped 脚本；对话脚本标签编辑 Global/Preset 规则，两者分别保持既有保存 scope，不会为每个 Session 复制一份；Session 私有 prompt injections 由兼容 API 写入。
 
 事件文档使用 schema 5，主体为 `rows + eventEdges`，并以有限长度的 `appliedMaintenanceJobs` 原子记录已提交后台任务。逻辑事件是聚合节点：一个事件通过同一 `eventId` 对应多条 memory rows；事件关系保存在 `eventEdges`，结构与行为保持不变。每条 memory row 包含 2–10 个唯一 `keywords`，用于查询与自动召回匹配；它们必须是对应助手正文中可逐字命中的具体名称、别名、专名、编号或特征短语，不能使用“物品”“事件”“关系”“状态变化”等泛化分类词。Host 在写盘前校验数量和正文来源，失败时拒绝整次写入并说明缺失词或原因。事件文档只检查文档版本号是否严格等于 5；其他版本会直接报错，不迁移、不重置、不改写，需手动删除对应事件文件。新 memory row 除 `storyTime`、`location`、`characters` 外，还保存正文来源 `sourceRefs` 和 `recallPolicy`：`always` 始终可自动召回，`after_compaction` 仅在全部来源事件都进入 DSH `compaction/summary.data.shadowedSeqs` 后成为自动召回候选，且普通候选仍须与近期对话或已 compact 的直接事件关系相关；`query_only` 只允许显式查询。重要度达到 `0.8` 的 memory row 除 `query_only` 外可提前进入候选，并在数量与字符预算内排在普通 memory rows 之前。事件关系自身也须全部来源已 compact 后才可参与自动相关性和 Prompt 注入；显式查询不受这些自动门槛影响。
 

@@ -11,7 +11,7 @@ import {
   queryEventGraph,
 } from '../src/event.js'
 import { renderPromptTemplate } from '../src/template.js'
-import { activateWorldbook } from '../src/worldbook.js'
+import { activateWorldbook, DEFAULT_FALLBACK_TOKEN_BUDGET, worldbookTokenBudget } from '../src/worldbook.js'
 import { injectWorldbookDepthMessages, sessionEventDelta } from '../src/prompt.js'
 import { tokenizerKindForModel } from '../src/tokenizer.js'
 
@@ -223,6 +223,13 @@ test('caps the model-relative budget by character-book and host limits', async (
   })
   assert.equal(calls.length, 1)
   assert.deepEqual(chinese.entries, [], 'the supplied tokenizer result controls the decision; content.length / 4 is not consulted')
+})
+
+test('uses a 250k worldbook budget when the model context window is unavailable', () => {
+  assert.equal(DEFAULT_FALLBACK_TOKEN_BUDGET, 250_000)
+  assert.equal(worldbookTokenBudget(), 250_000)
+  assert.equal(worldbookTokenBudget({ fallbackTokenBudget: 1_234 }), 1_234)
+  assert.equal(worldbookTokenBudget({ contextWindow: 1_000_000 }), 250_000)
 })
 
 test('evaluates high Order first and does not backfill normal entries after overflow', async () => {
