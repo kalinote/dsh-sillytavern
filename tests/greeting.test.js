@@ -42,6 +42,13 @@ test('initial greeting selects alternate swipes without mutating state', () => {
   assert.throws(() => initialGreetingView(state, -1), /non-negative safe integer/)
 })
 
+test('card angle aliases use the same persona as template macros in opening context', () => {
+  const state = greetingState('<user> meets <char>. {{user}} greets {{char}}. <USER>!', {}, ['Welcome <user>'])
+  assert.equal(initialGreetingView(state).text, 'Bob meets Alice. Bob greets Alice. Bob!')
+  assert.equal(initialGreetingView(state, 1).text, 'Welcome Bob')
+  assert.equal(state.record.card.data.first_mes, '<user> meets <char>. {{user}} greets {{char}}. <USER>!')
+})
+
 test('selected opening remains model context without duplicating the native user history', async () => {
   const state = greetingState('Original menu {{user}}', {}, ['Selected route for {{char}}'])
   state.binding.openingSwipeId = 1

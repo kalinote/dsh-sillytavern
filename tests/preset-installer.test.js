@@ -54,6 +54,12 @@ test('automatically installs, discovers, and idempotently adopts the bundled pre
   assert.equal((await readdir(userRoot)).some(id => id.includes('-install-')), false, 'writable-root probes are cleaned up')
 })
 
+test('the bundled persona uses the current DSH config field', async () => {
+  const composition = await readFile(new URL('../preset/agent.cordis.yml', import.meta.url), 'utf8')
+  assert.match(composition, /name: '@deepseek-ai\/dsh-persona'\r?\n  config:\r?\n    prefix: \|-/)
+  assert.doesNotMatch(composition, /name: '@deepseek-ai\/dsh-persona'\r?\n  config:\r?\n    text: \|-/)
+})
+
 test('updates an unmodified managed preset but refuses to overwrite user edits', async t => {
   const { roster, sourceDir, userRoot } = await fixture(t)
   await installBundledPreset(roster, { sourceDir, version: '0.2.0' })

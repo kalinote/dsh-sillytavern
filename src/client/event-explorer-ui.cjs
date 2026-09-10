@@ -2,7 +2,7 @@
 
 module.exports = function createEventExplorerUI(React, modelHelpers) {
   const h = React.createElement
-  const { buildEventExplorerModel, layoutEventGraph } = modelHelpers
+  const { buildEventExplorerModel, describeMemory, groupTimelineIntervals, layoutEventGraph } = modelHelpers
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value))
   const list = value => Array.isArray(value) ? value : []
   const text = value => value == null ? '' : String(value)
@@ -10,10 +10,7 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
   const finite = value => typeof value === 'number' && Number.isFinite(value)
 
   function eventTitle(node) {
-    const row = list(node?.rows)[0]
-    const label = text(node?.title || row?.key).trim()
-    const eventId = text(node?.eventId)
-    return label && label !== eventId ? `${label} · ${eventId}` : eventId
+    return text(node?.title).trim() || '未命名事件'
   }
 
   function timeOf(value) {
@@ -30,7 +27,7 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
   function formatNumber(value) {
     if (value == null || text(value).trim() === '') return '—'
     if (!finite(Number(value))) return '—'
-    return new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 }).format(Number(value))
+    return String(Number(value))
   }
 
   function formatStoryTime(value) {
@@ -40,7 +37,7 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
       const range = storyTime.end == null || text(storyTime.end).trim() === ''
         ? `${start} – 结束时间未记录`
         : `${start} – ${formatNumber(storyTime.end)}`
-      return [storyTime.timeline, storyTime.label, range].filter(item => text(item).trim()).join(' · ')
+      return [storyTime.label, storyTime.timeline, `坐标 ${range}`].filter(item => text(item).trim()).join(' · ')
     }
     if (storyTime.state === 'label-only') return `仅标签 · ${text(storyTime.label) || '未命名'}`
     return '时间未知'
@@ -63,9 +60,9 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
 
   function sourceRefLabel(ref) {
     const fields = []
-    if (Number.isSafeInteger(ref?.eventSeq)) fields.push(`#${ref.eventSeq}`)
     if (Number.isSafeInteger(ref?.turn)) fields.push(`第 ${ref.turn} 回合`)
-    if (text(ref?.role)) fields.push(ref.role === 'user' ? '用户' : ref.role === 'assistant' ? '助手' : text(ref.role))
+    if (text(ref?.role)) fields.push(ref.role === 'user' ? '用户原文' : ref.role === 'assistant' ? '剧情原文' : text(ref.role))
+    if (!fields.length && Number.isSafeInteger(ref?.eventSeq)) fields.push(`会话事件 ${ref.eventSeq}`)
     return fields.join(' · ') || '未知来源'
   }
 
@@ -115,11 +112,35 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
     return h('span', { className: `dst-explorer-time-pill ${storyTime.state}` }, formatStoryTime(storyTime))
   }
 
-  function SourceRefs({ refs }) {
+  function SourceRefs({ refs, onOpenSource }) {
     const values = list(refs)
     if (!values.length) return h('span', { className: 'dst-explorer-muted' }, '无来源记录')
     return h('ol', { className: 'dst-explorer-source-list' }, values.map((ref, index) =>
-      h('li', { key: `${ref?.eventSeq ?? 'unknown'}:${ref?.turn ?? 'unknown'}:${ref?.role ?? 'unknown'}:${index}` }, sourceRefLabel(ref))))
+      h('li', { key: `${ref?.eventSeq ?? 'unknown'}:${ref?.turn ?? 'unknown'}:${ref?.role ?? 'unknown'}:${index}` },
+        typeof onOpenSource === 'function'
+          ? h('button', { type: 'button', onClick: () => onOpenSource(ref), title: '返回对话并查看这段原文' }, sourceRefLabel(ref))
+          : sourceRefLabel(ref))))
+  }
+
+  function maintenanceFeedback(maintenance, model) {
+    const status = text(maintenance?.status).toLocaleLowerCase()
+    const pending = Number(maintenance?.pending ?? maintenance?.pendingCount ?? 0)
+    const running = Number(maintenance?.running ?? maintenance?.runningCount ?? 0)
+    const failed = Number(maintenance?.failed ?? maintenance?.failedCount ?? 0)
+    if (status === 'running' || status === 'processing' || running > 0) {
+      return { tone: 'busy', message: '正在整理这轮剧情，新的事件记忆会在完成后自动出现。' }
+    }
+    if (status === 'pending' || status === 'queued' || pending > 0) {
+      return { tone: 'busy', message: '剧情已进入记忆整理队列，完成后会自动更新。' }
+    }
+    if (status === 'failed' || status === 'error' || failed > 0) {
+      const reason = text(maintenance?.lastError || maintenance?.error).trim()
+      return { tone: 'error', message: reason ? `剧情记忆整理失败：${reason}` : '剧情记忆整理失败，稍后会自动重试。' }
+    }
+    const events = list(model?.nodes).length
+    const completed = Number(maintenance?.completed ?? maintenance?.completedCount ?? list(model?.appliedMaintenanceJobs).length)
+    if (events > 0) return { tone: 'ready', message: `已整理 ${events} 个剧情事件${completed > 0 ? ` · 完成 ${completed} 次记忆整理` : ''}` }
+    return { tone: 'waiting', message: '尚无剧情记忆。完成一个剧情回合后，系统会自动开始整理。' }
   }
 
   function EventButton({ eventId, children, className, selected, dimmed, matched, onChoose, register, style }) {
@@ -134,48 +155,158 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
     }, children)
   }
 
-  function GanttChart({ model, selectedId, query, matchedIds, onChoose, registerEvent }) {
-    const timelines = list(model?.timelines)
-    const untimed = []
-    for (const node of list(model?.nodes)) {
-      for (const row of list(node.rows)) {
-        const storyTime = timeOf(row?.storyTime)
-        if (storyTime.state !== 'normalized' || !finite(storyTime.start)) untimed.push({ eventId: node.eventId, row, storyTime })
-      }
+  const MIN_CLICKABLE_PERCENT = 8 / 450 * 100
+
+  function boundedTimelineViewport(minimum, maximum, timeline) {
+    const domainMinimum = timeline.min
+    const domainMaximum = timeline.max
+    const domainSpan = domainMaximum - domainMinimum
+    if (!(domainSpan > 0)) return { minimum: domainMaximum, maximum: domainMaximum }
+    let width = maximum - minimum
+    if (!finite(width) || !(width > 0) || width >= domainSpan) return { minimum: domainMinimum, maximum: domainMaximum }
+    let nextMinimum = minimum
+    let nextMaximum = maximum
+    if (nextMinimum < domainMinimum) {
+      nextMaximum += domainMinimum - nextMinimum
+      nextMinimum = domainMinimum
     }
+    if (nextMaximum > domainMaximum) {
+      nextMinimum -= nextMaximum - domainMaximum
+      nextMaximum = domainMaximum
+    }
+    nextMinimum = Math.max(domainMinimum, nextMinimum)
+    nextMaximum = Math.min(domainMaximum, nextMaximum)
+    width = nextMaximum - nextMinimum
+    return width > 0 ? { minimum: nextMinimum, maximum: nextMaximum } : { minimum: domainMinimum, maximum: domainMaximum }
+  }
+
+  function zoomTimelineViewport(viewport, timeline, factor) {
+    const width = viewport.maximum - viewport.minimum
+    if (!(width > 0)) return viewport
+    const nextWidth = width * factor
+    const middle = viewport.minimum + width / 2
+    const candidateMinimum = middle - nextWidth / 2
+    const candidateMaximum = middle + nextWidth / 2
+    if (!(candidateMaximum > candidateMinimum)) return viewport
+    const next = boundedTimelineViewport(candidateMinimum, candidateMaximum, timeline)
+    if (factor < 1 && !(next.maximum - next.minimum < width)) return viewport
+    return next
+  }
+
+  function moveTimelineViewport(viewport, timeline, direction) {
+    const width = viewport.maximum - viewport.minimum
+    if (!(width > 0)) return viewport
+    const distance = width * 0.4 * direction
+    return boundedTimelineViewport(viewport.minimum + distance, viewport.maximum + distance, timeline)
+  }
+
+  function coordinateDisplayStep(value) {
+    const source = String(value).toLocaleLowerCase()
+    const [coefficient, exponentText] = source.split('e')
+    const fractionDigits = coefficient.includes('.') ? coefficient.length - coefficient.indexOf('.') - 1 : 0
+    const exponent = exponentText === undefined ? 0 : Number(exponentText)
+    const writtenStep = 10 ** Math.min(0, exponent - fractionDigits)
+    const floatingStep = Math.abs(value) * Number.EPSILON * 16
+    return Math.max(Number.MIN_VALUE, writtenStep, floatingStep)
+  }
+
+  function focusTimelineViewport(timeline, intervals) {
+    let eventMinimum = Infinity
+    let eventMaximum = -Infinity
+    for (const interval of intervals) {
+      if (!finite(interval.start)) continue
+      const end = finite(interval.end) ? interval.end : timeline.max
+      eventMinimum = Math.min(eventMinimum, interval.start, end)
+      eventMaximum = Math.max(eventMaximum, interval.start, end)
+    }
+    if (!finite(eventMinimum) || !finite(eventMaximum)) return { minimum: timeline.min, maximum: timeline.max }
+    const eventSpan = eventMaximum - eventMinimum
+    const domainSpan = timeline.max - timeline.min
+    if (!(domainSpan > 0)) return { minimum: timeline.max, maximum: timeline.max }
+    if (!(eventSpan > 0)) {
+      const localStep = coordinateDisplayStep(eventMinimum)
+      return boundedTimelineViewport(eventMinimum - localStep * 20, eventMaximum + localStep * 20, timeline)
+    }
+    const padding = eventSpan * 2
+    // Anchor this viewport to the event's source coordinates. Deriving it from
+    // a percentage of a huge global minimum can erase very short intervals.
+    return boundedTimelineViewport(eventMinimum - padding, eventMaximum + padding, timeline)
+  }
+
+  function TimelineView({ timeline, model, selectedId, query, matchedIds, onChoose, registerEvent }) {
+    const overview = { minimum: timeline.min, maximum: timeline.max }
+    const [viewport, setViewport] = React.useState(overview)
+    const minimum = viewport.minimum
+    const maximum = viewport.maximum
+    const viewportSpan = maximum - minimum
+    const zeroSpan = !(timeline.span > 0)
+    const atOverview = minimum === timeline.min && maximum === timeline.max
+    const zoomedIn = zoomTimelineViewport(viewport, timeline, 0.5)
+    const canZoomIn = zoomedIn.minimum !== minimum || zoomedIn.maximum !== maximum
     const hasQuery = query.trim() !== ''
-    const timelineViews = timelines.map(timeline => {
-      const minimum = Number(timeline.min)
-      const maximum = Number(timeline.max)
-      const domainSpan = maximum - minimum
-      const span = finite(Number(timeline.span)) && Number(timeline.span) > 0 ? Number(timeline.span) : domainSpan
-      const tickPortions = domainSpan === 0 ? [0.5] : [0, 0.25, 0.5, 0.75, 1]
-      const ticks = tickPortions.map(portion => {
-        const current = domainSpan === 0 || portion === 1
-        return h('span', {
-          key: portion,
-          className: classes(portion === 0 && 'first', current && 'current'),
-          style: { left: `${portion * 100}%` },
-        }, current ? `当前 ${formatNumber(maximum)}` : formatNumber(minimum + (maximum - minimum) * portion))
-      })
-      const bars = list(timeline.intervals).map((interval, index) => {
+    const tickPortions = viewportSpan > 0 ? [0, 0.25, 0.5, 0.75, 1] : [1]
+    const ticks = tickPortions.map(portion => {
+      const coordinate = viewportSpan > 0
+        ? portion === 0 ? minimum : portion === 1 ? maximum : minimum + viewportSpan * portion
+        : timeline.max
+      const current = portion === 1 && maximum === timeline.max
+      return h('span', {
+        key: portion,
+        className: classes(portion === 0 && 'first', current && 'current'),
+        style: { left: `${portion * 100}%` },
+      }, current ? `最新 ${formatNumber(timeline.max)}` : formatNumber(coordinate))
+    })
+    const groups = groupTimelineIntervals(list(timeline.intervals))
+    const bars = groups.map(group => {
+      const eventId = text(group.eventId)
+      const matched = hasQuery && matchedIds.has(eventId)
+      const barTitle = eventTitle(nodeById(model, eventId))
+      const markers = group.intervals.flatMap(interval => {
         const storyTime = timeOf(interval)
         const start = storyTime.start
-        const endUnrecorded = storyTime.end == null || text(storyTime.end).trim() === ''
-        // A missing end stays unknown in the data, but is displayed through the
-        // latest known point on its own story timeline so ongoing events read as
-        // intervals instead of easily missed one-pixel markers.
-        const displayEnd = endUnrecorded ? maximum : storyTime.end
-        const point = !endUnrecorded && start === displayEnd
-        const left = domainSpan === 0 ? 50 : clamp((start - minimum) / span * 100, 0, 100)
-        const width = point || domainSpan === 0 ? 0 : Math.min(100 - left, Math.max(0, (displayEnd - start) / span * 100))
+        const endUnrecorded = !finite(storyTime.end)
+        const actualEnd = endUnrecorded ? timeline.max : storyTime.end
+        if (!finite(start) || actualEnd < minimum || start > maximum) return []
+        const point = !endUnrecorded && start === actualEnd
+        const visibleStart = Math.max(start, minimum)
+        const visibleEnd = Math.min(actualEnd, maximum)
+        const left = viewportSpan > 0 ? clamp((visibleStart - minimum) / viewportSpan * 100, 0, 100) : 100
+        const right = viewportSpan > 0 ? clamp((visibleEnd - minimum) / viewportSpan * 100, 0, 100) : 100
+        const width = viewportSpan > 0 ? clamp((visibleEnd - visibleStart) / viewportSpan * 100, 0, 100) : 0
+        const minimumMarker = !point && !zeroSpan && (
+          (width > 0 && width < MIN_CLICKABLE_PERCENT)
+          || (endUnrecorded && width === 0)
+        )
         const pointTransform = left <= 0 ? 'none' : left >= 100 ? 'translateX(-100%)' : 'translateX(-50%)'
-        const eventId = text(interval.eventId)
-        const matched = hasQuery && matchedIds.has(eventId)
-        const rowKey = text(interval.row?.key).trim()
-        const eventNode = nodeById(model, eventId)
-        const barTitle = rowKey && rowKey !== text(eventNode?.title) ? `${eventTitle(eventNode)} · ${rowKey}` : eventTitle(eventNode)
-        return h('div', { className: 'dst-explorer-bar-row', key: text(interval.rowId || interval.id || `${eventId}:${index}`) },
+        let style
+        if (zeroSpan) style = { left: '100%', width: '8px', transform: 'translateX(-100%)' }
+        else if (point) style = { left: `${left}%`, transform: pointTransform }
+        else if (endUnrecorded && minimumMarker) style = { right: '0', width: `${width}%`, minWidth: '8px' }
+        else if (endUnrecorded) style = { left: `${left}%`, right: '0' }
+        else if (minimumMarker && right >= 100) style = { right: '0', width: `${width}%`, minWidth: '8px' }
+        else style = { left: `${left}%`, width: `${width}%`, ...(minimumMarker ? { minWidth: '8px' } : {}) }
+        const timeDescription = [...new Set(interval.storyTimes.map(formatStoryTime))].join('\n')
+        const durationDescription = endUnrecorded
+          ? `真实起点 ${formatNumber(start)}\n真实终点 未记录\n真实时长 未知\n图示延伸至最新已知剧情时间 ${formatNumber(timeline.max)}`
+          : `真实起点 ${formatNumber(start)}\n真实终点 ${formatNumber(storyTime.end)}\n真实时长 ${formatNumber(storyTime.end - start)}`
+        const markerDescription = zeroSpan && endUnrecorded
+          ? '\n时间线上只有一个已知坐标；显示为标记，未推断事件时长。'
+          : endUnrecorded && width === 0 && start === timeline.max
+            ? '\n开放事件的起点就是最新已知坐标；显示为右端标记，未推断事件时长。'
+            : minimumMarker ? '\n此标记为便于点击而加宽，宽度不代表实际时长；放大后会按线性比例显示。' : ''
+        const title = `${barTitle}\n${timeDescription}\n${durationDescription}${markerDescription}`
+        return h('button', {
+          key: JSON.stringify([interval.start, interval.end ?? null]),
+          type: 'button',
+          className: classes('dst-explorer-bar', point && 'point', minimumMarker && 'minimum-marker', endUnrecorded && 'end-unrecorded', selectedId === eventId && 'selected', hasQuery && !matched && 'search-dim', matched && 'search-match'),
+          style,
+          title,
+          'aria-label': `打开事件 ${barTitle}：${title}`,
+          onClick: event => onChoose(eventId, event.currentTarget),
+        }, point || zeroSpan || width === 0 ? null : h('span', null, text(storyTime.label) || (endUnrecorded ? `${formatNumber(start)}–最新` : `${formatNumber(start)}–${formatNumber(storyTime.end)}`)))
+      })
+      return h('div', { className: 'dst-explorer-bar-row', key: eventId },
+        h('div', { className: 'dst-explorer-bar-label' },
           h(EventButton, {
             eventId,
             selected: selectedId === eventId,
@@ -183,28 +314,63 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
             matched,
             onChoose,
             register: element => registerEvent(eventId, element, 'gantt'),
-          }, h('span', { className: 'dst-explorer-bar-name', title: barTitle }, barTitle)),
-          h('div', { className: 'dst-explorer-bar-track' },
-            h('button', {
-              type: 'button',
-              className: classes('dst-explorer-bar', point && 'point', endUnrecorded && 'end-unrecorded', selectedId === eventId && 'selected', hasQuery && !matched && 'search-dim', matched && 'search-match'),
-              style: point || width === 0 ? { left: `${left}%`, transform: pointTransform } : { left: `${left}%`, width: `${width}%` },
-              title: `${barTitle}\n${formatStoryTime(storyTime)}${endUnrecorded ? `\n图示延伸至当前剧情时间 ${formatNumber(maximum)}` : ''}`,
-              'aria-label': `打开事件 ${eventId}：${formatStoryTime(storyTime)}${endUnrecorded ? `；图示延伸至当前剧情时间 ${formatNumber(maximum)}` : ''}`,
-              onClick: event => onChoose(eventId, event.currentTarget),
-            }, point || width === 0 ? null : h('span', null, text(storyTime.label) || (endUnrecorded ? `${formatNumber(start)}–当前` : `${formatNumber(start)}–${formatNumber(displayEnd)}`)))))
-      })
-      return h('article', { className: 'dst-explorer-timeline', key: text(timeline.timeline) },
-        h('div', { className: 'dst-explorer-timeline-head' },
-          h('strong', null, text(timeline.timeline) || '未命名时间线'),
-          h('span', null, `${formatNumber(minimum)} – ${formatNumber(maximum)}`)),
-        h('div', { className: 'dst-explorer-axis', 'aria-hidden': true }, ticks),
-        h('div', { className: 'dst-explorer-bars' }, bars))
+          }, h('span', { className: 'dst-explorer-bar-name', title: barTitle }, barTitle),
+          h('span', { className: 'dst-explorer-muted' }, `${group.rowCount} 条记忆`)),
+          h('button', {
+            type: 'button',
+            className: 'dst-explorer-focus-time',
+            title: `聚焦 ${barTitle} 的剧情时间`,
+            'aria-label': `聚焦事件时间：${barTitle}`,
+            onClick: () => setViewport(focusTimelineViewport(timeline, group.intervals)),
+          }, '聚焦事件时间')),
+        h('div', { className: 'dst-explorer-bar-track' }, markers))
     })
-    const untimedItems = untimed.map(({ eventId, row, storyTime }, index) => {
+    return h('article', { className: 'dst-explorer-timeline' },
+      h('div', { className: 'dst-explorer-timeline-head' },
+        h('div', null,
+          h('strong', null, text(timeline.timeline) || '未命名时间线'),
+          h('span', { className: 'dst-explorer-viewport-range' }, `视窗 ${formatNumber(minimum)} – ${formatNumber(maximum)}`)),
+        h('div', { className: 'dst-explorer-timeline-controls', 'aria-label': `${text(timeline.timeline) || '未命名时间线'}视窗控制` },
+          h('button', { type: 'button', disabled: zeroSpan || !canZoomIn, onClick: () => setViewport(zoomedIn), 'aria-label': '放大时间线' }, '放大'),
+          h('button', { type: 'button', disabled: atOverview || zeroSpan, onClick: () => setViewport(zoomTimelineViewport(viewport, timeline, 2)), 'aria-label': '缩小时间线' }, '缩小'),
+          h('button', { type: 'button', disabled: minimum <= timeline.min || zeroSpan, onClick: () => setViewport(moveTimelineViewport(viewport, timeline, -1)), 'aria-label': '向前移动时间线' }, '向前'),
+          h('button', { type: 'button', disabled: maximum >= timeline.max || zeroSpan, onClick: () => setViewport(moveTimelineViewport(viewport, timeline, 1)), 'aria-label': '向后移动时间线' }, '向后'),
+          h('button', { type: 'button', disabled: atOverview, onClick: () => setViewport(overview), 'aria-label': '总览时间线' }, '总览'))),
+      h('div', { className: 'dst-explorer-timeline-domain' }, `全域 ${formatNumber(timeline.min)} – ${formatNumber(timeline.max)}`),
+      h('div', { className: 'dst-explorer-axis', 'aria-hidden': true }, ticks),
+      h('div', { className: 'dst-explorer-bars' }, bars))
+  }
+
+  function GanttChart({ model, selectedId, query, matchedIds, onChoose, registerEvent }) {
+    const timelines = list(model?.timelines)
+    const untimed = []
+    for (const node of list(model?.nodes)) {
+      const times = new Map()
+      let rowCount = 0
+      for (const row of list(node.rows)) {
+        const storyTime = timeOf(row?.storyTime)
+        if (storyTime.state !== 'normalized' || !finite(storyTime.start)) {
+          rowCount += 1
+          times.set(formatStoryTime(storyTime), storyTime)
+        }
+      }
+      if (rowCount) untimed.push({ eventId: node.eventId, rowCount, times: [...times.values()] })
+    }
+    const hasQuery = query.trim() !== ''
+    const timelineViews = timelines.map(timeline => h(TimelineView, {
+      key: `${text(timeline.timeline)}:${timeline.min}:${timeline.max}`,
+      timeline,
+      model,
+      selectedId,
+      query,
+      matchedIds,
+      onChoose,
+      registerEvent,
+    }))
+    const untimedItems = untimed.map(({ eventId, rowCount, times }) => {
       const matched = hasQuery && matchedIds.has(eventId)
       return h(EventButton, {
-        key: text(row?.id || `${eventId}:${index}`),
+        key: eventId,
         eventId,
         className: 'dst-explorer-untimed-item',
         selected: selectedId === eventId,
@@ -214,19 +380,19 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
         register: element => registerEvent(eventId, element, 'gantt'),
       },
       h('strong', null, eventTitle(nodeById(model, eventId))),
-      h(StoryTimePill, { value: storyTime }),
-      h('span', { className: 'dst-explorer-muted' }, text(row?.key)))
+      times.map(storyTime => h(StoryTimePill, { key: formatStoryTime(storyTime), value: storyTime })),
+      h('span', { className: 'dst-explorer-muted' }, `${rowCount} 条记忆`))
     })
     const untimedView = untimedItems.length ? h('article', { className: 'dst-explorer-timeline dst-explorer-untimed' },
       h('div', { className: 'dst-explorer-timeline-head' },
         h('strong', null, '无数值剧情时间'),
-        h('span', null, `${untimed.length} 条记忆`)),
+        h('span', null, `${untimed.length} 个事件`)),
       h('div', { className: 'dst-explorer-untimed-list' }, untimedItems)) : null
     return h('section', { className: 'dst-explorer-panel dst-explorer-gantt', 'aria-labelledby': 'dst-explorer-gantt-title' },
       h('header', { className: 'dst-explorer-panel-head' },
         h('div', null,
           h('h2', { id: 'dst-explorer-gantt-title' }, '剧情时间'),
-          h('p', null, '每条时间线独立缩放；结束时间未记录的事件延伸至当前剧情时间。')),
+          h('p', null, '按原始数值计算间隔，每条时间线独立缩放；结束时间未记录的事件延伸至该轴最新已知位置。')),
         h('span', { className: 'dst-explorer-count' }, `${timelines.length} 条时间线`)),
       timelines.length === 0 && untimed.length === 0
         ? h('div', { className: 'dst-explorer-empty' }, '尚无可显示的剧情时间。')
@@ -282,9 +448,9 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
         style: { left: `${node.x}px`, top: `${node.y}px`, width: `${node.width}px`, height: `${node.height}px` },
       },
       h('span', { className: 'dst-explorer-graph-node-position' },
-      h('strong', { title: text(node.title) || eventId }, text(node.title) || text(list(node.rows)[0]?.key) || eventId),
-      h('span', { className: 'dst-explorer-node-id', title: eventId }, eventId),
-      h('span', { className: 'dst-explorer-node-summary' }, `${list(node.rows).length} 条记忆 · 层级 ${Number(node.rank) + 1}`),
+      h('strong', { title: eventTitle(node) }, eventTitle(node)),
+      node.summary ? h('span', { className: 'dst-explorer-node-summary', title: text(node.summary) }, text(node.summary)) : null,
+      h('span', { className: 'dst-explorer-node-meta' }, `${list(node.rows).length} 条记忆 · 层级 ${Number(node.rank) + 1}`),
       h('span', { className: 'dst-explorer-node-time' }, normalizedTimes.length ? formatStoryTime(normalizedTimes[0]) : '无标准化时间'),
       ))
     })))
@@ -306,7 +472,7 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
         : h('div', { className: 'dst-explorer-empty' }, '尚无由记忆组成的事件。'))
   }
 
-  function RelationList({ title, relations, direction, onNavigate }) {
+  function RelationList({ title, relations, direction, model, onNavigate, onOpenSource }) {
     const values = list(relations)
     return h('section', { className: 'dst-explorer-detail-section' },
       h('h3', null, title),
@@ -315,60 +481,60 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
             const edge = edgeOf(relation)
             const target = relatedEventId(relation, direction)
             return h('li', { key: text(edge.id || `${target}:${index}`) },
-              h('button', { type: 'button', onClick: () => onNavigate(target) }, target || '未知事件'),
+              h('button', { type: 'button', onClick: () => onNavigate(target) }, eventTitle(nodeById(model, target))),
               edge.reason ? h('p', null, text(edge.reason)) : null,
-              h('dl', { className: 'dst-explorer-edge-meta' },
-                detailPair('关系 ID', text(edge.id) || '未记录'),
-                detailPair('类型', text(edge.kind) || '未记录'),
-                detailPair('创建时间', formatDate(edge.createdAt)),
-                detailPair('更新时间', formatDate(edge.updatedAt))),
-              list(edge.sourceRefs).length ? h(SourceRefs, { refs: edge.sourceRefs }) : null,
-              h('details', { className: 'dst-explorer-raw' },
-                h('summary', null, '查看完整关系 JSON'),
+              list(edge.sourceRefs).length ? h(SourceRefs, { refs: edge.sourceRefs, onOpenSource }) : null,
+              h('details', { className: 'dst-explorer-technical' },
+                h('summary', null, '技术信息'),
+                h('dl', { className: 'dst-explorer-edge-meta' },
+                  detailPair('关系 ID', text(edge.id) || '未记录'),
+                  detailPair('类型', text(edge.kind) || '未记录'),
+                  detailPair('创建时间', formatDate(edge.createdAt)),
+                  detailPair('更新时间', formatDate(edge.updatedAt))),
                 h('pre', { className: 'dst-explorer-json' }, formatJson(edge))))
           }))
         : h('p', { className: 'dst-explorer-muted' }, '无'))
   }
 
-  function MemoryDetail({ row, index }) {
+  function MemoryDetail({ row, index, onOpenSource }) {
     const storyTime = timeOf(row?.storyTime)
+    const description = describeMemory(row)
     return h('article', { className: 'dst-explorer-memory-detail' },
       h('header', null,
-        h('div', null,
-          h('span', classNameProps('dst-explorer-table-pill'), text(row?.table) || '未命名表'),
-          h('h3', null, text(row?.key) || `记忆 ${index + 1}`)),
-        h('span', { className: 'dst-explorer-importance' }, `重要度 ${Math.round(Number(row?.importance ?? 0) * 100)}%`)),
+        h('h3', null, description.title || `剧情记忆 ${index + 1}`)),
+      description.summary ? h('p', { className: 'dst-explorer-memory-summary' }, description.summary) : null,
+      description.facts.length ? h('section', { className: 'dst-explorer-facts' },
+        h('h4', null, '已确认的剧情事实'),
+        h('ul', null, description.facts.map((fact, factIndex) => h('li', { key: `${factIndex}:${fact}` }, fact)))) : null,
       h('dl', { className: 'dst-explorer-detail-grid' },
-        detailPair('记忆 ID', text(row?.id) || '未记录'),
         detailPair('剧情时间', h(StoryTimePill, { value: storyTime })),
-        storyTime.state === 'normalized' ? detailPair('开始时间', finite(storyTime.start) ? formatNumber(storyTime.start) : '开始时间未记录') : null,
-        storyTime.state === 'normalized' ? detailPair('结束时间', storyTime.end == null || text(storyTime.end).trim() === '' ? '结束时间未记录' : formatNumber(storyTime.end)) : null,
         detailPair('地点', formatLocation(row?.location)),
-        detailPair('人物', list(row?.characters).length ? list(row.characters).join('、') : '未记录'),
-        detailPair('关键词', list(row?.keywords).length ? list(row.keywords).join('、') : '未记录'),
-        detailPair('召回策略', text(row?.recallPolicy) || '未记录'),
-        detailPair('创建时间', formatDate(row?.createdAt)),
-        detailPair('更新时间', formatDate(row?.updatedAt))),
+        detailPair('人物', list(row?.characters).length ? list(row.characters).join('、') : '未记录')),
       h('section', { className: 'dst-explorer-detail-section' },
         h('h4', null, `来源（${list(row?.sourceRefs).length}）`),
-        h(SourceRefs, { refs: row?.sourceRefs })),
-      h('section', { className: 'dst-explorer-detail-section' },
-        h('h4', null, '结构化值'),
-        h('pre', { className: 'dst-explorer-json' }, formatJson(row?.value))),
-      h('details', { className: 'dst-explorer-raw' },
-        h('summary', null, '查看完整记忆 JSON'),
+        h(SourceRefs, { refs: row?.sourceRefs, onOpenSource })),
+      h('details', { className: 'dst-explorer-technical' },
+        h('summary', null, '技术信息'),
+        h('dl', { className: 'dst-explorer-detail-grid' },
+          detailPair('数据表', text(row?.table) || '未记录'),
+          detailPair('记录键', text(row?.key) || '未记录'),
+          detailPair('记忆 ID', text(row?.id) || '未记录'),
+          storyTime.state === 'normalized' ? detailPair('排序坐标（开始）', finite(storyTime.start) ? formatNumber(storyTime.start) : '未记录') : null,
+          storyTime.state === 'normalized' ? detailPair('排序坐标（结束）', storyTime.end == null || text(storyTime.end).trim() === '' ? '未记录' : formatNumber(storyTime.end)) : null,
+          detailPair('关键词', list(row?.keywords).length ? list(row.keywords).join('、') : '未记录'),
+          detailPair('召回策略', text(row?.recallPolicy) || '未记录'),
+          detailPair('重要度', `${Math.round(Number(row?.importance ?? 0) * 100)}%`),
+          detailPair('创建时间', formatDate(row?.createdAt)),
+          detailPair('更新时间', formatDate(row?.updatedAt))),
+        h('h4', null, '完整结构化数据'),
         h('pre', { className: 'dst-explorer-json' }, formatJson(row))))
-  }
-
-  function classNameProps(className) {
-    return { className }
   }
 
   function detailPair(label, value) {
     return h(React.Fragment, { key: label }, h('dt', null, label), h('dd', null, value))
   }
 
-  function DetailDialog({ dialogRef, node, onDismiss, onClosed, onNavigate }) {
+  function DetailDialog({ dialogRef, node, model, onDismiss, onClosed, onNavigate, onOpenSource }) {
     return h('dialog', {
       ref: dialogRef,
       className: 'dst-explorer-detail-dialog',
@@ -381,41 +547,47 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
       h('header', { className: 'dst-explorer-detail-head' },
         h('div', null,
           h('span', { className: 'dst-explorer-kicker' }, '事件详情'),
-          h('h2', null, text(node.title) || text(list(node.rows)[0]?.key) || text(node.eventId)),
-          h('p', null, `${text(node.eventId)} · ${list(node.rows).length} 条记忆`)),
+          h('h2', null, eventTitle(node)),
+          node.summary ? h('p', { className: 'dst-explorer-event-summary' }, text(node.summary)) : null),
         h('button', { type: 'button', className: 'dst-explorer-close', onClick: onDismiss, autoFocus: true, 'aria-label': '关闭事件详情' }, '×')),
       h('div', { className: 'dst-explorer-detail-body' },
-        h(RelationList, { title: '直接前置事件', relations: node.predecessors, direction: 'predecessor', onNavigate }),
-        h(RelationList, { title: '直接后续事件', relations: node.successors, direction: 'successor', onNavigate }),
+        h(RelationList, { title: '直接前置事件', relations: node.predecessors, direction: 'predecessor', model, onNavigate, onOpenSource }),
+        h(RelationList, { title: '直接后续事件', relations: node.successors, direction: 'successor', model, onNavigate, onOpenSource }),
         h('section', { className: 'dst-explorer-detail-section' },
-          h('h3', null, '聚合信息'),
+          h('h3', null, '剧情信息'),
           h('dl', { className: 'dst-explorer-detail-grid' },
             detailPair('人物', list(node.characters).length ? list(node.characters).join('、') : '未记录'),
             detailPair('地点', list(node.locations).length ? list(node.locations).map(formatLocation).join('；') : '未记录'),
-            detailPair('关键词', list(node.keywords).length ? list(node.keywords).join('、') : '未记录'),
-            detailPair('平均重要度', finite(Number(node.importance?.average)) ? `${Math.round(Number(node.importance.average) * 100)}%` : '未记录'),
-            detailPair('最高重要度', finite(Number(node.importance?.max)) ? `${Math.round(Number(node.importance.max) * 100)}%` : '未记录'))),
+            detailPair('记忆数量', `${list(node.rows).length} 条`))),
         h('section', { className: 'dst-explorer-detail-section' },
           h('h3', null, `记忆（${list(node.rows).length}）`),
           h('div', { className: 'dst-explorer-memory-list' }, list(node.rows).map((row, index) =>
-            h(MemoryDetail, { key: text(row?.id || index), row, index })))))) : null)
+            h(MemoryDetail, { key: text(row?.id || index), row, index, onOpenSource })))),
+        h('details', { className: 'dst-explorer-technical dst-explorer-event-technical' },
+          h('summary', null, '事件技术信息'),
+          h('dl', { className: 'dst-explorer-detail-grid' },
+            detailPair('事件 ID', text(node.eventId) || '未记录'),
+            detailPair('关键词', list(node.keywords).length ? list(node.keywords).join('、') : '未记录'),
+            detailPair('平均重要度', finite(Number(node.importance?.average)) ? `${Math.round(Number(node.importance.average) * 100)}%` : '未记录'),
+            detailPair('最高重要度', finite(Number(node.importance?.max)) ? `${Math.round(Number(node.importance.max) * 100)}%` : '未记录'))))) : null)
   }
 
-  function UngroupedRows({ rows }) {
+  function UngroupedRows({ rows, onOpenSource }) {
     const values = list(rows)
     if (!values.length) return null
     return h('details', { className: 'dst-explorer-ungrouped' },
       h('summary', null, `未关联事件的记忆（${values.length}）`),
       h('div', { className: 'dst-explorer-memory-list' }, values.map((row, index) =>
-        h(MemoryDetail, { key: text(row?.id || index), row, index }))))
+        h(MemoryDetail, { key: text(row?.id || index), row, index, onOpenSource }))))
   }
 
-  function EventExplorerView({ document: eventDocument, loading = false, refreshing = false, error = null, onRefresh, onEdit, sessionId }) {
+  function EventExplorerView({ document: eventDocument, maintenance = null, loading = false, refreshing = false, error = null, onRefresh, onEdit, onOpenSource, sessionId }) {
     const [selectedId, setSelectedId] = React.useState(null)
     const [query, setQuery] = React.useState('')
     const [searchCursor, setSearchCursor] = React.useState(-1)
     const [scale, setScale] = React.useState(1)
     const [pan, setPan] = React.useState({ x: 0, y: 0 })
+    const [sourceNotice, setSourceNotice] = React.useState('')
     const graphViewport = React.useRef(null)
     const dialogRef = React.useRef(null)
     const restoreFocus = React.useRef(null)
@@ -438,6 +610,20 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
     const matches = React.useMemo(() => normalizedQuery ? searchEntries.filter(entry => entry.haystack.includes(normalizedQuery)).map(entry => entry.id) : searchEntries.map(entry => entry.id), [searchEntries, normalizedQuery])
     const matchedIds = React.useMemo(() => new Set(matches), [matches])
     const selectedNode = selectedId ? nodeById(computed.model, selectedId) : null
+    const maintenanceState = maintenanceFeedback(maintenance, computed.model)
+
+    const openSource = React.useCallback(ref => {
+      if (typeof onOpenSource !== 'function') return
+      setSourceNotice('正在返回来源回合…')
+      try {
+        Promise.resolve(onOpenSource(ref)).then(
+          () => setSourceNotice(''),
+          caught => setSourceNotice(`无法打开来源回合：${caught instanceof Error ? caught.message : text(caught)}`),
+        )
+      } catch (caught) {
+        setSourceNotice(`无法打开来源回合：${caught instanceof Error ? caught.message : text(caught)}`)
+      }
+    }, [onOpenSource])
 
     const registerEvent = React.useCallback((eventId, element, surface) => {
       const id = text(eventId)
@@ -522,6 +708,7 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
       setSearchCursor(-1)
       setScale(1)
       setPan({ x: 0, y: 0 })
+      setSourceNotice('')
       fittedSession.current = null
       eventElements.current.clear()
     }, [sessionId])
@@ -633,6 +820,15 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
       shownError ? h('div', { className: 'dst-explorer-error', role: 'alert' },
         h('span', null, text(shownError)),
         typeof onRefresh === 'function' ? h('button', { type: 'button', onClick: () => onRefresh() }, '重试') : null) : null,
+      sourceNotice ? h('div', {
+        className: classes('dst-explorer-maintenance', sourceNotice.startsWith('无法') ? 'error' : 'busy'),
+        role: sourceNotice.startsWith('无法') ? 'alert' : 'status',
+      }, sourceNotice) : null,
+      !loading || eventDocument ? h('div', {
+        className: classes('dst-explorer-maintenance', maintenanceState.tone),
+        role: maintenanceState.tone === 'error' ? 'alert' : 'status',
+        'aria-live': 'polite',
+      }, maintenanceState.message) : null,
       loading && !eventDocument ? h('div', { className: 'dst-explorer-loading', role: 'status' }, '正在读取事件…') : null,
       computed.model && (!loading || eventDocument) ? h('main', { className: 'dst-explorer-content', 'aria-busy': refreshing === true },
         h(GanttChart, { model: computed.model, selectedId, query: normalizedQuery, matchedIds, onChoose: chooseEvent, registerEvent }),
@@ -652,13 +848,15 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
           onZoom: zoomBy,
           onFit: fitGraph,
         }),
-        h(UngroupedRows, { rows: computed.model.ungrouped })) : null,
+        h(UngroupedRows, { rows: computed.model.ungrouped, onOpenSource: openSource })) : null,
       h(DetailDialog, {
         dialogRef,
         node: selectedNode,
+        model: computed.model,
         onDismiss: dismissDetails,
         onClosed: handleDialogClosed,
         onNavigate: eventId => { setSelectedId(eventId); centerGraphEvent(eventId) },
+        onOpenSource: openSource,
       }))
   }
 
@@ -672,9 +870,12 @@ module.exports = function createEventExplorerUI(React, modelHelpers) {
   // The public View marker opts into the host's fixed-height layout. Reserve its
   // measured composer seat so the graph remains usable above the native input.
   const viewportCss = `
+.dst-explorer-axis>span{white-space:nowrap}
 .dst-explorer-root{width:100%;padding-bottom:calc(var(--dsh-composer-height,152px) + 8px);container-type:inline-size;container-name:dst-events}
+.dst-explorer-maintenance{flex:0 0 auto;padding:7px 18px;border-bottom:1px solid var(--dsw-alias-border-l3,#edf0f4);background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-secondary,#667085);font-size:12px}.dst-explorer-maintenance.busy{background:#fff8e8;color:#80550a}.dst-explorer-maintenance.ready{background:#eef8f1;color:#28613a}.dst-explorer-maintenance.error{background:#fff0f0;color:#9b1c1c}.dst-explorer-memory-summary,.dst-explorer-event-summary{white-space:pre-wrap;overflow-wrap:anywhere}.dst-explorer-memory-summary{margin:0 0 12px;font-size:14px;line-height:1.7}.dst-explorer-facts{margin:0 0 13px}.dst-explorer-facts h4{margin:0 0 6px}.dst-explorer-facts ul{margin:0;padding-left:21px}.dst-explorer-facts li{padding:2px 0}.dst-explorer-source-list button{height:auto;padding:1px 0;border:0;background:none;color:var(--dsw-alias-brand-primary,#24548a);cursor:pointer;font:inherit;text-align:left;text-decoration:underline;text-underline-offset:2px}.dst-explorer-technical{margin-top:12px;padding-top:10px;border-top:1px dashed var(--dsw-alias-border-l2,#dfe3ea)}.dst-explorer-technical>summary{color:var(--dsw-alias-label-secondary,#667085);cursor:pointer;font-size:12px}.dst-explorer-technical[open]>summary{margin-bottom:8px}.dst-explorer-technical>.dst-explorer-json{margin-top:10px}.dst-explorer-event-technical{margin-bottom:20px}.dst-explorer-node-meta{overflow:hidden;color:var(--dsw-alias-label-tertiary,#87909f);font-size:10px;text-overflow:ellipsis;white-space:nowrap}
 .dst-explorer-content{grid-template-rows:minmax(156px,34%) minmax(220px,1fr) auto;gap:10px;padding:10px}
 .dst-explorer-graph-viewport{min-height:0}
+.dst-explorer-timeline-head>div:first-child{display:flex;min-width:0;flex-direction:column;gap:1px}.dst-explorer-viewport-range,.dst-explorer-timeline-domain{color:var(--dsw-alias-label-secondary,#667085);font-size:10px;font-variant-numeric:tabular-nums}.dst-explorer-timeline-domain{margin:0 0 2px var(--dst-gantt-label-width);padding-left:10px}.dst-explorer-timeline-controls{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px}.dst-explorer-timeline-controls button,.dst-explorer-focus-time{min-height:24px;padding:2px 7px;border:1px solid var(--dsw-alias-border-l1,#ccd5e3);border-radius:6px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-secondary,#667085);cursor:pointer;font:10px/1.2 system-ui,sans-serif}.dst-explorer-timeline-controls button:disabled{opacity:.42;cursor:not-allowed}.dst-explorer-bar-label{display:grid;min-width:0;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:4px}.dst-explorer-bar-label>.dst-explorer-event-button{min-width:0;padding:3px 6px;border-radius:6px}.dst-explorer-focus-time{white-space:nowrap}.dst-explorer-bar.minimum-marker{z-index:1}
 @container dst-events (max-width:850px){.dst-explorer-toolbar{flex-wrap:wrap;gap:8px;padding:10px}.dst-explorer-heading{width:100%;min-width:0}.dst-explorer-search{min-width:0;max-width:none;order:3;width:100%}.dst-explorer-refresh{margin-left:auto}.dst-explorer-heading h1{font-size:16px}.dst-explorer-kicker{letter-spacing:0}}
 `
   return { EventExplorer, css: css + viewportCss }

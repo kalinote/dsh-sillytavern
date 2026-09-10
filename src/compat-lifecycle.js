@@ -25,7 +25,9 @@ export class CompatibilityLifecycle {
   disconnect(sessionId, clientId) {
     const state = this.session(sessionId)
     state.clients.delete(clientId)
-    for (const request of [...state.requests.values()]) if (request.clientId === clientId) request.finish(new Error('compatibility callback owner disconnected'))
+    // Keep assigned requests until completion, abort, or timeout. A route
+    // change remounts the iframe runtime with the same browser client id, and
+    // poll() deliberately re-delivers these unfinished callbacks.
   }
 
   complete(sessionId, clientId, id, result, error) {

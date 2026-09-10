@@ -5,6 +5,20 @@ import vm from 'node:vm'
 
 const clientSource = () => readFile(new URL('../client.cjs', import.meta.url), 'utf8')
 
+test('full HTML documents receive syntactically executable bootstrap, sizing, and ready scripts', async () => {
+  const source = await clientSource()
+  const start = source.indexOf('    function executableScript')
+  const end = source.indexOf('    function mergeSessionEventState', start)
+  assert.ok(start >= 0 && end > start)
+  const helpers = vm.runInNewContext(`(() => { ${source.slice(start, end)}; return { trustedDocument } })()`, { JSON, String, btoa })
+  const cardHtml = `<!DOCTYPE html><html lang="zh-CN"><head><style>@import url('https://fonts.googleapis.com/css2?family=Noto+Sans');body{display:flex}</style></head><body><div id="raw-data" style="display:none">{"scene":"RiNG"}</div><div class="panel">可见内容</div><script>(function(){const init=()=>document.querySelector('.panel');if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init()})()<\/script></body></html>`
+  const document = helpers.trustedDocument({ id: 'ournotes', name: 'OurNotes', kind: 'html', source: cardHtml }, 'test-channel', { messages: [] }, { surface: 'message', currentMessageId: 2 })
+  const scripts = [...document.matchAll(/<script>([\s\S]*?)<\/script>/gi)].map(match => match[1])
+  assert.equal(scripts.length, 4)
+  for (const script of scripts) assert.doesNotThrow(() => new vm.Script(script))
+  assert.ok(document.indexOf('installCompatibilityRuntime') < document.indexOf('@import url'), 'the compatibility bootstrap runs before a remote stylesheet can block later document work')
+})
+
 test('new-session auto binding reloads the session snapshot before script rendering', async () => {
   const source = await clientSource()
   const start = source.indexOf('    function TavernCharacterSelect')
@@ -100,8 +114,13 @@ test('TrustedFrame resizes from authenticated child messages and does not reserv
   const runtimeSource = source.slice(source.indexOf('    const compatRuntime'), source.indexOf('    function useCompatSnapshot'))
   assert.match(runtimeSource, /message\.event === 'frame-resize'/)
   assert.match(runtimeSource, /event\.source !== registration\.getWindow\(\)/)
-  assert.match(runtimeSource, /message\.event === 'frame-ready'[\s\S]*event: 'compat-state', payload: clone\(runtime\.snapshot\)/)
-  assert.match(frameSource, /style: hidden \? \{ display: 'none' \} : height === null \? undefined : \{ height, minHeight: 0 \}/)
+  assert.match(runtimeSource, /message\.event === 'frame-ready'[\s\S]*registration\.ready = true[\s\S]*event: 'compat-state', payload: clone\(runtime\.snapshot\)/)
+  assert.match(runtimeSource, /const readyFrames = runtime =>[\s\S]*filter\(registration => registration\?\.ready === true\)/)
+  assert.match(runtimeSource, /if \(Number\.isFinite\(height\) && height >= 0\) registration\.onResize/)
+  assert.match(frameSource, /\[sessionId, script\.id, script\.source, attempt\]/, 'a changed script source or explicit retry must get a fresh iframe channel')
+  assert.match(frameSource, /if \(!runtimeReady\) \{ setArmedChannel\(null\); return undefined \}/)
+  assert.match(frameSource, /height === null \? \{ position: 'absolute',[^}]*visibility: 'hidden'/)
+  assert.match(frameSource, /key: transportReady \? channel : `\$\{channel\}:arming`/, 'arming completion must replace the empty about:srcdoc iframe with a document-bearing node')
   assert.match(frameSource, /const messageReady = surface !== 'message' \|\| !Number\.isSafeInteger\(sourceSeq\) \|\| currentMessageId >= 0/)
   assert.match(frameSource, /boot\.current\.snapshot === null && messageReady/)
   assert.match(frameSource, /currentSourceSeq: sourceSeq/)
@@ -109,6 +128,19 @@ test('TrustedFrame resizes from authenticated child messages and does not reserv
 
   const conversationCss = source.match(/\.dst-script-conversation \.dst-trusted-frame\{([^}]*)\}/)?.[1] || ''
   assert.doesNotMatch(conversationCss, /height\s*:\s*520px/)
+  assert.doesNotMatch(conversationCss, /height\s*:\s*280px/)
+  assert.doesNotMatch(trustedSource, /root\?\.offsetHeight/, 'the measuring viewport must not become an empty document height')
+  assert.match(trustedSource, /body\?\.scrollHeight/)
+  assert.match(trustedSource, /rootScroll>viewport\?rootScroll:0/, 'overflowing documents must retain content outside the measuring viewport')
+  assert.match(trustedSource, /DOMContentLoaded',observeDocument/, 'zero height must not be published before the source document is parsed')
+  assert.match(trustedSource, /observeDocument=\(\)=>\{[^}]*observer\.observe\(document\.documentElement\)[\s\S]*?measure\(\)\}/, 'the first parsed-document measurement must not depend on a hidden iframe requestAnimationFrame')
+  assert.match(runtimeSource, /message\.event === 'frame-error'[\s\S]*registration\.onError/)
+  assert.match(frameSource, /脚本渲染失败/)
+  assert.match(frameSource, /重新加载/)
+  assert.match(frameSource, /查看脚本原文/)
+  assert.match(frameSource, /if \(hidden\) return iframe/, 'background scripts do not render diagnostic chrome')
+  assert.doesNotMatch(frameSource, /if \(!runtimeReady\) return null/, 'a stalled runtime must remain diagnosable')
+  assert.match(trustedSource, /finally\{URL\.revokeObjectURL\(url\);window\.__dshTavernReady\?\.\(\)\}/, 'a failed background module must still leave the callback barrier')
 })
 
 test('second-turn Regex refresh keeps the last rendered iframe mounted', async () => {

@@ -48,12 +48,40 @@ async function waitFor(predicate, message, timeout = 5000) {
   assert.fail(message)
 }
 
+function frozenAgentLoopRequest(system, userText, id, route = {}) {
+  const textBlock = text => Object.freeze({ type: 'text', text })
+  const systemMessage = Object.freeze({
+    id: `system-${id}`,
+    role: 'system',
+    content: Object.freeze([textBlock(system)]),
+    source: Object.freeze({ kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' }),
+  })
+  const userMessage = Object.freeze({
+    id: `user-${id}`,
+    role: 'user',
+    content: Object.freeze([textBlock(userText)]),
+    source: Object.freeze({ kind: 'user' }),
+  })
+  return Object.freeze({
+    provider: route.provider ?? 'openai',
+    model: route.model ?? 'gpt-5',
+    sessionId: 'session-http',
+    messages: Object.freeze([systemMessage, userMessage]),
+  })
+}
+
+async function consume(stream) {
+  for await (const _chunk of stream) {}
+}
+
 function fakeAgent(workspace, id = 'session-http') {
   const events = []
   const surface = { nodes: [] }
   return {
     id,
     ctx: {},
+    followups: [],
+    followup(message) { this.followups.push(message) },
     runMaintenance(job) {
       const task = Promise.resolve(job(new AbortController().signal))
       this.lastMaintenance = task
@@ -85,11 +113,14 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   t.after(() => rm(root, { recursive: true, force: true }))
   const live = fakeAgent(join(root, 'workspace'))
   const agents = new Map([[live.id, live]])
+  const coldAgents = new Map()
+  const resumeCalls = []
   const effects = []
   const listeners = new Map()
   let route
   let initiator
   let adapterOptions
+  const adapterRequests = []
   let flushSession = async () => true
   const sessionFlushes = []
   const subagentRuns = []
@@ -100,6 +131,7 @@ test('Host API imports into the existing session and exposes memory CRUD', async
     stream(options) {
       const base = async function* () {
         adapterOptions = options
+        adapterRequests.push(options)
         yield { type: 'text-delta', index: 0, text: 'model raw' }
         yield { type: 'block-end', index: 0, block: { type: 'text', text: 'model raw' } }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -109,7 +141,36 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   }
   const ctx = {
     webServer: { register(value) { route = value; return () => { route = undefined } } },
-    agents: { list: () => [...agents.values()], get: id => agents.get(id), currentInitiator: () => initiator },
+    agents: {
+      list: () => [...agents.values()],
+      get: id => agents.get(id),
+      currentInitiator: () => initiator,
+      async create(options) {
+        const created = fakeAgent(options.meta.cwd, options.sessionId)
+        created.options = { ...(options.agentOptions ?? {}) }
+        created.session.header = { id: options.sessionId, ...structuredClone(options.meta) }
+        created.session.events.push(...structuredClone(options.seed ?? []))
+        created.session.inheritedEventCount = options.inheritedEventCount ?? 0
+        const setupCommit = typeof options.setup === 'function' ? await options.setup(created.ctx) : undefined
+        setupCommit?.commit()
+        await listeners.get('session/created')?.(created.session)
+        agents.set(created.id, created)
+        await listeners.get('agent/created')?.({ agent: created })
+        return { agent: created, async dispose() { agents.delete(created.id) } }
+      },
+      async resume(options) {
+        resumeCalls.push(options)
+        const id = String(options.resumeSessionId)
+        const resumed = coldAgents.get(id)
+        if (resumed === undefined) throw new Error(`persisted session "${id}" not found`)
+        const agentCtx = { agent: resumed }
+        resumed.ctx = agentCtx
+        await options.setup?.(agentCtx)
+        agents.set(id, resumed)
+        await listeners.get('agent/created')?.({ agent: resumed })
+        return { agent: resumed, async dispose() { agents.delete(id) } }
+      },
+    },
     subagents: {
       async start(provider, options) {
         subagentRuns.push({ provider, options })
@@ -133,13 +194,17 @@ test('Host API imports into the existing session and exposes memory CRUD', async
       },
     },
     sessions: {
+      get(id) { return agents.get(String(id))?.session },
       flush(session) {
         sessionFlushes.push(session)
         return flushSession(session)
       },
     },
     llm,
-    agentPresets: { composedPreset: agentContext => agentContext?.preset === 'standard' ? 'standard' : 'sillytavern' },
+    agentPresets: {
+      composedPreset: agentContext => agentContext?.preset === 'standard' ? 'standard' : 'sillytavern',
+      async mount(agentContext, preset) { agentContext.preset = preset; return { id: preset } },
+    },
     provide(name, value) { this[name] = value; return () => { delete this[name] } },
     get(name) { return this[name] },
     effect(callback) { const dispose = callback(); effects.push(dispose); return dispose },
@@ -151,6 +216,38 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   const crossSite = await invoke(route, 'GET', '/api/dsh-sillytavern/library', undefined, { host: 'evil.example', origin: 'http://evil.example', 'sec-fetch-site': 'cross-site' })
   assert.equal(crossSite.status, 403)
   assert.match(crossSite.body.error, /untrusted API request/)
+
+  const cold = fakeAgent(join(root, 'cold-workspace'), 'session-http-cold')
+  cold.session.header.agentPreset = 'standard'
+  cold.session.append('agent-preset/selected', { agentPreset: 'sillytavern' })
+  coldAgents.set(cold.id, cold)
+  const coldEventCount = cold.session.events.length
+  const [coldSession, coldGreeting] = await Promise.all([
+    invoke(route, 'GET', `/api/dsh-sillytavern/session?sessionId=${cold.id}`),
+    invoke(route, 'GET', `/api/dsh-sillytavern/greeting?sessionId=${cold.id}`),
+  ])
+  assert.equal(coldSession.status, 200)
+  assert.equal(coldGreeting.status, 200)
+  assert.equal(resumeCalls.filter(call => call.resumeSessionId === cold.id).length, 1, 'parallel plugin reads share one cold Agent resume')
+  assert.equal(cold.ctx.preset, 'sillytavern', 'cold resume mounts the latest persisted preset selection')
+  assert.equal(cold.session.events.length, coldEventCount, 'cold reads do not append lifecycle events')
+  assert.deepEqual(cold.followups, [], 'cold reads do not enqueue a generation')
+
+  const coldStandard = fakeAgent(join(root, 'cold-standard-workspace'), 'session-http-cold-standard')
+  coldStandard.session.header.agentPreset = 'standard'
+  coldAgents.set(coldStandard.id, coldStandard)
+  const standardResponse = await invoke(route, 'GET', `/api/dsh-sillytavern/session?sessionId=${coldStandard.id}`)
+  assert.equal(standardResponse.status, 403)
+  assert.match(standardResponse.body.error, /not using/)
+  assert.equal(agents.has(coldStandard.id), false, 'a different persisted preset is not published through this plugin')
+
+  const coldSubagent = fakeAgent(join(root, 'cold-subagent-workspace'), 'session-http-cold-subagent')
+  coldSubagent.session.header = { ...coldSubagent.session.header, agentPreset: 'sillytavern', origin: 'subagent' }
+  coldAgents.set(coldSubagent.id, coldSubagent)
+  const subagentResponse = await invoke(route, 'GET', `/api/dsh-sillytavern/session?sessionId=${coldSubagent.id}`)
+  assert.equal(subagentResponse.status, 400)
+  assert.match(subagentResponse.body.error, /ordinary Agent session/)
+  assert.equal(agents.has(coldSubagent.id), false, 'a persisted subagent is not published through this plugin')
 
   const card = minimalCard({ first_mes: 'Welcome {{user}} — {{char}} keeps {{getvar::secret}}.', alternate_greetings: ['Alternate {{user}} with {{char}}.'] })
   const imported = await invoke(route, 'POST', '/api/dsh-sillytavern/import', {
@@ -200,6 +297,7 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   const diagnostics = ctx.sillyTavern.sessionView(live).worldbookDiagnostics
   assert.deepEqual(diagnostics.activeEntryIds, ['7'])
   assert.deepEqual(diagnostics.budget, prepared.worldbookBudget)
+  assert.deepEqual(diagnostics.depthProjection, { status: 'pending', expectedEntries: 1, injectedEntries: 0 })
   assert.equal(diagnostics.warnings.some(warning => warning.startsWith('vectorized-entry-unavailable:')), true)
   assert.equal(Object.hasOwn(diagnostics, 'system'), false, 'diagnostics never expose the generated prompt')
   const diagnosedSession = await invoke(route, 'GET', `/api/dsh-sillytavern/session?sessionId=${live.id}`)
@@ -224,6 +322,72 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   for await (const _chunk of ctx.llm.stream({ provider: 'openai', model: 'gpt-5', system: prepared.system, messages: [{ id: 'u2', role: 'user', content: [{ type: 'text', text: 'unbound' }], source: { kind: 'user' } }] })) {}
   initiator = undefined
   assert.equal(adapterOptions.messages.some(message => message.content?.[0]?.text === 'request-only lore'), false, 'an unbound request cannot reuse another generation\'s @depth projection')
+
+  const olderPrepared = await ctx.sillyTavern.promptFor(live, undefined, { provider: 'openai', model: 'gpt-5' })
+  const olderSystem = ctx.sillyTavern.bindPromptToRequest(live, olderPrepared, { provider: 'openai', model: 'gpt-5' })
+  const newerPrepared = await ctx.sillyTavern.promptFor(live, undefined, { provider: 'openai', model: 'gpt-5' })
+  const newerDiagnosticsPending = ctx.sillyTavern.sessionView(live).worldbookDiagnostics
+  assert.deepEqual(newerDiagnosticsPending.depthProjection, { status: 'pending', expectedEntries: 1, injectedEntries: 0 })
+  const newerSystem = ctx.sillyTavern.bindPromptToRequest(live, newerPrepared, { provider: 'openai', model: 'gpt-5' })
+  initiator = live
+  await consume(ctx.llm.stream(frozenAgentLoopRequest(newerSystem, 'newer v3 request', 'newer-v3')))
+  initiator = undefined
+  const newerDiagnosticsInjected = structuredClone(ctx.sillyTavern.sessionView(live).worldbookDiagnostics)
+  assert.equal(newerDiagnosticsInjected.revision, newerDiagnosticsPending.revision)
+  assert.deepEqual(newerDiagnosticsInjected.depthProjection, { status: 'injected', expectedEntries: 1, injectedEntries: 1 })
+  initiator = live
+  await consume(ctx.llm.stream(frozenAgentLoopRequest(olderSystem, 'older mismatched request', 'older-v3', { model: 'changed-model' })))
+  initiator = undefined
+  assert.deepEqual(ctx.sillyTavern.sessionView(live).worldbookDiagnostics, newerDiagnosticsInjected, 'an older request cannot overwrite the latest depth projection diagnostic')
+
+  const v3Prepared = {
+    ...prepared,
+    worldbookDepthEntries: [
+      { content: 'v3 status rule', depth: 0, role: 0 },
+      { content: 'v3 choice rule', depth: 0, role: 0 },
+    ],
+  }
+  const v3System = ctx.sillyTavern.bindPromptToRequest(live, v3Prepared, { provider: 'openai', model: 'gpt-5' })
+  const v3Request = frozenAgentLoopRequest(v3System, 'v3 request', 'v3')
+  const v3RequestBefore = structuredClone(v3Request)
+  const eventsBeforeV3Projection = structuredClone(live.session.events)
+  const requestsBeforeV3Projection = adapterRequests.length
+  initiator = live
+  await consume(ctx.llm.stream(v3Request))
+  initiator = undefined
+  assert.equal(adapterRequests.length, requestsBeforeV3Projection + 1, 'a v3 request reaches the adapter exactly once after nested projection')
+  const v3AdapterRequest = adapterRequests.at(-1)
+  const v3AdapterText = v3AdapterRequest.messages.flatMap(message => message.content ?? []).filter(block => block.type === 'text').map(block => block.text)
+  assert.equal(v3AdapterText.filter(text => text.includes('v3 status rule')).length, 1, 'v3 projection injects the depth-zero status rule exactly once')
+  assert.equal(v3AdapterText.filter(text => text.includes('v3 choice rule')).length, 1, 'v3 projection injects the depth-zero choice rule exactly once')
+  assert.equal(v3AdapterText.some(text => text.includes('dsh-sillytavern-request:')), false, 'the private marker is stripped from the v3 system message')
+  assert.deepEqual(v3Request, v3RequestBefore, 'v3 projection does not mutate the original frozen request')
+  assert.deepEqual(live.session.events, eventsBeforeV3Projection, 'request-only depth projection does not mutate durable session events')
+
+  const interleavedPreparedA = { ...prepared, system: 'interleaved system A', worldbookDepthEntries: [{ content: 'interleaved lore A', depth: 0, role: 0 }] }
+  const interleavedPreparedB = { ...prepared, system: 'interleaved system B', worldbookDepthEntries: [{ content: 'interleaved lore B', depth: 0, role: 0 }] }
+  const interleavedRequestA = frozenAgentLoopRequest(ctx.sillyTavern.bindPromptToRequest(live, interleavedPreparedA, { provider: 'openai', model: 'gpt-5' }), 'interleaved user A', 'interleaved-a')
+  const interleavedRequestB = frozenAgentLoopRequest(ctx.sillyTavern.bindPromptToRequest(live, interleavedPreparedB, { provider: 'openai', model: 'gpt-5' }), 'interleaved user B', 'interleaved-b')
+  const requestsBeforeInterleaving = adapterRequests.length
+  initiator = live
+  await Promise.all([
+    consume(ctx.llm.stream(interleavedRequestB)),
+    consume(ctx.llm.stream(interleavedRequestA)),
+  ])
+  initiator = undefined
+  const interleavedAdapterRequests = adapterRequests.slice(requestsBeforeInterleaving)
+  assert.equal(interleavedAdapterRequests.length, 2)
+  const adapterRequestA = interleavedAdapterRequests.find(request => request.messages.some(message => message.content?.some(block => block.text === 'interleaved user A')))
+  const adapterRequestB = interleavedAdapterRequests.find(request => request.messages.some(message => message.content?.some(block => block.text === 'interleaved user B')))
+  const textOfRequest = request => request.messages.flatMap(message => message.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('\n')
+  assert.match(textOfRequest(adapterRequestA), /interleaved system A/)
+  assert.match(textOfRequest(adapterRequestA), /interleaved lore A/)
+  assert.doesNotMatch(textOfRequest(adapterRequestA), /interleaved (system|lore) B/)
+  assert.match(textOfRequest(adapterRequestB), /interleaved system B/)
+  assert.match(textOfRequest(adapterRequestB), /interleaved lore B/)
+  assert.doesNotMatch(textOfRequest(adapterRequestB), /interleaved (system|lore) A/)
+  assert.equal(textOfRequest(adapterRequestA).includes('dsh-sillytavern-request:'), false)
+  assert.equal(textOfRequest(adapterRequestB).includes('dsh-sillytavern-request:'), false)
 
   const libraryAfterImport = await invoke(route, 'GET', `/api/dsh-sillytavern/library?sessionId=${live.id}`)
   assert.equal(libraryAfterImport.body.value.selectedCardId, imported.body.value.record.id)
@@ -524,7 +688,12 @@ test('Host API imports into the existing session and exposes memory CRUD', async
   assert.deepEqual(eventView.body.value.document, session.body.value.event, 'the explorer receives all stored rows and edges without query/recall limits')
   assert.equal(eventView.body.value.sessionId, live.id)
   const unchangedEvents = await invoke(route, 'GET', `/api/dsh-sillytavern/events?sessionId=${live.id}&revision=1`)
-  assert.deepEqual(unchangedEvents.body.value, { sessionId: live.id, revision: 1, unchanged: true })
+  assert.deepEqual(unchangedEvents.body.value, {
+    sessionId: live.id,
+    revision: 1,
+    unchanged: true,
+    maintenance: { status: 'idle', pending: 0, running: 0, failed: 0, completed: 0 },
+  })
   const otherEvents = await invoke(route, 'GET', `/api/dsh-sillytavern/events?sessionId=${fresh.id}`)
   assert.equal(otherEvents.body.value.document.rows.length, 0, 'events remain scoped to the requested session')
 
@@ -555,6 +724,60 @@ test('Host API imports into the existing session and exposes memory CRUD', async
     { eventSeq: backgroundUser.seq, turn: backgroundTurn, role: 'user' },
     { eventSeq: backgroundAssistant.seq, turn: backgroundTurn, role: 'assistant' },
   ])
+
+  const freshBranchResponse = await invoke(route, 'POST', '/api/dsh-sillytavern/player/branch', { sessionId: live.id, fresh: true })
+  assert.equal(freshBranchResponse.status, 200, freshBranchResponse.body.error)
+  assert.deepEqual(Object.keys(freshBranchResponse.body.value), ['sessionId'])
+  const freshBranch = agents.get(freshBranchResponse.body.value.sessionId)
+  assert.equal(ctx.sillyTavern.sessionView(freshBranch).card.card.data.name, 'Alice')
+  assert.equal(ctx.sillyTavern.sessionView(freshBranch).binding.startedAt, null)
+  assert.deepEqual(ctx.sillyTavern.sessionView(freshBranch).binding.variables, {})
+  assert.deepEqual(ctx.sillyTavern.sessionView(freshBranch).binding.chatMetadata, {})
+  assert.deepEqual(ctx.sillyTavern.sessionView(freshBranch).binding.scriptInjections, [])
+  assert.equal(ctx.sillyTavern.sessionView(freshBranch).binding.openingSwipeId, 0)
+  assert.equal(ctx.sillyTavern.sessionView(freshBranch).fork.inheritance.exact, true)
+  assert.equal(freshBranch.session.events.length, 0)
+
+  const retryBranchResponse = await invoke(route, 'POST', '/api/dsh-sillytavern/player/branch', { sessionId: live.id, beforeTurn: backgroundTurn })
+  assert.equal(retryBranchResponse.status, 200, retryBranchResponse.body.error)
+  const retryBranch = agents.get(retryBranchResponse.body.value.sessionId)
+  assert.equal(retryBranch.session.events.some(event => event.type === 'turn/start' && event.data?.turn === backgroundTurn), false)
+  assert.equal(ctx.sillyTavern.sessionView(retryBranch).card.card.data.name, 'Alice')
+
+  const continuationResponse = await invoke(route, 'POST', '/api/dsh-sillytavern/player/branch', { sessionId: live.id, afterTurn: backgroundTurn })
+  assert.equal(continuationResponse.status, 200, continuationResponse.body.error)
+  const continuation = agents.get(continuationResponse.body.value.sessionId)
+  assert.equal(continuation.session.events.at(-1).type, 'turn/end')
+  assert.equal(continuation.session.events.at(-1).data.turn, backgroundTurn)
+  assert.equal(ctx.sillyTavern.sessionView(continuation).fork.inheritance.exact, true)
+
+  await rm(ctx.sillyTavern.store.branchBindingPath(await ctx.sillyTavern.store.stateFor(continuation), continuation.id), { force: true })
+  const nestedRetryResponse = await invoke(route, 'POST', '/api/dsh-sillytavern/player/branch', { sessionId: continuation.id, beforeTurn: backgroundTurn })
+  assert.equal(nestedRetryResponse.status, 200, nestedRetryResponse.body.error)
+  const nestedRetry = agents.get(nestedRetryResponse.body.value.sessionId)
+  assert.equal(nestedRetry.session.header.parentSession, continuation.id)
+  assert.equal(nestedRetry.session.events.some(event => event.type === 'turn/start' && event.data?.turn === backgroundTurn), false)
+  assert.equal(ctx.sillyTavern.sessionView(nestedRetry).card.card.data.name, 'Alice')
+
+  const noHistory = fakeAgent(join(root, 'workspace'), 'session-http-no-branch-history')
+  noHistory.session.events.push(
+    { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+    { type: 'user/message', seq: 1, time: 2, data: { content: 'one', source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, time: 3, data: { message: { content: 'answer one' } } },
+    { type: 'turn/end', seq: 3, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/start', seq: 4, time: 5, data: { turn: 2 } },
+    { type: 'user/message', seq: 5, time: 6, data: { content: 'two', source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 6, time: 7, data: { message: { content: 'answer two' } } },
+    { type: 'turn/end', seq: 7, time: 8, data: { turn: 2, reason: { kind: 'completed' } } },
+  )
+  agents.set(noHistory.id, noHistory)
+  await ctx.sillyTavern.store.bind(noHistory, imported.body.value.record.id)
+  await rm(ctx.sillyTavern.store.branchBindingPath(await ctx.sillyTavern.store.stateFor(noHistory), noHistory.id), { force: true })
+  const agentCountBeforeRejectedBranch = agents.size
+  const rejectedHistoricalBranch = await invoke(route, 'POST', '/api/dsh-sillytavern/player/branch', { sessionId: noHistory.id, beforeTurn: 2 })
+  assert.equal(rejectedHistoricalBranch.status, 409)
+  assert.equal(rejectedHistoricalBranch.body.code, 'fork-inheritance-unavailable')
+  assert.equal(agents.size, agentCountBeforeRejectedBranch, 'an unavailable historical cut must not create a child session')
 
   const maintenanceChild = fakeAgent(join(root, 'workspace'), 'session-http-maintenance-child')
   maintenanceChild.session.header.origin = 'subagent'

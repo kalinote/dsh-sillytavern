@@ -56,7 +56,7 @@ const timeRange = {
     start: { type: 'number', required: true },
     end: { type: 'number', required: true },
   },
-  description: 'Story-time range filter with one timeline and finite start/end bounds.',
+  description: 'Story-time range filter with one timeline and finite raw numeric start/end bounds in that timeline\'s established unit. Labels and date-shaped digits do not imply a calendar or epoch conversion.',
 }
 
 function queryFields() {

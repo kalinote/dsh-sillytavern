@@ -21,10 +21,10 @@ const storyTimeSchema = {
   additionalProperties: false,
   properties: {
     state: { type: 'string', const: 'normalized' },
-    label: nullableString,
-    timeline: { type: 'string', description: 'A non-empty narrative timeline identifier.' },
-    start: { type: 'number', description: 'A finite narrative coordinate grounded in the story, never real-world time.' },
-    end: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+    label: { ...nullableString, description: 'Human-readable world time, preserving the finest story-provided precision. Zero-pad display fields to the established practical display resolution (usually milliseconds for modern dates); identify coarse or approximate source precision. Display padding never changes start/end or their unit.' },
+    timeline: { type: 'string', description: 'A non-empty narrative timeline identifier with a consistent numeric origin and unit.' },
+    start: { type: 'number', description: 'A finite raw narrative coordinate grounded in the story. Numeric differences express distance in this timeline, with no automatic calendar or epoch conversion.' },
+    end: { oneOf: [{ type: 'number' }, { type: 'null' }], description: 'An ending coordinate in the same unit as start, or null when unrecorded.' },
   },
   required: ['state', 'label', 'timeline', 'start'],
 }
@@ -286,6 +286,14 @@ function promptForJob(job, document, touches = {}) {
     '- If an existing event is continued, reuse its exact eventId. Do not invent a second id for the same event.',
     '- Do not create an edge to an event that is not represented by at least one row in the resulting patch/document.',
     '- Every new memory row must include normalized storyTime with state "normalized", a non-empty timeline, and a finite numeric start grounded in the supplied story.',
+    '- Treat start/end as raw numeric coordinates: ordering, interval queries, and timeline lengths use the original numbers and their differences. Reuse the established origin and unit for the same timeline.',
+    '- label is display text for the fictional world\'s time. Neither label, the timeline name, nor a number\'s digit pattern implies a Gregorian, Unix, or epoch conversion. Do not rewrite existing coordinates to format their labels.',
+    '- Preserve the finest time detail established by the story instead of reducing a precise scene to a date: include hours, minutes, seconds, and milliseconds when supplied or derivable from the established world-time rules.',
+    '- Use a consistent practical display resolution for labels on the same timeline. For a world using modern real-world-style dates, normally display YYYY-MM-DD HH:mm:ss.SSS; other worlds use their own established calendar fields and practical display resolution, not a universal physical minimum.',
+    '- Zero-pad label display fields only. Do not multiply, rescale, round, or otherwise change start/end or their numeric unit merely to fill display fields. Computation need not use the finest displayed unit; milliseconds may remain fractional seconds on a seconds-based timeline.',
+    '- Display padding is not evidence of measured precision. Preserve supplied fine detail, but mark unreported lower fields as display padding and retain the original coarse or approximate precision. For example, a date-only source may display "2020-04-13 00:00:00.000 (source precision: day; lower fields padded)" without claiming that midnight was recorded.',
+    '- For long events or ages measured in millions or hundreds of millions of years, zero-pad the lower display fields to that world\'s practical display resolution while retaining qualifiers such as approximate and source precision: 100 million years. Do not invent an exact date or force all calculations into millisecond ticks to produce this label.',
+    '- Ground any mapping from a world calendar to numeric coordinates in an explicitly established origin, unit, and conversion rule. Do not assume real-world calendar rules or concatenate date fields as a substitute for a consistent numeric measure.',
     '- A storyTime end may be omitted or null when the ending has not been established. If present as a number, it must be finite and greater than or equal to start.',
     '- A null or omitted end means only that no ending was recorded. It does not mean the event continues through the present.',
     '- Never use the real-world clock, the model runtime, or the current date as story time.',
@@ -573,6 +581,29 @@ export class EventMaintenanceManager {
       this.states.set(key, state)
     }
     return state
+  }
+
+  async readStatus(agent) {
+    return this.serialState(agent, async () => {
+      const state = await this.stateFor(agent)
+      const running = state.pending.filter(job => job.status === 'running').length
+      const pending = state.pending.length - running
+      const failed = state.failed.length
+      const completed = state.completed.length
+      const jobs = [...state.pending, ...state.failed]
+      const lastErrorJob = jobs.filter(job => typeof job.lastError === 'string' && job.lastError !== '')
+        .sort((left, right) => Number(left.updatedAt ?? 0) - Number(right.updatedAt ?? 0)).at(-1)
+      const turns = [state.lastPeriodicBoundary?.turn, ...jobs.map(job => job.turn)].filter(Number.isSafeInteger)
+      return {
+        status: running > 0 ? 'running' : pending > 0 ? 'pending' : failed > 0 ? 'failed' : 'idle',
+        pending,
+        running,
+        failed,
+        completed,
+        ...(lastErrorJob === undefined ? {} : { lastError: lastErrorJob.lastError }),
+        ...(turns.length === 0 ? {} : { latestTurn: Math.max(...turns) }),
+      }
+    })
   }
 
   async save(agent, state) {

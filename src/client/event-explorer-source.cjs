@@ -1,7 +1,7 @@
 /** A mounted event view owns one sequential, revision-aware polling source. */
 function createEventExplorerSource({ load, interval = 2000, schedule = setTimeout, cancel = clearTimeout,
   isVisible = () => true, subscribeVisibility = () => () => {} }) {
-  const initial = () => ({ document: null, loading: true, refreshing: false, error: null })
+  const initial = () => ({ document: null, maintenance: null, loading: true, refreshing: false, error: null })
   let state = initial()
   const listeners = new Set()
   let timer
@@ -36,8 +36,10 @@ function createEventExplorerSource({ load, interval = 2000, schedule = setTimeou
     run.promise = Promise.resolve().then(() => load(state.document?.revision, run.controller.signal)).then(value => {
       if (current !== run || run.controller.signal.aborted) return
       const document = value.unchanged ? state.document : value.document
-      if (document !== state.document || state.loading || state.refreshing || state.error !== null) {
-        publish({ document, loading: false, refreshing: false, error: null })
+      const nextMaintenance = Object.hasOwn(value, 'maintenance') ? value.maintenance : state.maintenance
+      const maintenance = JSON.stringify(nextMaintenance) === JSON.stringify(state.maintenance) ? state.maintenance : nextMaintenance
+      if (document !== state.document || maintenance !== state.maintenance || state.loading || state.refreshing || state.error !== null) {
+        publish({ document, maintenance, loading: false, refreshing: false, error: null })
       }
     }).catch(error => {
       if (current !== run || run.controller.signal.aborted) return

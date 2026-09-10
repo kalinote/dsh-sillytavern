@@ -1,5 +1,5 @@
 import { isMemoryAutoRecallEligible, eventLimits } from './event.js'
-import { createTemplateRuntime, neutralizeDshTemplates, renderMacros } from './template.js'
+import { createTemplateRuntime, neutralizeDshTemplates, renderMacros, renderCharacterAliases } from './template.js'
 import { activateWorldbook } from './worldbook.js'
 import { projectInjectionDescriptors } from './compat-injections.js'
 import { getRegexedString, REGEX_PLACEMENT, regexRulesForState } from './regex.js'
@@ -327,6 +327,7 @@ export function initialGreetingView(state, swipeId = 0) {
   try { text = render(swipeId === 0 ? state.record.card.data.first_mes : alternates[swipeId - 1]).trim() } catch { return null }
   if (text === '') return null
   text = promptRegex(text, REGEX_PLACEMENT.AI_OUTPUT, regexRulesForState(state), { scope }, 'raw opening greeting')
+  text = renderCharacterAliases(text, scope)
   if (text === '') return null
   let characterName
   try { characterName = render(state.record.card.data.nickname || state.record.card.data.name).trim() } catch { characterName = '' }

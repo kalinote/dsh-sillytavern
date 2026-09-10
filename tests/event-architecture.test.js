@@ -157,6 +157,22 @@ test('maintenance prompt requires grounded normalized starts and treats a missin
   assert.doesNotMatch(prompt, /Use the explicit unknown structure/)
 })
 
+test('maintenance time precision rules pad labels without rescaling numeric coordinates or inventing precision', () => {
+  const prompt = buildEventMaintenancePrompt(maintenanceJob('prompt-display-precision', 1, 10), { rows: [], eventEdges: [] })
+  assert.match(prompt, /Preserve the finest time detail established by the story/)
+  assert.match(prompt, /YYYY-MM-DD HH:mm:ss\.SSS/)
+  assert.match(prompt, /Zero-pad label display fields only/)
+  assert.match(prompt, /Do not multiply, rescale, round, or otherwise change start\/end/)
+  assert.match(prompt, /milliseconds may remain fractional seconds/)
+  assert.match(prompt, /source precision: day; lower fields padded/)
+  assert.match(prompt, /source precision: 100 million years/)
+  assert.match(prompt, /Do not invent an exact date or force all calculations into millisecond ticks/)
+  const timeSchema = EVENT_PATCH_SCHEMA.properties.operations.items.oneOf
+    .find(operation => operation.properties.action.const === 'upsert').properties.storyTime
+  assert.equal(timeSchema.properties.start.type, 'number')
+  assert.match(timeSchema.properties.label.description, /Display padding never changes start\/end/)
+})
+
 async function waitFor(predicate, message, timeout = 5000) {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {

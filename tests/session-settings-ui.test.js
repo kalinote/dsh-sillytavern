@@ -49,6 +49,302 @@ function createReactHarness() {
   }
 }
 
+test('failed action recovery preserves an existing draft and retries unpersisted input exactly once', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const harness = createReactHarness()
+  const Button = function Button() {}
+  const input = { draft: '尚未发送的补充', phase: 'plain' }
+  const sent = []
+  const action = '我先检查制冰机的电源。\n再请立希说明异响。'
+  const failed = { turn: 2, text: action, inputs: [{ persisted: false }] }
+  const { TavernFailureNode } = compile(source, ['TavernFailureNode'], {
+    React: harness.React, h: harness.h, Button,
+    useAsync: () => ({ loading: false, value: { failedTurns: [failed] } }),
+  })
+  const props = { sessionId: 'a', node: { data: { turn: 2, seq: 9, message: 'script callback barrier timed out' } },
+    useInput: selector => selector(input), inputActions: { setDraft: value => { input.draft = value }, submit: () => { sent.push(input.draft); input.draft = '' } } }
+  let tree = harness.render(TavernFailureNode, props)
+  assert.equal(findButton(tree, Button, '重试这轮').props.disabled, true)
+  findButton(tree, Button, '恢复输入 / 编辑').props.onClick()
+  assert.equal(input.draft, `尚未发送的补充\n${action}`)
+  input.draft = ''
+  tree = harness.render(TavernFailureNode, props)
+  findButton(tree, Button, '重试这轮').props.onClick()
+  assert.deepEqual(sent, [action])
+  failed.inputs[0].persisted = true
+  tree = harness.render(TavernFailureNode, props)
+  findButton(tree, Button, '继续未完成的回复').props.onClick()
+  assert.equal(sent[1].includes(action), false, 'an already-persisted user action is not resubmitted into context')
+})
+
+test('message actions retry only the opening action and reject continuation after an unfinished turn', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const harness = createReactHarness()
+  const Button = function Button() {}
+  const branches = []
+  const entry = { turn: 3, reason: 'interrupted', text: '开场行动\n中途追加', retryText: '开场行动', steeringText: '中途追加', assistantIds: ['assistant-3'] }
+  const { TavernMessageActions } = compile(source, ['TavernMessageActions'], {
+    React: harness.React, h: harness.h, Button, Object,
+    Tooltip: 'tooltip', IconRefreshOutline16: 'refresh-icon', IconEditOutline16: 'edit-icon', IconRightUpOutline16: 'continue-icon',
+    useAsync: () => ({ value: { turns: [entry] } }),
+    openPlayerBranch: async (...args) => { branches.push(args) },
+    encodeURIComponent,
+  })
+  const tree = harness.render(TavernMessageActions, { sessionId: 'session-a', messageId: 'assistant-3' })
+  const continueButton = descendants(tree).find(node => node.type === 'button' && node.props['aria-label'] === '从这里继续')
+  assert.equal(continueButton.props['aria-disabled'], true)
+  assert.equal(continueButton.props.onClick, undefined)
+  assert.match(textContent(tree), /中途追加的行动/)
+  descendants(tree).find(node => node.type === 'button' && node.props['aria-label'] === '重生成 · 保留原分支').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(JSON.parse(JSON.stringify(branches)), [['session-a', { beforeTurn: 3 }, '开场行动', true]])
+})
+
+test('retrying an earlier failure branches even when every later turn also failed', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const harness = createReactHarness()
+  const Button = function Button() {}
+  const branches = []
+  const failed = { turn: 2, text: '开场行动\n中途追加', retryText: '开场行动', steeringText: '中途追加', inputs: [{ target: 'next-turn', persisted: false }, { target: 'next-step', persisted: true }] }
+  const { TavernFailureNode } = compile(source, ['TavernFailureNode'], {
+    React: harness.React, h: harness.h, Button, Object,
+    useAsync: () => ({ loading: false, value: { turns: [failed, { turn: 3, reason: 'error' }], failedTurns: [failed] } }),
+    openPlayerBranch: async (...args) => { branches.push(args) },
+  })
+  const input = { draft: '', phase: 'plain' }
+  const tree = harness.render(TavernFailureNode, { sessionId: 'session-a', node: { data: { turn: 2, seq: 9, message: 'failed' } },
+    useInput: selector => selector(input), inputActions: { setDraft() {}, submit() {} } })
+  assert.match(textContent(tree), /中途追加的行动/)
+  findButton(tree, Button, '从这轮创建重试分支').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(JSON.parse(JSON.stringify(branches)), [['session-a', { beforeTurn: 2 }, '开场行动', true]])
+})
+
+test('fork inheritance repair is offered only for a broken repairable fork', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const Button = function Button() {}
+  const render = inheritance => {
+    const harness = createReactHarness()
+    const { ForkInheritanceNotice } = compile(source, ['ForkInheritanceNotice'], {
+      React: harness.React, h: harness.h, Button,
+      api: async () => ({}), overlay: { changed() {} }, JSON,
+    })
+    return harness.render(ForkInheritanceNotice, { session: { sessionId: 'session-a', fork: { inheritance } }, reload() {} })
+  }
+  const inherited = render({ status: 'inherited', exact: true, repairable: true })
+  assert.equal(descendants(inherited).some(node => node.type === Button), false)
+  const broken = render({ status: 'repairable', exact: false, repairable: true, reason: 'missing state' })
+  assert.equal(findButton(broken, Button, '从来源剧情恢复分支设定').props.disabled, false)
+})
+
+test('branch navigation waits for refresh and does not follow or queue a draft after the player switches sessions', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const declaration = functionSource(source, 'openPlayerBranch')
+  let current = 'session-a'
+  let resolveRefresh
+  const opened = []
+  const alerts = []
+  const sessions = {
+    list: { getSnapshot: () => ({ current }) },
+    refresh: () => new Promise(resolve => { resolveRefresh = resolve }),
+    open: id => opened.push(id),
+  }
+  let next = 0
+  const compiled = vm.runInNewContext(`(() => {
+    let playerSessions = sessions
+    const pendingPlayerDrafts = new Map()
+    async ${declaration}
+    return { openPlayerBranch, pendingPlayerDrafts }
+  })()`, {
+    sessions,
+    api: async () => ({ sessionId: `branch-${++next}` }),
+    overlay: { close() {} },
+    window: { alert: message => alerts.push(message) },
+    JSON,
+    Error,
+  })
+
+  const switched = compiled.openPlayerBranch('session-a', { beforeTurn: 2 }, '重试行动', true)
+  await new Promise(resolve => setImmediate(resolve))
+  current = 'session-b'
+  resolveRefresh()
+  assert.equal((await switched).opened, false)
+  assert.deepEqual(opened, [])
+  assert.equal(compiled.pendingPlayerDrafts.size, 0)
+  assert.match(alerts[0], /会话列表打开新分支/)
+
+  current = 'session-a'
+  sessions.refresh = async () => {}
+  const followed = await compiled.openPlayerBranch('session-a', { beforeTurn: 2 }, '重试行动', true)
+  assert.equal(followed.opened, true)
+  assert.deepEqual(opened, ['branch-2'])
+  assert.equal(compiled.pendingPlayerDrafts.get('branch-2').text, '重试行动')
+
+  sessions.refresh = async () => { throw new Error('offline') }
+  await assert.rejects(compiled.openPlayerBranch('session-a', { beforeTurn: 2 }, '不会排队', true), /新分支已创建，但会话列表刷新失败/)
+  assert.equal(compiled.pendingPlayerDrafts.has('branch-3'), false)
+})
+
+test('worldbook editor disables its mutation surface while its save snapshot is in flight', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const harness = createReactHarness()
+  const Button = function Button() {}
+  let resolveSave
+  const { WorldbookEditor } = compile(source, ['WorldbookEditor'], {
+    React: harness.React,
+    h: harness.h,
+    Button,
+    Field: function Field() {},
+    WorldbookEntryEditor: function WorldbookEntryEditor() {},
+    normalizeWorldbookRecord: value => value,
+    api: () => new Promise(resolve => { resolveSave = resolve }),
+    overlay: { changed() {} },
+    crypto: { randomUUID: () => 'entry' },
+    window: { confirm: () => true },
+  })
+  const props = { sessionId: 'session-a', worldbook: { id: 'book-a', name: 'Book', book: { name: 'Book', entries: [] } }, reload() {} }
+  let tree = harness.render(WorldbookEditor, props)
+  findButton(tree, Button, '保存世界书').props.onClick()
+  tree = harness.render(WorldbookEditor, props)
+  const fieldset = descendants(tree).find(node => node.type === 'fieldset')
+  assert.ok(fieldset)
+  assert.equal(fieldset.props.disabled, true)
+  assert.equal(findButton(tree, Button, '保存中…').props.disabled, true)
+  resolveSave({})
+  await new Promise(resolve => setImmediate(resolve))
+})
+
+test('worldbook session copy chooses a free suffix, retries a concurrent conflict, and preserves the full book', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const harness = createReactHarness()
+  const Button = function Button() {}
+  const baseName = '【BanD Dream！】交织的乐章 0826'
+  const entries = Array.from({ length: 54 }, (_, index) => ({ id: index, keys: [`key-${index}`], content: `entry-${index}`, enabled: true, extensions: { depth: index } }))
+  const original = { id: 'original', name: baseName, book: { name: baseName, entries, extensions: { custom: { retained: true } }, scan_depth: 7, unknown_field: { nested: ['kept'] } } }
+  const worldbooks = [original, { id: 'copy-1', name: `${baseName} · 当前剧情副本` }]
+  const createBodies = []
+  const updates = []
+  const selections = []
+  let createdCopy
+  let loadedWorldbook = original
+  const api = async (path, options) => {
+    const body = JSON.parse(options.body)
+    if (path === '/worldbook/create') {
+      createBodies.push(body)
+      if (createBodies.length === 1) throw Object.assign(new Error('already exists'), { code: 'worldbook-name-conflict' })
+      createdCopy = { id: 'copy-3', name: body.name, book: body.book }
+      return createdCopy
+    }
+    if (path === '/session/update') { updates.push(body); return {} }
+    throw new Error(`unexpected request ${path}`)
+  }
+  let persistentRef
+  const { WorldbookTab } = compile(source, ['availableWorldbookCopyName', 'WorldbookTab'], {
+    React: { ...harness.React, useEffect: effect => effect(), useRef: initial => (persistentRef ||= { current: initial }) },
+    h: harness.h,
+    Button,
+    Field: function Field() {},
+    ConfirmPanel: function ConfirmPanel() {},
+    ReferenceList: function ReferenceList() {},
+    WorldbookEditor: function WorldbookEditor() {},
+    normalizeWorldbookRecord: value => value,
+    useAsync: () => ({ loading: false, error: null, value: loadedWorldbook }),
+    api,
+    overlay: { changed() {} },
+    crypto: { randomUUID: () => 'new-book' },
+    window: { confirm: () => true },
+    Set,
+  })
+  let editorSelection = original.id
+  let libraryWorldbooks = worldbooks
+  let session = { sessionId: 'session-a', card: { id: 'card-a' }, binding: { worldbookId: original.id, worldbookExplicit: true } }
+  const render = () => harness.render(WorldbookTab, {
+    session,
+    library: { worldbooks: libraryWorldbooks },
+    editorSelection,
+    onEditorSelection: id => { editorSelection = id; selections.push(id) },
+    reload() {},
+  })
+  let tree = render()
+  findButton(tree, Button, '复制到当前剧情再编辑').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(createBodies.map(body => body.name), [`${baseName} · 当前剧情副本 2`, `${baseName} · 当前剧情副本 3`])
+  assert.equal(createBodies[1].book.entries.length, 54)
+  assert.deepEqual(createBodies[1].book.unknown_field, { nested: ['kept'] })
+  assert.deepEqual(createBodies[1].book.extensions, { custom: { retained: true } })
+  assert.deepEqual(updates, [{ sessionId: 'session-a', patch: { worldbookId: 'copy-3' } }])
+  assert.deepEqual(selections, ['copy-3'])
+  tree = render()
+  assert.equal(editorSelection, 'copy-3', 'the old library snapshot must not roll the editor back to the original')
+  assert.equal(descendants(tree).find(node => node.type === 'select').props.value, 'copy-3')
+  assert.equal(descendants(tree).some(node => node.type.name === 'WorldbookEditor'), false, 'the previous worldbook value must not mount under the new selection key')
+  assert.match(textContent(tree), /正在读取世界书/)
+  loadedWorldbook = createdCopy
+  tree = render()
+  const editorNode = descendants(tree).find(node => node.type.name === 'WorldbookEditor')
+  assert.equal(editorNode.props.worldbook.id, 'copy-3')
+  const editorHarness = createReactHarness()
+  const { WorldbookEditor } = compile(source, ['WorldbookEditor'], {
+    React: editorHarness.React,
+    h: editorHarness.h,
+    Button,
+    Field: function Field() {},
+    WorldbookEntryEditor: function WorldbookEntryEditor() {},
+    normalizeWorldbookRecord: value => value,
+    api,
+    overlay: { changed() {} },
+    crypto: { randomUUID: () => 'new-entry' },
+    window: { confirm: () => true },
+  })
+  const editorTree = editorHarness.render(WorldbookEditor, editorNode.props)
+  assert.ok(descendants(editorTree).some(node => node.type === 'input' && node.props.value === `${baseName} · 当前剧情副本 3`), 'the mounted editor draft must initialize with the copy name')
+  libraryWorldbooks = [...worldbooks, createdCopy]
+  session = { ...session, binding: { worldbookId: 'copy-3', worldbookExplicit: true } }
+  tree = render()
+  assert.equal(editorSelection, 'copy-3', 'the refreshed library keeps the created copy selected')
+  assert.deepEqual(selections, ['copy-3'])
+  assert.match(textContent(tree), /当前剧情副本 3/)
+})
+
+test('persona save keeps only the failed resource dirty and retries only that resource', async () => {
+  const source = await readFile(new URL('../client.cjs', import.meta.url), 'utf8')
+  const harness = createReactHarness()
+  const Button = function Button() {}
+  const calls = []
+  let reloads = 0
+  const { PersonaTab } = compile(source, ['PersonaTab'], {
+    React: harness.React,
+    h: harness.h,
+    Button,
+    Field: function Field() {},
+    api: async path => {
+      calls.push(path)
+      if (path === '/regex-sources') throw new Error('global unavailable')
+      return {}
+    },
+    overlay: { changed() {} },
+  })
+  const props = { session: { sessionId: 'session-a', binding: { userPersona: { name: 'User' }, variables: {} }, globalVariables: {} }, reload: () => { reloads += 1 } }
+  let tree = harness.render(PersonaTab, props)
+  assert.equal(findButton(tree, Button, '保存角色设定与变量').props.disabled, true)
+  descendants(tree).find(node => node.type === 'input').props.onChange({ target: { value: 'Player' } })
+  descendants(tree).filter(node => node.type === 'textarea').at(-1).props.onChange({ target: { value: '{"mood":"tense"}' } })
+  tree = harness.render(PersonaTab, props)
+  findButton(tree, Button, '保存角色设定与变量').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  tree = harness.render(PersonaTab, props)
+  assert.match(textContent(tree), /角色设定与会话变量已保存/)
+  assert.match(textContent(tree), /全局变量保存失败：global unavailable/)
+  assert.equal(findButton(tree, Button, '保存角色设定与变量').props.disabled, false)
+  assert.deepEqual(calls, ['/session/update', '/regex-sources'])
+  assert.equal(reloads, 1)
+
+  findButton(tree, Button, '保存角色设定与变量').props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(calls, ['/session/update', '/regex-sources', '/regex-sources'])
+  assert.equal(reloads, 1)
+})
+
 function descendants(node) {
   if (Array.isArray(node)) return node.flatMap(descendants)
   if (!node || typeof node !== 'object') return []
@@ -254,6 +550,8 @@ test('manager and conversation settings route each page to the intended editor',
     PersonaTab,
     EventTab,
     TemplatesTab,
+    ForkInheritanceNotice: function ForkInheritanceNotice() {},
+    PlayerNewStory: function PlayerNewStory() {},
     useTavernSettings: () => ({ loading: false, error: null, value: { library, session }, reload() {} }),
   }
   const { ManagerContent, SessionSettingsContent } = compile(source, ['ManagerContent', 'SessionSettingsContent'], context)

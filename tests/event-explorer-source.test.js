@@ -108,3 +108,28 @@ test('a failed refresh retains the last full document for inspection', async () 
   assert.equal(h.source.getSnapshot().refreshing, false)
   stop()
 })
+
+test('maintenance state updates independently of the event document revision', async () => {
+  const document = { revision: 0, rows: [], eventEdges: [] }
+  let response = { document, unchanged: false, maintenance: { status: 'pending', pending: 1 } }
+  const h = harness(async () => response)
+  let changes = 0
+  const stop = h.source.subscribe(() => { changes += 1 })
+  await settle()
+  assert.equal(h.source.getSnapshot().document, document)
+  assert.deepEqual(h.source.getSnapshot().maintenance, { status: 'pending', pending: 1 })
+
+  const pendingSnapshot = h.source.getSnapshot()
+  response = { unchanged: true, maintenance: { status: 'pending', pending: 1 } }
+  h.tick()
+  await settle()
+  assert.equal(h.source.getSnapshot(), pendingSnapshot, 'equivalent metadata does not cause a redundant render')
+
+  response = { unchanged: true, maintenance: { status: 'running', running: 1 } }
+  h.tick()
+  await settle()
+  assert.equal(h.source.getSnapshot().document, document)
+  assert.deepEqual(h.source.getSnapshot().maintenance, { status: 'running', running: 1 })
+  assert.equal(changes, 2)
+  stop()
+})

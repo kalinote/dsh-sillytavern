@@ -186,6 +186,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     await import(new URL(`../client.cjs?test=${Date.now()}`, import.meta.url).href)
     assert.equal(definition.id, 'dsh-sillytavern')
     let hookStates = []
+    const hookUpdates = []
     const reactEffects = []
     const reactLayoutEffects = []
     function Menu() {}
@@ -201,7 +202,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
         Fragment,
         createElement(type, props, ...children) { return { type, props: props || {}, children } },
         memo(component) { return component },
-        useState(initial) { return [hookStates.length > 0 ? hookStates.shift() : typeof initial === 'function' ? initial() : initial, () => undefined] },
+        useState(initial) { return [hookStates.length > 0 ? hookStates.shift() : typeof initial === 'function' ? initial() : initial, value => { hookUpdates.push(value) }] },
         useRef(value) { return { current: value } },
         useMemo(factory) { return factory() },
         useCallback(callback) { return callback },
@@ -211,7 +212,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
       }
     })
     assert.equal(typeof plugin.apply, 'function')
-    assert.deepEqual(plugin.inject, ['slots', 'commandUi', 'conversation'])
+    assert.deepEqual(plugin.inject, ['slots', 'commandUi', 'conversation', 'sessions'])
 
     let removed = false
     const style = { dataset: {}, textContent: '', remove() { removed = true } }
@@ -224,8 +225,10 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     let slotsDisposed = 0
     let decoration
     const conversation = { blocks: { set() {}, storeFor: () => ({ getSnapshot: () => undefined }) } }
+    const sessionState = { current: 'session-a', byId: { 'session-a': { projectionValues: { agentPreset: 'sillytavern' } } } }
+    const sessions = { list: { getSnapshot: () => sessionState, subscribe: () => () => {} } }
     plugin.apply({
-      get(name) { return name === 'conversation' ? conversation : undefined },
+      get(name) { return name === 'conversation' ? conversation : name === 'sessions' ? sessions : undefined },
       effect(callback) { const dispose = callback(); disposers.push(dispose); return dispose },
       commandUi: { decorate(value) { decoration = value; return () => { commandDisposed += 1 } } },
       slots: {
@@ -241,10 +244,6 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
       'settings.section',
       'conversation.chat.commandview',
       'conversation.chat.commandview',
-      'conversation.view',
-      'conversation.view',
-      'conversation.view',
-      'conversation.view',
       'conversation.view',
     ])
     assert.deepEqual(slotOptions.map(option => [option.name, option.id, option.order, option.priority]), [
@@ -263,7 +262,6 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(slotOptions[4].key, 'st-opening')
     assert.equal(slotOptions[5].key, 'narrator')
     assert.equal(slotOptions[1].inject, undefined)
-    const sessionState = { byId: { 'session-a': { projectionValues: { agentPreset: 'sillytavern' } } } }
     assert.deepEqual(slotOptions.slice(6, 11).map(option => option.label), ['时间线', '世界书', '用户设定/变量', '脚本', '提示词模板'])
     assert.deepEqual(slotComponents.slice(6, 11).map(component => component.name), ['TavernEventsView', 'TavernWorldbookView', 'TavernPersonaView', 'TavernScriptsView', 'TavernTemplatesView'])
     const eventView = slotComponents[6]({ sessionId: 'session-a', useSessions: selector => selector(sessionState) })
@@ -283,11 +281,13 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     const inputState = { draft: '已有草稿', phase: 'plain' }
     const useInput = selector => selector(inputState)
     let nextDraft
-    const composerElement = slotComponents[0]({ sessionId: 'session-a', ...slotOptions[0].inject(), useInput, inputActions: { setDraft(value) { nextDraft = value } }, useSessions: selector => selector(sessionState) })
+    const composerChrome = slotComponents[0]({ sessionId: 'session-a', ...slotOptions[0].inject(), useInput, inputActions: { setDraft(value) { nextDraft = value } }, useSessions: selector => selector(sessionState) })
+    assert.equal(composerChrome.type.name, 'TavernPlayerChrome')
+    const composerElement = composerChrome.children[0]
     assert.equal(composerElement.type.name, 'TavernCharacterSelect')
     assert.equal(composerElement.props.input, undefined, 'the fixture must use the public DSH input hook, not the removed props.input field')
     const legacyComposerElement = slotComponents[0]({ sessionId: 'legacy-session', useInput: selector => selector({ draft: '', phase: 'plain' }), inputActions: { setDraft() {} }, useSessions: selector => selector({ byId: { 'legacy-session': { agentPreset: 'sillytavern' } } }) })
-    assert.equal(legacyComposerElement.type.name, 'TavernCharacterSelect', 'pre-0.1.2 Session summaries remain compatible')
+    assert.equal(legacyComposerElement.children[0].type.name, 'TavernCharacterSelect', 'pre-0.1.2 Session summaries remain compatible')
     assert.deepEqual(composerElement.props.appendInput('1. 前往练习室'), { draft: '已有草稿\n1. 前往练习室' })
     assert.equal(nextDraft, '已有草稿\n1. 前往练习室')
     assert.deepEqual(composerElement.props.appendInput('2. 留在原地'), { draft: '已有草稿\n1. 前往练习室\n2. 留在原地' }, 'rapid bridge calls serialize against the synchronous draft ref')
@@ -298,14 +298,16 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     const rendererEffect = reactEffects.find(effect => String(effect).includes('registerMessageRenderers'))
     assert.equal(typeof rendererEffect, 'function')
     const disposeRenderers = rendererEffect()
-    assert.deepEqual(slotOptions.slice(-5).map(option => [option.name, option.key, option.priority, option.locale]), [
+    assert.deepEqual(slotOptions.slice(-7).map(option => [option.name, option.key, option.priority, option.locale]), [
       ['conversation.chat.node', 'assistant-step', -20, undefined],
       ['conversation.chat.node', 'user', -20, undefined],
       ['conversation.chat.node', 'steering', -20, undefined],
       ['conversation.chat.node', 'turn-process', -20, 'chat'],
       ['conversation.chat.node', 'system-prompt', -20, 'chat'],
+      ['conversation.chat.node', 'turn-error', -20, undefined],
+      ['conversation.chat.assistant-actions', undefined, undefined, undefined],
     ])
-    assert.deepEqual(slotComponents.slice(-5).map(component => component.name), ['TavernAssistantNode', 'TavernUserNode', 'TavernUserNode', 'TavernTurnProcessNode', 'TavernSystemPromptNode'])
+    assert.deepEqual(slotComponents.slice(-7).map(component => component.name), ['TavernAssistantNode', 'TavernUserNode', 'TavernUserNode', 'TavernTurnProcessNode', 'TavernSystemPromptNode', 'TavernFailureNode', 'TavernMessageActions'])
     const messageRenderers = Object.fromEntries(slotOptions.map((option, index) => [option.key, slotComponents[index]]).filter(([key]) => key !== undefined))
     const assistantRenderer = messageRenderers['assistant-step']
     const turnProcessRenderer = messageRenderers['turn-process']
@@ -483,7 +485,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(tavernSvg.props.viewBox, '0 0 16 16')
     assert.equal(characterView.props.anchor.children[1].children[0], 'Alice')
     assert.equal(slotComponents[0]({ sessionId: 'session-b', blocks: conversation.blocks, useInput: selector => selector({ draft: '', phase: 'plain' }), inputActions: { setDraft() {} }, useSessions: selector => selector({ byId: { 'session-b': { projectionValues: { agentPreset: 'cat' } } } }) }), null)
-    hookStates = ['opening', null, null, { loading: true, error: null, value: { characterName: 'Alice', text: 'Welcome, User.', swipeId: 0, swipeCount: 2 } }]
+    hookStates = ['opening', null, null, 0, false, { loading: true, error: null, value: { characterName: 'Alice', text: 'Welcome, User.', swipeId: 0, swipeCount: 2 } }]
     const blankSettingsElement = slotComponents[1]({ sessionId: 'session-a', session: { blank: true }, useSessions: selector => selector(sessionState) })
     assert.equal(blankSettingsElement.type.name, 'BlankSessionSettings')
     const blankSettings = blankSettingsElement.type(blankSettingsElement.props)
@@ -499,7 +501,7 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(openingView.props['aria-label'], '角色开场预览')
     assert.equal(openingView.props['aria-busy'], true, 'refresh keeps the previous preview mounted instead of flashing')
     assert.equal(openingView.children[0].children[1].children[0], 'Alice')
-    assert.equal(openingView.children[0].children.length, 2, 'the visible opening-preview badge is removed')
+    assert.equal(openingView.children[0].children.length, 3, 'opening navigation is available beside the character name')
     const renderedGreeting = openingView.children[1]
     assert.equal(renderedGreeting.type.name, 'RegexGreetingContent')
     const resolvedGreeting = renderedGreeting.type(renderedGreeting.props)
@@ -510,6 +512,60 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(fetchCalls[0].url, '/api/dsh-sillytavern/opening/select')
     assert.equal(fetchCalls[0].options.method, 'POST')
     assert.deepEqual(JSON.parse(fetchCalls[0].options.body), { sessionId: 'session-a', swipeId: 1 })
+
+    const confirmations = []
+    globalThis.window.confirm = message => { confirmations.push(message); return true }
+    const renderCharacterControl = (id, sessionValue, compatibilityValue, replacement = null) => {
+      hookStates = [
+        null,
+        { loading: false, error: null, value: sessionValue },
+        { loading: false, error: null, value: compatibilityValue },
+        { loading: false, error: null, value: { cards: [{ id: 'card-a', name: 'Alice' }, { id: 'card-b', name: 'Bob' }] } },
+        false,
+        replacement,
+      ]
+      const view = composerElement.type({ ...composerElement.props, sessionId: id })
+      return replacement ? view.children.find(child => child?.type?.name === 'ConfirmPanel') : view.children[0]
+    }
+    fetchCalls.length = 0
+    const previewCardControl = renderCharacterControl(
+      'session-preview-card',
+      { sessionId: 'session-preview-card', binding: null, card: null, history: [] },
+      { state: { binding: null }, cardRecord: { id: 'card-a', card: { data: { name: 'Alice' } } } },
+    )
+    assert.equal(previewCardControl.props.value, 'card-a', 'the default preview remains visible in the selector')
+    previewCardControl.props.onChange('card-b')
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(confirmations.length, 0, 'changing an unbound default preview does not ask to replace a real binding')
+    assert.equal(fetchCalls.length, 1)
+    assert.equal(fetchCalls[0].url, '/api/dsh-sillytavern/bind')
+    assert.deepEqual(JSON.parse(fetchCalls[0].options.body), { sessionId: 'session-preview-card', cardId: 'card-b', replace: false, expectedCardId: null })
+
+    fetchCalls.length = 0
+    const boundCardControl = renderCharacterControl(
+      'session-bound-card',
+      { sessionId: 'session-bound-card', binding: { cardId: 'card-a', startedAt: null }, card: { id: 'card-a', card: { data: { name: 'Alice' } } }, history: [] },
+      { state: { binding: { cardId: 'card-a' } }, cardRecord: { id: 'card-a', card: { data: { name: 'Alice' } } } },
+    )
+    hookUpdates.length = 0
+    boundCardControl.props.onChange('card-b')
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(confirmations.length, 0, 'replacement does not block the browser with a native dialog')
+    assert.equal(fetchCalls.length, 0, 'replacement waits for explicit page confirmation')
+    const pendingReplacement = hookUpdates.find(value => value?.id === 'card-b')
+    assert.equal(pendingReplacement.boundCardId, 'card-a')
+    const replacementPanel = renderCharacterControl(
+      'session-bound-card',
+      { sessionId: 'session-bound-card', binding: { cardId: 'card-a', startedAt: null }, card: { id: 'card-a', card: { data: { name: 'Alice' } } }, history: [] },
+      { state: { binding: { cardId: 'card-a' } }, cardRecord: { id: 'card-a', card: { data: { name: 'Alice' } } } },
+      pendingReplacement,
+    )
+    replacementPanel.props.onConfirm()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(fetchCalls.length, 1)
+    assert.deepEqual(JSON.parse(fetchCalls[0].options.body), { sessionId: 'session-bound-card', cardId: 'card-b', replace: true, expectedCardId: 'card-a' })
+    fetchCalls.length = 0
+
     assert.deepEqual(renderedGreeting.props.onCommitSwipe(1, 'frame-a'), { message_id: 0, swipe_id: 1 })
     assert.throws(() => renderedGreeting.props.onCommitSwipe(1, 'frame-a'), /does not match the prepared frame selection/)
     const markdownGreeting = resolvedGreeting.type(resolvedGreeting.props)
@@ -567,8 +623,11 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(mixedGreeting.children[1].type.name, 'GreetingHtmlFrame')
     const htmlFrameWrapper = mixedGreeting.children[1].type(mixedGreeting.children[1].props)
     assert.equal(htmlFrameWrapper.type.name, 'TrustedFrame')
-    const htmlFrame = htmlFrameWrapper.type(htmlFrameWrapper.props)
-    assert.equal(htmlFrame.type, 'iframe')
+    const htmlFrameShell = htmlFrameWrapper.type(htmlFrameWrapper.props)
+    assert.equal(htmlFrameShell.type, 'div')
+    assert.equal(htmlFrameShell.props.className, 'dst-trusted-frame-shell')
+    const htmlFrame = htmlFrameShell.children.flat().find(child => child?.type === 'iframe')
+    assert.ok(htmlFrame)
     assert.equal(htmlFrame.props.sandbox, 'allow-scripts allow-forms allow-popups allow-downloads allow-modals')
     assert.equal(htmlFrame.props.referrerPolicy, undefined)
     assert.match(htmlFrame.props.srcDoc, /installCompatibilityRuntime/)
@@ -590,7 +649,8 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(embeddedFenceGreeting.children.length, 3)
     assert.equal(embeddedFenceGreeting.children[1].type.name, 'GreetingHtmlFrame')
     const embeddedGreetingWrapper = embeddedFenceGreeting.children[1].type(embeddedFenceGreeting.children[1].props)
-    const embeddedGreetingFrame = embeddedGreetingWrapper.type(embeddedGreetingWrapper.props)
+    const embeddedGreetingFrame = embeddedGreetingWrapper.type(embeddedGreetingWrapper.props).children.flat().find(child => child?.type === 'iframe')
+    assert.ok(embeddedGreetingFrame)
     assert.match(embeddedGreetingFrame.props.srcDoc, /提取可能被```json等包裹的数据/)
     assert.match(embeddedGreetingFrame.props.srcDoc, /const parsed = true;/)
     assert.match(embeddedGreetingFrame.props.srcDoc, /<div>Rendered status<\/div>/)
@@ -815,6 +875,6 @@ test('client bundle keeps additive controls and scopes exact assistant replaceme
     assert.equal(slotComponents[2](), null, 'plugin disposal must reset module-scoped overlay state')
     assert.equal(removed, true)
     assert.equal(commandDisposed, 1)
-    assert.equal(slotsDisposed, 16)
+    assert.equal(slotsDisposed, 18)
   } finally { globalThis.window = previous; globalThis.document = previousDocument; globalThis.fetch = previousFetch }
 })

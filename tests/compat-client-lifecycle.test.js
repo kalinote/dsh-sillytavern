@@ -59,10 +59,10 @@ async function loadRuntimes(api, parentWindow) {
   return { parent, installFrame }
 }
 
-function parentSurface() {
+function parentSurface({ maxTimeoutMs = Infinity } = {}) {
   const handlers = new Map()
   return {
-    setTimeout,
+    setTimeout(listener, delay) { return setTimeout(listener, Math.min(delay, maxTimeoutMs)) },
     clearTimeout,
     addEventListener(name, listener) { if (!handlers.has(name)) handlers.set(name, new Set()); handlers.get(name).add(listener) },
     removeEventListener(name, listener) { handlers.get(name)?.delete(listener) },
@@ -116,13 +116,14 @@ class FakeHost {
       return { binding: { revision: this.bindingRevision, variables: { count: 2 }, scriptInjections: body.patch.scriptInjections || [] } }
     }
     if (path === '/compat/lifecycle') {
-      const available = this.lifecycle.filter(item => !item.delivered)
-      for (const item of available) item.delivered = true
+      const available = this.lifecycle.filter(item => !item.completed)
+      for (const item of available) item.deliveries = (item.deliveries || 0) + 1
       return available.map(({ id, kind, payload }) => ({ id, kind, payload }))
     }
     if (path === '/compat/lifecycle/result') {
       const request = this.lifecycle.find(item => item.id === body.id)
       if (!request) throw new Error(`unknown lifecycle result ${body.id}`)
+      request.completed = true
       request.result = body.result
       request.error = body.error
       if (body.error) request.start.reject(Object.assign(new Error(body.error), { code: 'generation-prepare-failed' }))
@@ -138,7 +139,7 @@ class FakeHost {
       const generationId = String(body.config.generation_id)
       this.generations.set(generationId, { active: true, status: 'active', full: '', toolCalls: [] })
       const start = deferred()
-      this.lifecycle.push({ id: `prepare-${++this.nextLifecycleId}`, kind: 'prepare', payload: {}, generationId, start, delivered: false })
+      this.lifecycle.push({ id: `prepare-${++this.nextLifecycleId}`, kind: 'prepare', payload: {}, generationId, start, completed: false, deliveries: 0 })
       return start.promise
     }
     if (path === '/compat/generation') return structuredClone(this.generations.get(new URL(url, 'http://local').searchParams.get('generationId')))
@@ -156,8 +157,8 @@ class FakeHost {
   }
 }
 
-async function harness(options) {
-  const surface = parentSurface()
+async function harness(options = {}) {
+  const surface = parentSurface(options)
   const host = new FakeHost(options)
   const { parent, installFrame } = await loadRuntimes(host.api.bind(host), surface)
   parent.start()
@@ -166,8 +167,72 @@ async function harness(options) {
   const unregisterA = parent.register({ channel: a.channel, sessionId: 'session-a', scriptId: 'script-a', getWindow: () => a.frameWindow })
   const unregisterB = parent.register({ channel: b.channel, sessionId: 'session-a', scriptId: 'script-b', getWindow: () => b.frameWindow })
   parent.set('session-a', baseSnapshot(), 'initial')
-  return { host, parent, a, b, cleanup() { unregisterA(); unregisterB(); parent.reset() } }
+  if (options.ready !== false) { a.root.__dshTavernReady(); b.root.__dshTavernReady() }
+  return { host, parent, surface, installFrame, a, b, unregisterA, unregisterB, cleanup() { unregisterA(); unregisterB(); parent.reset() } }
 }
+
+test('registered frames do not own lifecycle callbacks until their runtime reports ready', async t => {
+  const runtime = await harness({ ready: false })
+  t.after(runtime.cleanup)
+  const generated = runtime.a.root.generate({ generation_id: 'wait-for-ready' })
+  await waitFor(() => runtime.host.lifecycle.length === 1, 'generation did not create a lifecycle request')
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(runtime.host.lifecycle[0].deliveries, 0, 'a blank or booting iframe must not claim the callback')
+  runtime.a.root.__dshTavernReady()
+  assert.equal(await generated, 'done')
+  assert.deepEqual(runtime.host.lifecycle[0].result.ownerFrameIds, ['frame-a'])
+})
+
+test('a callback detached by navigation is re-delivered after an iframe remounts', async t => {
+  const runtime = await harness({ ready: false })
+  t.after(runtime.cleanup)
+  const stalledWindow = { postMessage() {} }
+  const unregisterStalled = runtime.parent.register({ channel: 'stalled-frame', sessionId: 'session-a', scriptId: 'stalled-script', getWindow: () => stalledWindow })
+  runtime.surface.dispatch(stalledWindow, { __dshSillyTavern: true, channel: 'stalled-frame', event: 'frame-ready' })
+  runtime.a.root.__dshTavernReady()
+  const generated = runtime.a.root.generate({ generation_id: 'resume-after-navigation' })
+  await waitFor(() => runtime.host.lifecycle[0]?.deliveries === 1, 'lifecycle callback was not delivered')
+  unregisterStalled()
+  runtime.unregisterA()
+
+  const replacement = attachFrame(runtime.surface, runtime.installFrame, 'replacement-frame')
+  const unregisterReplacement = runtime.parent.register({ channel: replacement.channel, sessionId: 'session-a', scriptId: 'replacement-script', getWindow: () => replacement.frameWindow })
+  t.after(unregisterReplacement)
+  replacement.root.__dshTavernReady()
+
+  assert.equal(await generated, 'done')
+  assert.ok(runtime.host.lifecycle[0].deliveries >= 2, 'the unfinished callback must be polled again')
+  assert.deepEqual(runtime.host.lifecycle[0].result.ownerFrameIds, ['replacement-frame'])
+  assert.equal(runtime.host.lifecycle[0].error, undefined)
+})
+
+test('an unresponsive iframe times out once and is retired from later callback barriers', async t => {
+  const runtime = await harness({ ready: false, maxTimeoutMs: 20 })
+  t.after(runtime.cleanup)
+  const stalledWindow = { postMessage() {} }
+  const unregisterStalled = runtime.parent.register({ channel: 'stalled-frame', sessionId: 'session-a', scriptId: 'stalled-script', getWindow: () => stalledWindow })
+  t.after(unregisterStalled)
+  runtime.surface.dispatch(stalledWindow, { __dshSillyTavern: true, channel: 'stalled-frame', event: 'frame-ready' })
+  runtime.a.root.__dshTavernReady()
+
+  assert.equal(await runtime.a.root.generate({ generation_id: 'retire-stalled-frame' }), 'done')
+  assert.deepEqual(runtime.host.lifecycle[0].result.ownerFrameIds, ['frame-a'])
+  assert.equal(runtime.host.lifecycle[0].error, undefined)
+})
+
+test('an empty iframe may collapse to zero height after authenticated measurement', async t => {
+  const surface = parentSurface()
+  const host = new FakeHost()
+  const { parent } = await loadRuntimes(host.api.bind(host), surface)
+  t.after(() => parent.reset())
+  parent.start()
+  const frameWindow = { postMessage() {} }
+  let height = null
+  const unregister = parent.register({ channel: 'empty-frame', sessionId: 'session-a', scriptId: 'empty-script', getWindow: () => frameWindow, onResize: value => { height = value } })
+  t.after(unregister)
+  surface.dispatch(frameWindow, { __dshSillyTavern: true, channel: 'empty-frame', event: 'frame-resize', payload: { height: 0 } })
+  assert.equal(height, 0)
+})
 
 test('two frames drain accepted writes before generation and run owner filters through the lifecycle barrier', async t => {
   const runtime = await harness({ blockFirstWrite: true })

@@ -355,6 +355,20 @@ function normalizeBinding(binding) {
     })
     return [normalized]
   }) : []
+  const inherited = binding.inheritedFrom !== null && typeof binding.inheritedFrom === 'object' && !Array.isArray(binding.inheritedFrom)
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(String(binding.inheritedFrom.parentSessionId ?? ''))
+    && Number.isSafeInteger(Number(binding.inheritedFrom.inheritedEventCount)) && Number(binding.inheritedFrom.inheritedEventCount) >= 0
+    ? {
+        parentSessionId: String(binding.inheritedFrom.parentSessionId),
+        inheritedEventCount: Number(binding.inheritedFrom.inheritedEventCount),
+        exact: binding.inheritedFrom.exact === true,
+        bindingExact: binding.inheritedFrom.bindingExact === true,
+        source: ['fork-point', 'history', 'parent-current'].includes(binding.inheritedFrom.source) ? binding.inheritedFrom.source : 'parent-current',
+        event: ['exact', 'source-bounded', 'missing'].includes(binding.inheritedFrom.event) ? binding.inheritedFrom.event : 'missing',
+        compatChat: ['exact', 'native-only', 'missing'].includes(binding.inheritedFrom.compatChat) ? binding.inheritedFrom.compatChat : 'missing',
+        inheritedAt: typeof binding.inheritedFrom.inheritedAt === 'string' ? binding.inheritedFrom.inheritedAt : new Date(0).toISOString(),
+      }
+    : null
   return {
     revision: Number.isSafeInteger(Number(binding.revision)) && Number(binding.revision) >= 0 ? Number(binding.revision) : 0,
     cardId: String(binding.cardId),
@@ -368,6 +382,7 @@ function normalizeBinding(binding) {
     chatMetadata,
     scriptInjections,
     openingSwipeId: Number.isSafeInteger(Number(binding.openingSwipeId)) && Number(binding.openingSwipeId) >= 0 ? Number(binding.openingSwipeId) : 0,
+    ...(inherited === null ? {} : { inheritedFrom: inherited }),
   }
 }
 
@@ -411,6 +426,51 @@ function defaultBinding(cardId) {
     scriptInjections: [],
     openingSwipeId: 0,
   }
+}
+
+function ordinaryFork(session) {
+  const parentSessionId = session?.header?.parentSession
+  const inheritedEventCount = Number(session?.inheritedEventCount)
+  if (session?.header?.origin === 'subagent' || session?.header?.isSeeded !== true
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(String(parentSessionId ?? ''))
+    || !Number.isSafeInteger(inheritedEventCount) || inheritedEventCount < 0) return null
+  return { parentSessionId: String(parentSessionId), inheritedEventCount }
+}
+
+function sessionBoundary(session) {
+  if (Number.isSafeInteger(Number(session?.seq)) && Number(session.seq) >= 0) return Number(session.seq)
+  return sessionEvents(session).length
+}
+
+function normalizeBranchBindingHistory(value, sessionId) {
+  const snapshots = []
+  if (value?.schemaVersion === 1 && value.sessionId === sessionId && Array.isArray(value.snapshots)) {
+    for (const item of value.snapshots) {
+      const boundary = Number(item?.boundary)
+      const binding = normalizeBinding(item?.binding)
+      if (!Number.isSafeInteger(boundary) || boundary < 0 || binding === null) continue
+      snapshots.push({ boundary, exact: item.exact !== false, binding })
+    }
+  }
+  snapshots.sort((left, right) => left.boundary - right.boundary)
+  return { schemaVersion: 1, sessionId, snapshots }
+}
+
+function sourceBoundedEventDocument(document, sessionId, inheritedEventCount) {
+  const beforeBoundary = item => Array.isArray(item?.sourceRefs) && item.sourceRefs.length > 0
+    && item.sourceRefs.every(ref => Number.isSafeInteger(ref?.eventSeq) && ref.eventSeq < inheritedEventCount)
+  const rows = document.rows.filter(beforeBoundary).map(snapshot)
+  const eventIds = new Set(rows.flatMap(row => typeof row.eventId === 'string' ? [row.eventId] : []))
+  const eventEdges = document.eventEdges.filter(edge => beforeBoundary(edge)
+    && eventIds.has(edge.predecessorEventId) && eventIds.has(edge.successorEventId)).map(snapshot)
+  return normalizeEventDocument({
+    ...document,
+    sessionId,
+    revision: 0,
+    rows,
+    eventEdges,
+    appliedMaintenanceJobs: [],
+  }, sessionId)
 }
 
 function normalizeWorldbookBook(value, forcedName) {
@@ -459,6 +519,8 @@ export class SillyTavernStore {
     this.disposedAgents = new WeakSet()
     this.sessionLoads = new Map()
     this.sessionEpoch = new Map()
+    this.forkCaptures = new WeakMap()
+    this.preparedForkCaptures = new Map()
     this.tails = new Map()
     this.ready = this.workspaceState(this.fallbackWorkspace)
   }
@@ -572,6 +634,7 @@ export class SillyTavernStore {
         mkdir(join(root, 'worldbooks'), { recursive: true }),
         mkdir(join(root, 'event'), { recursive: true }),
         mkdir(join(root, 'compat-chats'), { recursive: true }),
+        mkdir(join(root, 'branch-bindings'), { recursive: true }),
       ])
       const state = {
         workspace,
@@ -1630,6 +1693,211 @@ export class SillyTavernStore {
     }, signal)
   }
 
+  branchBindingPath(state, sessionId) {
+    const name = createHash('sha256').update(String(sessionId)).digest('hex')
+    return join(state.root, 'branch-bindings', `${name}.json`)
+  }
+
+  captureForkPoint(session, parentAgent) {
+    const fork = ordinaryFork(session)
+    if (fork === null || parentAgent?.session === undefined || String(parentAgent.id) !== fork.parentSessionId) return false
+    const prepared = this.preparedForkCaptures.get(String(session.id))
+    if (prepared?.parentSessionId === fork.parentSessionId && prepared.inheritedEventCount === fork.inheritedEventCount) {
+      this.preparedForkCaptures.delete(String(session.id))
+      this.forkCaptures.set(session, prepared)
+      return true
+    }
+    const parent = this.sessionSync(parentAgent)
+    if (parent === undefined || parent.binding === null || parent.workspace !== this.workspaceFor(session?.header?.cwd)) return false
+    if (sessionBoundary(parentAgent.session) !== fork.inheritedEventCount) return false
+    this.forkCaptures.set(session, {
+      ...fork,
+      binding: snapshot(parent.binding),
+      event: snapshot(parent.event),
+      compatChat: snapshot(parent.compatChat),
+    })
+    return true
+  }
+
+  prepareFreshFork(childSessionId, parentAgent) {
+    const parent = this.sessionSync(parentAgent)
+    if (parent === undefined || parent.binding === null) throw new Error('source session has no selected character')
+    const id = safeSessionId(childSessionId)
+    const binding = snapshot(parent.binding)
+    binding.revision = 0
+    binding.boundAt = new Date().toISOString()
+    binding.startedAt = null
+    const card = parent.state.cards.get(binding.cardId)
+    binding.worldbookId = card === undefined ? binding.worldbookId : this.effectiveWorldbook(parent.state, parent.binding, card)?.id ?? null
+    binding.worldbookExplicit = true
+    binding.variables = {}
+    binding.chatMetadata = {}
+    binding.scriptInjections = []
+    binding.openingSwipeId = 0
+    delete binding.inheritedFrom
+    this.preparedForkCaptures.set(id, {
+      parentSessionId: String(parentAgent.id),
+      inheritedEventCount: 0,
+      binding,
+      event: emptyEventDocument(id),
+      compatChat: emptyCompatChatDocument(id),
+    })
+  }
+
+  cancelPreparedFork(childSessionId) {
+    this.preparedForkCaptures.delete(String(childSessionId))
+  }
+
+  async recordBindingSnapshot(agent, binding, signal) {
+    if (binding === null || binding === undefined) return
+    const state = await this.stateFor(agent)
+    const path = this.branchBindingPath(state, agent.id)
+    const boundary = sessionBoundary(agent.session)
+    await this.serial(`branch-binding:${state.root}:${String(agent.id)}`, () => withFileLock(path, async () => {
+      const history = normalizeBranchBindingHistory(await readJson(path, { schemaVersion: 1, sessionId: String(agent.id), snapshots: [] }, 16 * 1024 * 1024), String(agent.id))
+      const item = { boundary, exact: true, binding: snapshot(binding) }
+      const index = history.snapshots.findIndex(entry => entry.boundary === boundary)
+      if (index === -1) history.snapshots.push(item)
+      else history.snapshots[index] = item
+      history.snapshots.sort((left, right) => left.boundary - right.boundary)
+      history.snapshots = history.snapshots.slice(-512)
+      assertJsonBytes(history, 16 * 1024 * 1024, 'branch binding history')
+      await atomicJson(path, history, () => signal?.throwIfAborted())
+    }, signal), signal)
+  }
+
+  async checkpointBranchState(agent, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    if (session.binding !== null) await this.recordBindingSnapshot(agent, session.binding, signal)
+    return this.sessionView(agent)
+  }
+
+  async branchAvailability(parentAgent, inheritedEventCount, signal) {
+    const cut = Number(inheritedEventCount)
+    if (!Number.isSafeInteger(cut) || cut < 0) throw new TypeError('fork boundary must be a non-negative safe integer')
+    const session = this.sessionSync(parentAgent) ?? await this.ensureSession(parentAgent, signal)
+    if (session.binding === null) return { available: false, exact: false, source: null }
+    if (sessionBoundary(parentAgent.session) === cut) return { available: true, exact: true, source: 'fork-point' }
+    const bindingsPath = join(session.state.root, 'bindings.json')
+    const bindings = normalizeBindingsDocument(await readJson(bindingsPath, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+    const historical = (await this.collectBranchHistory(session.state, bindings, String(parentAgent.id), cut)).at(-1)
+    return historical === undefined
+      ? { available: false, exact: false, source: null }
+      : { available: true, exact: historical.exact === true && historical.boundary === cut, source: 'history' }
+  }
+
+  async collectBranchHistory(state, bindings, sessionId, cut, seen = new Set()) {
+    if (seen.has(sessionId) || seen.size >= 64) return []
+    seen.add(sessionId)
+    const path = this.branchBindingPath(state, sessionId)
+    const local = normalizeBranchBindingHistory(await readJson(path, { schemaVersion: 1, sessionId, snapshots: [] }, 16 * 1024 * 1024), sessionId)
+      .snapshots.filter(item => item.boundary <= cut)
+    const lineage = bindings.sessions[sessionId]?.inheritedFrom
+    const inherited = lineage !== undefined && cut <= lineage.inheritedEventCount
+      ? await this.collectBranchHistory(state, bindings, lineage.parentSessionId, cut, seen)
+      : []
+    const merged = new Map(inherited.map(item => [item.boundary, item]))
+    for (const item of local) merged.set(item.boundary, item)
+    return [...merged.values()].sort((left, right) => left.boundary - right.boundary)
+  }
+
+  async forkSource(agent, state, bindings, allowCurrentFallback = false) {
+    const fork = ordinaryFork(agent.session)
+    if (fork === null) return null
+    const captured = this.forkCaptures.get(agent.session)
+    if (captured?.parentSessionId === fork.parentSessionId && captured.inheritedEventCount === fork.inheritedEventCount) {
+      return { source: 'fork-point', exact: true, binding: snapshot(captured.binding), event: snapshot(captured.event), compatChat: snapshot(captured.compatChat) }
+    }
+    const history = await this.collectBranchHistory(state, bindings, fork.parentSessionId, fork.inheritedEventCount)
+    const historical = history.at(-1)
+    if (historical !== undefined) return { source: 'history', exact: historical.exact === true && historical.boundary === fork.inheritedEventCount, binding: snapshot(historical.binding) }
+    const current = bindings.sessions[fork.parentSessionId]
+    if (allowCurrentFallback && current !== undefined) return { source: 'parent-current', exact: false, binding: snapshot(current) }
+    return null
+  }
+
+  forkView(agent, session) {
+    const fork = ordinaryFork(agent.session)
+    if (fork === null) return null
+    const inherited = session.binding?.inheritedFrom
+    if (inherited?.parentSessionId === fork.parentSessionId && inherited.inheritedEventCount === fork.inheritedEventCount) {
+      return {
+        ...fork,
+        inheritance: {
+          status: 'inherited', exact: inherited.exact === true, source: inherited.source,
+          repairable: true, binding: inherited.bindingExact === true ? 'exact' : 'fallback',
+          event: inherited.event, compatChat: inherited.compatChat,
+          ...(inherited.exact === true ? {} : { reason: inherited.source === 'parent-current'
+            ? 'the fork-point binding was unavailable, so repair used the parent session current configuration'
+            : 'the binding was recovered at the fork boundary, while event memory and compatibility state were conservatively reconstructed from persisted sources' }),
+        },
+      }
+    }
+    return {
+      ...fork,
+      inheritance: {
+        status: session.forkRepairable ? 'repairable' : 'unavailable', exact: false, source: null,
+        repairable: session.forkRepairable === true, binding: session.binding === null ? 'missing' : 'fallback',
+        event: 'missing', compatChat: 'missing',
+        reason: session.forkRepairable ? 'legacy fork binding can be restored from its parent' : 'no parent binding snapshot exists at or before the fork boundary',
+      },
+    }
+  }
+
+  async inheritedDocuments(agent, session, source, fork) {
+    if (source.source === 'fork-point') {
+      return {
+        event: normalizeEventDocument({ ...source.event, sessionId: session.agentId }, session.agentId),
+        compatChat: normalizeCompatChatDocument({ ...source.compatChat, sessionId: session.agentId }, session.agentId, sessionTranscriptMessages(agent)),
+        eventKind: 'exact', compatChatKind: 'exact',
+      }
+    }
+    const parentName = createHash('sha256').update(fork.parentSessionId).digest('hex')
+    const parentEvent = normalizeEventDocument(await readJson(join(session.state.root, 'event', `${parentName}.json`), emptyEventDocument(fork.parentSessionId), 20 * 1024 * 1024), fork.parentSessionId)
+    return {
+      event: sourceBoundedEventDocument(parentEvent, session.agentId, fork.inheritedEventCount),
+      compatChat: emptyCompatChatDocument(session.agentId, sessionTranscriptMessages(agent)),
+      eventKind: 'source-bounded', compatChatKind: 'native-only',
+    }
+  }
+
+  async inheritFork(agent, session, bindings, source, signal) {
+    const fork = ordinaryFork(agent.session)
+    const documents = await this.inheritedDocuments(agent, session, source, fork)
+    const binding = {
+      ...snapshot(source.binding),
+      inheritedFrom: {
+        ...fork,
+        exact: source.exact === true && documents.eventKind === 'exact' && documents.compatChatKind === 'exact',
+        bindingExact: source.exact === true,
+        source: source.source,
+        event: documents.eventKind,
+        compatChat: documents.compatChatKind,
+        inheritedAt: new Date().toISOString(),
+      },
+    }
+    await Promise.all([
+      atomicJson(session.eventPath, documents.event, () => this.assertAgentActive(agent, session)),
+      atomicJson(session.compatChatPath, documents.compatChat, () => this.assertAgentActive(agent, session)),
+    ])
+    session.event = documents.event
+    session.compatChat = documents.compatChat
+    session.binding = binding
+    bindings.sessions[session.agentId] = snapshot(binding)
+    const inheritedHistory = await this.collectBranchHistory(session.state, bindings, fork.parentSessionId, fork.inheritedEventCount)
+    const historyPath = this.branchBindingPath(session.state, session.agentId)
+    await this.serial(`branch-binding:${session.state.root}:${session.agentId}`, () => withFileLock(historyPath, async () => {
+      const existing = normalizeBranchBindingHistory(await readJson(historyPath, { schemaVersion: 1, sessionId: session.agentId, snapshots: [] }, 16 * 1024 * 1024), session.agentId)
+      const merged = new Map(inheritedHistory.map(item => [item.boundary, snapshot(item)]))
+      for (const item of existing.snapshots) merged.set(item.boundary, item)
+      merged.set(fork.inheritedEventCount, { boundary: fork.inheritedEventCount, exact: source.exact === true, binding: snapshot(binding) })
+      existing.snapshots = [...merged.values()].sort((left, right) => left.boundary - right.boundary).slice(-512)
+      assertJsonBytes(existing, 16 * 1024 * 1024, 'branch binding history')
+      await atomicJson(historyPath, existing, () => signal?.throwIfAborted())
+    }, signal), signal)
+    return binding
+  }
+
   async ensureSession(agent, signal) {
     if (this.disposedAgents.has(agent)) throw new Error(`agent ${String(agent.id)} was disposed`)
     const id = safeSessionId(agent.id)
@@ -1656,6 +1924,19 @@ export class SillyTavernStore {
         return withFileLock(bindingsPath, async () => {
           const bindings = normalizeBindingsDocument(await readJson(bindingsPath, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
           let binding = bindings.sessions[id] ?? null
+          const session = { key, agentId: id, epoch, workspace, state, binding: binding === null ? null : snapshot(binding), event, eventPath, compatChat, compatChatPath, forkRepairable: false }
+          const fork = ordinaryFork(agent.session)
+          if (fork !== null) {
+            const source = await this.forkSource(agent, state, bindings)
+            if (binding === null && source !== null) {
+              binding = await this.inheritFork(agent, session, bindings, source, signal)
+              event = session.event
+              compatChat = session.compatChat
+              await atomicJson(bindingsPath, bindings, () => this.assertAgentActive(agent, session))
+            } else if (binding?.inheritedFrom?.parentSessionId !== fork.parentSessionId || binding?.inheritedFrom?.inheritedEventCount !== fork.inheritedEventCount) {
+              session.forkRepairable = source !== null || bindings.sessions[fork.parentSessionId] !== undefined
+            }
+          }
           if (binding !== null && !state.cards.has(binding.cardId)) {
             const record = await this.loadCardRecord(join(state.root, 'cards', `${binding.cardId}.json`), binding.cardId, false)
             if (record !== undefined) state.cards.set(binding.cardId, record)
@@ -1681,7 +1962,9 @@ export class SillyTavernStore {
           const cached = this.sessions.get(key)
           if (cached?.event.revision > event.revision) event = cached.event
           if (this.disposedAgents.has(agent)) throw new Error(`agent ${id} was disposed`)
-          const session = { key, agentId: id, epoch, workspace, state, binding: binding === null ? null : snapshot(binding), event, eventPath, compatChat, compatChatPath }
+          session.binding = binding === null ? null : snapshot(binding)
+          session.event = event
+          session.compatChat = compatChat
           if ((this.sessionEpoch.get(key) ?? 0) === epoch) this.sessions.set(key, session)
           return session
         })
@@ -1699,9 +1982,45 @@ export class SillyTavernStore {
     if (this.disposedAgents.has(agent) || (this.sessionEpoch.get(session.key) ?? 0) !== session.epoch) throw new Error(`agent ${session.agentId} was disposed`)
   }
 
+  async repairForkInheritance(agent, options = {}, signal) {
+    const session = this.sessionSync(agent) ?? await this.ensureSession(agent, signal)
+    const fork = ordinaryFork(agent.session)
+    if (fork === null) {
+      const error = new Error('session is not an ordinary seeded fork')
+      error.code = 'not-repairable-fork'
+      throw error
+    }
+    if (options.parentAgent !== undefined) this.captureForkPoint(agent.session, options.parentAgent)
+    const state = session.state
+    const path = join(state.root, 'bindings.json')
+    const view = await this.serial(`bindings:${state.root}`, () => withFileLock(path, async () => {
+      const bindings = normalizeBindingsDocument(await readJson(path, { schemaVersion: 1, sessions: {} }, 16 * 1024 * 1024))
+      const source = await this.forkSource(agent, state, bindings, true)
+      if (source === null) {
+        const error = new Error('parent binding is unavailable for this fork')
+        error.code = 'fork-inheritance-unavailable'
+        throw error
+      }
+      const binding = await this.inheritFork(agent, session, bindings, source, signal)
+      assertJsonBytes(bindings, 16 * 1024 * 1024, 'workspace bindings')
+      await atomicJson(path, bindings, () => this.assertAgentActive(agent, session))
+      session.binding = binding
+      session.forkRepairable = false
+      state.bindings = bindings
+      return this.sessionView(agent)
+    }, signal), signal)
+    await this.recordBindingSnapshot(agent, session.binding, signal)
+    return view
+  }
+
   async ensureSelectedSession(agent, signal) {
     const session = await this.ensureSession(agent, signal)
     if (session.binding !== null) return session
+    if (ordinaryFork(agent.session) !== null) {
+      const error = new Error('fork inheritance is unavailable; repair the fork before continuing')
+      error.code = 'fork-inheritance-unavailable'
+      throw error
+    }
     const selectedCardId = await this.refreshSelection(session.workspace, signal)
     if (selectedCardId === null) return session
     await this.bind(agent, selectedCardId, { signal })
@@ -1747,11 +2066,13 @@ export class SillyTavernStore {
         throw error
       }
       if (previous?.cardId === id) {
+        await this.recordBindingSnapshot(agent, previous, signal)
         return this.sessionView(agent)
       }
       const next = previous === null
         ? defaultBinding(id)
         : { ...previous, revision: previous.revision + 1, cardId: id, boundAt: new Date().toISOString(), startedAt: null, worldbookId: null, worldbookExplicit: false, openingSwipeId: 0 }
+      if (previous?.cardId !== id) delete next.inheritedFrom
       bindings.sessions[session.agentId] = snapshot(next)
       if (Object.keys(bindings.sessions).length > 4096) throw new Error('workspace bindings exceed 4096 sessions')
       assertJsonBytes(bindings, 16 * 1024 * 1024, 'workspace bindings')
@@ -1762,6 +2083,7 @@ export class SillyTavernStore {
         session.compatChat = emptyCompatChatDocument(session.agentId, sessionTranscriptMessages(agent))
         await atomicJson(session.compatChatPath, session.compatChat, () => this.assertAgentActive(agent, session))
       }
+      await this.recordBindingSnapshot(agent, next, signal)
       return this.sessionView(agent)
     }, signal), signal)
   }
@@ -1777,6 +2099,7 @@ export class SillyTavernStore {
       if (current.startedAt !== null) {
         session.binding = snapshot(current)
         state.bindings = bindings
+        await this.recordBindingSnapshot(agent, current, signal)
         return this.sessionView(agent)
       }
       const cardPath = join(state.root, 'cards', `${current.cardId}.json`)
@@ -1799,6 +2122,7 @@ export class SillyTavernStore {
       await atomicJson(path, bindings, () => this.assertAgentActive(agent, session))
       session.binding = next
       state.bindings = bindings
+      await this.recordBindingSnapshot(agent, next, signal)
       return this.sessionView(agent)
     }, signal), signal)
   }
@@ -1878,6 +2202,7 @@ export class SillyTavernStore {
       await atomicJson(path, bindings, () => this.assertAgentActive(agent, session))
       session.binding = next
       state.bindings = bindings
+      await this.recordBindingSnapshot(agent, next, signal)
       return this.sessionView(agent)
     }, signal), signal)
   }
@@ -2073,6 +2398,7 @@ export class SillyTavernStore {
       if (next.local !== undefined) {
         state.bindings = next.local
         session.binding = snapshot(next.local.sessions[session.agentId])
+        await this.recordBindingSnapshot(agent, session.binding, signal)
       }
       if (next.global !== undefined) {
         state.globalRegexScripts = next.global.global
@@ -2199,7 +2525,7 @@ export class SillyTavernStore {
 
   sessionView(agent) {
     const session = this.sessionSync(agent)
-    if (session === undefined) return { sessionId: agent.id, ready: false, binding: null, card: null, worldbook: null, worldbookId: null, event: emptyEventDocument(agent.id), templates: [], globalRegexScripts: [], presetRegexScripts: [], globalVariables: {}, compatibilityVariables: { revisions: { chat: 0, global: 0, workspace: 0 }, scopes: { chat: {}, global: {}, preset: {}, character: {}, message: {}, script: {}, extension: {} } } }
+    if (session === undefined) return { sessionId: agent.id, ready: false, binding: null, card: null, worldbook: null, worldbookId: null, fork: null, event: emptyEventDocument(agent.id), templates: [], globalRegexScripts: [], presetRegexScripts: [], globalVariables: {}, compatibilityVariables: { revisions: { chat: 0, global: 0, workspace: 0 }, scopes: { chat: {}, global: {}, preset: {}, character: {}, message: {}, script: {}, extension: {} } } }
     const card = session.binding === null ? null : session.state.cards.get(session.binding.cardId) ?? null
     const worldbook = card === null ? null : this.effectiveWorldbook(session.state, session.binding, card)
     return {
@@ -2210,6 +2536,7 @@ export class SillyTavernStore {
       card: card === null ? null : snapshot(card),
       worldbook: worldbook === null ? null : snapshot(worldbook),
       worldbookId: worldbook?.id ?? null,
+      fork: this.forkView(agent, session),
       event: snapshot(session.event),
       templates: snapshot(session.state.templates),
       globalRegexScripts: snapshot(session.state.globalRegexScripts),

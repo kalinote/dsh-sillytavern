@@ -3,6 +3,12 @@ import { createTemplateRuntime, TemplateRuntime, TEMPLATE_LIMITS } from './templ
 const MAX_TEMPLATE_CHARS = TEMPLATE_LIMITS.maxTemplateChars
 const MAX_OUTPUT_CHARS = TEMPLATE_LIMITS.maxOutputChars
 
+export function renderCharacterAliases(input, scope) {
+  return String(input).replace(/<(user|char)>/gi, (_match, name) => String(name.toLowerCase() === 'user'
+    ? scope.user ?? scope.userPersona?.name ?? 'User'
+    : scope.char ?? scope.character?.name ?? 'Character'))
+}
+
 function macroValue(token, scope) {
   const trimmed = token.trim()
   if (trimmed === 'char') return scope.char ?? scope.character?.name ?? ''

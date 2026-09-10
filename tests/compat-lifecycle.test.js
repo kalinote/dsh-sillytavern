@@ -19,21 +19,37 @@ test('preparation waits for every live owner, and ignores foreign and duplicate 
   lifecycle.dispose()
 })
 
-test('callback errors, owner disposal, cancellation and stale leases have explicit outcomes', async () => {
+test('disconnect keeps assigned callbacks available for the same browser to resume', async () => {
+  const lifecycle = new CompatibilityLifecycle({ timeoutMs: 100 })
+  lifecycle.poll('s', 'a')
+  let settled = false
+  const pending = lifecycle.request('s', 'prepare', {}).then(value => { settled = true; return value })
+  const [assigned] = lifecycle.poll('s', 'a')
+  lifecycle.disconnect('s', 'a')
+  await Promise.resolve()
+  assert.equal(settled, false, 'route changes must not reject a callback while its iframe remounts')
+  const [resumed] = lifecycle.poll('s', 'a')
+  assert.equal(resumed.id, assigned.id, 'the original request is re-delivered after reconnect')
+  lifecycle.complete('s', 'a', resumed.id, { ownerFrameIds: ['fresh-frame'] })
+  assert.deepEqual(await pending, [{ ownerFrameIds: ['fresh-frame'] }])
+  lifecycle.dispose()
+})
+
+test('callback errors, cancellation, timeout and stale leases have explicit outcomes', async () => {
   let now = 0
-  const lifecycle = new CompatibilityLifecycle({ now: () => now, leaseMs: 10 })
+  const lifecycle = new CompatibilityLifecycle({ now: () => now, leaseMs: 10, timeoutMs: 20 })
   lifecycle.poll('s', 'a')
   const failed = lifecycle.request('s', 'prepare', {})
   lifecycle.complete('s', 'a', lifecycle.poll('s', 'a')[0].id, null, 'filter failed')
   await assert.rejects(failed, /filter failed/)
-  const disconnected = lifecycle.request('s', 'prepare', {})
-  lifecycle.disconnect('s', 'a')
-  await assert.rejects(disconnected, /disconnected/)
-  lifecycle.poll('s', 'a')
   const controller = new AbortController()
   const cancelled = lifecycle.request('s', 'prepare', {}, controller.signal)
   controller.abort(new Error('cancelled'))
   await assert.rejects(cancelled, /cancelled/)
+  const timedOut = lifecycle.request('s', 'prepare', {})
+  lifecycle.disconnect('s', 'a')
+  await assert.rejects(timedOut, /timed out/)
+  lifecycle.poll('s', 'a')
   now = 11
   assert.deepEqual(await lifecycle.request('s', 'prepare', {}), [])
   lifecycle.dispose()

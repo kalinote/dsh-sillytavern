@@ -8,6 +8,59 @@ const DEFAULT_LAYOUT = Object.freeze({
   padding: 28,
 })
 
+const TITLE_FIELDS = new Set(['title', 'name', 'headline', 'displayName', 'display_name', 'eventTitle', 'event_title', 'subject'])
+const SUMMARY_FIELDS = new Set(['summary', 'event', 'description', 'narrative', 'content', 'text', 'detail', 'details'])
+const FACT_FIELDS = new Set(['durableFacts', 'durable_facts', 'facts', 'keyFacts', 'key_facts', 'highlights', 'outcomes', 'consequences'])
+
+function readableStrings(value) {
+  if (typeof value === 'string') {
+    const normalized = value.replace(/\s+/gu, ' ').trim()
+    return normalized === '' ? [] : [normalized]
+  }
+  if (Array.isArray(value)) return value.flatMap(readableStrings)
+  return []
+}
+
+function valuesForFields(value, fields, seen = new Set()) {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return []
+  seen.add(value)
+  const found = []
+  for (const [key, child] of Object.entries(value)) {
+    if (fields.has(key)) found.push(...readableStrings(child))
+    if (child !== null && typeof child === 'object') found.push(...valuesForFields(child, fields, seen))
+  }
+  return found
+}
+
+function identifierLike(value) {
+  return /^[\p{L}\p{N}]+(?:[-_.:/][\p{L}\p{N}]+)+$/u.test(value) && !/[\u3400-\u9fff]/u.test(value)
+}
+
+function readableIdentifier(value) {
+  return String(value ?? '').replace(/[-_.:/]+/gu, ' ').replace(/\s+/gu, ' ').trim()
+}
+
+function clippedTitle(value, maximum = 42) {
+  const normalized = String(value ?? '').replace(/\s+/gu, ' ').trim()
+  if (normalized === '') return ''
+  const clause = normalized.split(/[，,；;。！？!?]/u)[0].trim()
+  const preferred = [...clause].length >= 4 ? clause : normalized
+  const characters = [...preferred]
+  return characters.length <= maximum ? preferred : `${characters.slice(0, maximum - 1).join('')}…`
+}
+
+function describeMemory(row) {
+  const value = row?.value && typeof row.value === 'object' ? row.value : {}
+  const titles = valuesForFields(value, TITLE_FIELDS)
+  const summaries = valuesForFields(value, SUMMARY_FIELDS)
+  const facts = [...new Set(valuesForFields(value, FACT_FIELDS))]
+  const naturalTitle = titles.find(candidate => !identifierLike(candidate))
+  const summary = summaries.find(candidate => !identifierLike(candidate)) || summaries[0] || titles[0] || ''
+  const fallback = readableIdentifier(row?.key) || readableIdentifier(row?.eventId) || '未命名事件'
+  const title = clippedTitle(naturalTitle || summary || titles[0] || fallback)
+  return { title, summary, facts, natural: Boolean(naturalTitle || summary) }
+}
+
 function uniqueValues(rows, field) {
   const result = []
   const seen = new Set()
@@ -70,11 +123,15 @@ function intervalForRow(eventId, row) {
 
 function aggregateNode(eventId, rows) {
   const intervals = rows.map(row => intervalForRow(eventId, row))
+  const descriptions = rows.map(describeMemory)
   const importanceValues = rows.map(row => row.importance).filter(Number.isFinite)
   const importanceTotal = importanceValues.reduce((sum, value) => sum + value, 0)
   return {
     eventId,
-    title: rows[0]?.key || eventId,
+    title: descriptions.find(description => description.natural)?.title || descriptions[0]?.title || readableIdentifier(eventId),
+    summary: descriptions.find(description => description.summary)?.summary || '',
+    facts: [...new Set(descriptions.flatMap(description => description.facts))],
+    descriptions,
     rows,
     rowIds: rows.map(row => row.id),
     intervals,
@@ -96,22 +153,44 @@ function aggregateNode(eventId, rows) {
   }
 }
 
-function buildTimelines(nodes) {
+function extendTimelineBoundary(timeline, value) {
+  if (!Number.isFinite(value)) return
+  timeline.min = Math.min(timeline.min, value)
+  timeline.max = Math.max(timeline.max, value)
+}
+
+function buildTimelines(nodes, rows = []) {
   const byTimeline = new Map()
+
+  // Every normalized memory contributes to its timeline's known domain. Rows
+  // without an event id affect the clock, but never create an event track.
+  for (const row of rows) {
+    const storyTime = row?.storyTime
+    if (storyTime?.state !== 'normalized' || !Number.isFinite(storyTime.start)) continue
+    let timeline = byTimeline.get(storyTime.timeline)
+    if (timeline === undefined) {
+      timeline = { timeline: storyTime.timeline, min: storyTime.start, max: storyTime.start, span: 0, intervals: [] }
+      byTimeline.set(storyTime.timeline, timeline)
+    }
+    extendTimelineBoundary(timeline, storyTime.start)
+    extendTimelineBoundary(timeline, storyTime.end)
+  }
+
   for (const node of nodes) {
     for (const interval of node.normalizedIntervals) {
       if (!Number.isFinite(interval.start)) continue
-      const layoutEnd = interval.end ?? interval.start
       let timeline = byTimeline.get(interval.timeline)
       if (timeline === undefined) {
-        timeline = { timeline: interval.timeline, min: interval.start, max: layoutEnd, span: 0, intervals: [] }
+        timeline = { timeline: interval.timeline, min: interval.start, max: interval.start, span: 0, intervals: [] }
         byTimeline.set(interval.timeline, timeline)
       }
-      timeline.min = Math.min(timeline.min, interval.start)
-      timeline.max = Math.max(timeline.max, layoutEnd)
+      extendTimelineBoundary(timeline, interval.start)
+      extendTimelineBoundary(timeline, interval.end)
       timeline.intervals.push(interval)
     }
   }
+  // Coordinates carry the world's own numeric measure. Labels and timeline
+  // names never select a calendar or change the unit used for distances.
   return [...byTimeline.values()].map(timeline => ({
     ...timeline,
     span: timeline.max - timeline.min,
@@ -119,6 +198,31 @@ function buildTimelines(nodes) {
       left.start - right.start
       || (left.end ?? left.start) - (right.end ?? right.start)
     )),
+  }))
+}
+
+// Timeline rows represent events. Keep distinct ranges on that event's track,
+// while memories with the same coordinates share one marker. Raw rows and all
+// of their story times remain available on the event node for its details.
+function groupTimelineIntervals(intervals) {
+  const byEvent = new Map()
+  for (const interval of intervals) {
+    let event = byEvent.get(interval.eventId)
+    if (event === undefined) {
+      event = { eventId: interval.eventId, rowCount: 0, byRange: new Map() }
+      byEvent.set(interval.eventId, event)
+    }
+    event.rowCount += 1
+    const key = JSON.stringify([interval.timeline, interval.start, interval.end ?? null])
+    let range = event.byRange.get(key)
+    if (range === undefined) {
+      range = { ...interval, storyTimes: [] }
+      event.byRange.set(key, range)
+    }
+    range.storyTimes.push(interval.storyTime)
+  }
+  return [...byEvent.values()].map(({ eventId, rowCount, byRange }) => ({
+    eventId, rowCount, intervals: [...byRange.values()],
   }))
 }
 
@@ -148,10 +252,11 @@ function buildEventExplorerModel(document) {
 
   return {
     revision: document.revision,
+    appliedMaintenanceJobs: Array.isArray(document.appliedMaintenanceJobs) ? document.appliedMaintenanceJobs.slice() : [],
     nodes,
     edges,
     byId,
-    timelines: buildTimelines(nodes),
+    timelines: buildTimelines(nodes, document.rows),
     ungrouped,
   }
 }
@@ -288,4 +393,10 @@ function layoutEventGraph(model, options = {}) {
   return { ...model, nodes, edges, byId: new Map(nodes.map(node => [node.eventId, node])), width, height, ranks }
 }
 
-module.exports = { DEFAULT_LAYOUT, buildEventExplorerModel, layoutEventGraph }
+module.exports = {
+  DEFAULT_LAYOUT,
+  buildEventExplorerModel,
+  describeMemory,
+  groupTimelineIntervals,
+  layoutEventGraph,
+}

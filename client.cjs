@@ -19,6 +19,59 @@ window.__ModuleLoader__.load({
         padding: 28,
       })
 
+      const TITLE_FIELDS = new Set(['title', 'name', 'headline', 'displayName', 'display_name', 'eventTitle', 'event_title', 'subject'])
+      const SUMMARY_FIELDS = new Set(['summary', 'event', 'description', 'narrative', 'content', 'text', 'detail', 'details'])
+      const FACT_FIELDS = new Set(['durableFacts', 'durable_facts', 'facts', 'keyFacts', 'key_facts', 'highlights', 'outcomes', 'consequences'])
+
+      function readableStrings(value) {
+        if (typeof value === 'string') {
+          const normalized = value.replace(/\s+/gu, ' ').trim()
+          return normalized === '' ? [] : [normalized]
+        }
+        if (Array.isArray(value)) return value.flatMap(readableStrings)
+        return []
+      }
+
+      function valuesForFields(value, fields, seen = new Set()) {
+        if (value === null || typeof value !== 'object' || seen.has(value)) return []
+        seen.add(value)
+        const found = []
+        for (const [key, child] of Object.entries(value)) {
+          if (fields.has(key)) found.push(...readableStrings(child))
+          if (child !== null && typeof child === 'object') found.push(...valuesForFields(child, fields, seen))
+        }
+        return found
+      }
+
+      function identifierLike(value) {
+        return /^[\p{L}\p{N}]+(?:[-_.:/][\p{L}\p{N}]+)+$/u.test(value) && !/[\u3400-\u9fff]/u.test(value)
+      }
+
+      function readableIdentifier(value) {
+        return String(value ?? '').replace(/[-_.:/]+/gu, ' ').replace(/\s+/gu, ' ').trim()
+      }
+
+      function clippedTitle(value, maximum = 42) {
+        const normalized = String(value ?? '').replace(/\s+/gu, ' ').trim()
+        if (normalized === '') return ''
+        const clause = normalized.split(/[，,；;。！？!?]/u)[0].trim()
+        const preferred = [...clause].length >= 4 ? clause : normalized
+        const characters = [...preferred]
+        return characters.length <= maximum ? preferred : `${characters.slice(0, maximum - 1).join('')}…`
+      }
+
+      function describeMemory(row) {
+        const value = row?.value && typeof row.value === 'object' ? row.value : {}
+        const titles = valuesForFields(value, TITLE_FIELDS)
+        const summaries = valuesForFields(value, SUMMARY_FIELDS)
+        const facts = [...new Set(valuesForFields(value, FACT_FIELDS))]
+        const naturalTitle = titles.find(candidate => !identifierLike(candidate))
+        const summary = summaries.find(candidate => !identifierLike(candidate)) || summaries[0] || titles[0] || ''
+        const fallback = readableIdentifier(row?.key) || readableIdentifier(row?.eventId) || '未命名事件'
+        const title = clippedTitle(naturalTitle || summary || titles[0] || fallback)
+        return { title, summary, facts, natural: Boolean(naturalTitle || summary) }
+      }
+
       function uniqueValues(rows, field) {
         const result = []
         const seen = new Set()
@@ -81,11 +134,15 @@ window.__ModuleLoader__.load({
 
       function aggregateNode(eventId, rows) {
         const intervals = rows.map(row => intervalForRow(eventId, row))
+        const descriptions = rows.map(describeMemory)
         const importanceValues = rows.map(row => row.importance).filter(Number.isFinite)
         const importanceTotal = importanceValues.reduce((sum, value) => sum + value, 0)
         return {
           eventId,
-          title: rows[0]?.key || eventId,
+          title: descriptions.find(description => description.natural)?.title || descriptions[0]?.title || readableIdentifier(eventId),
+          summary: descriptions.find(description => description.summary)?.summary || '',
+          facts: [...new Set(descriptions.flatMap(description => description.facts))],
+          descriptions,
           rows,
           rowIds: rows.map(row => row.id),
           intervals,
@@ -107,22 +164,44 @@ window.__ModuleLoader__.load({
         }
       }
 
-      function buildTimelines(nodes) {
+      function extendTimelineBoundary(timeline, value) {
+        if (!Number.isFinite(value)) return
+        timeline.min = Math.min(timeline.min, value)
+        timeline.max = Math.max(timeline.max, value)
+      }
+
+      function buildTimelines(nodes, rows = []) {
         const byTimeline = new Map()
+
+        // Every normalized memory contributes to its timeline's known domain. Rows
+        // without an event id affect the clock, but never create an event track.
+        for (const row of rows) {
+          const storyTime = row?.storyTime
+          if (storyTime?.state !== 'normalized' || !Number.isFinite(storyTime.start)) continue
+          let timeline = byTimeline.get(storyTime.timeline)
+          if (timeline === undefined) {
+            timeline = { timeline: storyTime.timeline, min: storyTime.start, max: storyTime.start, span: 0, intervals: [] }
+            byTimeline.set(storyTime.timeline, timeline)
+          }
+          extendTimelineBoundary(timeline, storyTime.start)
+          extendTimelineBoundary(timeline, storyTime.end)
+        }
+
         for (const node of nodes) {
           for (const interval of node.normalizedIntervals) {
             if (!Number.isFinite(interval.start)) continue
-            const layoutEnd = interval.end ?? interval.start
             let timeline = byTimeline.get(interval.timeline)
             if (timeline === undefined) {
-              timeline = { timeline: interval.timeline, min: interval.start, max: layoutEnd, span: 0, intervals: [] }
+              timeline = { timeline: interval.timeline, min: interval.start, max: interval.start, span: 0, intervals: [] }
               byTimeline.set(interval.timeline, timeline)
             }
-            timeline.min = Math.min(timeline.min, interval.start)
-            timeline.max = Math.max(timeline.max, layoutEnd)
+            extendTimelineBoundary(timeline, interval.start)
+            extendTimelineBoundary(timeline, interval.end)
             timeline.intervals.push(interval)
           }
         }
+        // Coordinates carry the world's own numeric measure. Labels and timeline
+        // names never select a calendar or change the unit used for distances.
         return [...byTimeline.values()].map(timeline => ({
           ...timeline,
           span: timeline.max - timeline.min,
@@ -130,6 +209,31 @@ window.__ModuleLoader__.load({
             left.start - right.start
             || (left.end ?? left.start) - (right.end ?? right.start)
           )),
+        }))
+      }
+
+      // Timeline rows represent events. Keep distinct ranges on that event's track,
+      // while memories with the same coordinates share one marker. Raw rows and all
+      // of their story times remain available on the event node for its details.
+      function groupTimelineIntervals(intervals) {
+        const byEvent = new Map()
+        for (const interval of intervals) {
+          let event = byEvent.get(interval.eventId)
+          if (event === undefined) {
+            event = { eventId: interval.eventId, rowCount: 0, byRange: new Map() }
+            byEvent.set(interval.eventId, event)
+          }
+          event.rowCount += 1
+          const key = JSON.stringify([interval.timeline, interval.start, interval.end ?? null])
+          let range = event.byRange.get(key)
+          if (range === undefined) {
+            range = { ...interval, storyTimes: [] }
+            event.byRange.set(key, range)
+          }
+          range.storyTimes.push(interval.storyTime)
+        }
+        return [...byEvent.values()].map(({ eventId, rowCount, byRange }) => ({
+          eventId, rowCount, intervals: [...byRange.values()],
         }))
       }
 
@@ -159,10 +263,11 @@ window.__ModuleLoader__.load({
 
         return {
           revision: document.revision,
+          appliedMaintenanceJobs: Array.isArray(document.appliedMaintenanceJobs) ? document.appliedMaintenanceJobs.slice() : [],
           nodes,
           edges,
           byId,
-          timelines: buildTimelines(nodes),
+          timelines: buildTimelines(nodes, document.rows),
           ungrouped,
         }
       }
@@ -299,7 +404,13 @@ window.__ModuleLoader__.load({
         return { ...model, nodes, edges, byId: new Map(nodes.map(node => [node.eventId, node])), width, height, ranks }
       }
 
-      module.exports = { DEFAULT_LAYOUT, buildEventExplorerModel, layoutEventGraph }
+      module.exports = {
+        DEFAULT_LAYOUT,
+        buildEventExplorerModel,
+        describeMemory,
+        groupTimelineIntervals,
+        layoutEventGraph,
+      }
       return module.exports
     })()
     const eventExplorerSource = (() => {
@@ -307,7 +418,7 @@ window.__ModuleLoader__.load({
       /** A mounted event view owns one sequential, revision-aware polling source. */
       function createEventExplorerSource({ load, interval = 2000, schedule = setTimeout, cancel = clearTimeout,
         isVisible = () => true, subscribeVisibility = () => () => {} }) {
-        const initial = () => ({ document: null, loading: true, refreshing: false, error: null })
+        const initial = () => ({ document: null, maintenance: null, loading: true, refreshing: false, error: null })
         let state = initial()
         const listeners = new Set()
         let timer
@@ -342,8 +453,10 @@ window.__ModuleLoader__.load({
           run.promise = Promise.resolve().then(() => load(state.document?.revision, run.controller.signal)).then(value => {
             if (current !== run || run.controller.signal.aborted) return
             const document = value.unchanged ? state.document : value.document
-            if (document !== state.document || state.loading || state.refreshing || state.error !== null) {
-              publish({ document, loading: false, refreshing: false, error: null })
+            const nextMaintenance = Object.hasOwn(value, 'maintenance') ? value.maintenance : state.maintenance
+            const maintenance = JSON.stringify(nextMaintenance) === JSON.stringify(state.maintenance) ? state.maintenance : nextMaintenance
+            if (document !== state.document || maintenance !== state.maintenance || state.loading || state.refreshing || state.error !== null) {
+              publish({ document, maintenance, loading: false, refreshing: false, error: null })
             }
           }).catch(error => {
             if (current !== run || run.controller.signal.aborted) return
@@ -394,7 +507,7 @@ window.__ModuleLoader__.load({
 
       module.exports = function createEventExplorerUI(React, modelHelpers) {
         const h = React.createElement
-        const { buildEventExplorerModel, layoutEventGraph } = modelHelpers
+        const { buildEventExplorerModel, describeMemory, groupTimelineIntervals, layoutEventGraph } = modelHelpers
         const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value))
         const list = value => Array.isArray(value) ? value : []
         const text = value => value == null ? '' : String(value)
@@ -402,10 +515,7 @@ window.__ModuleLoader__.load({
         const finite = value => typeof value === 'number' && Number.isFinite(value)
 
         function eventTitle(node) {
-          const row = list(node?.rows)[0]
-          const label = text(node?.title || row?.key).trim()
-          const eventId = text(node?.eventId)
-          return label && label !== eventId ? `${label} · ${eventId}` : eventId
+          return text(node?.title).trim() || '未命名事件'
         }
 
         function timeOf(value) {
@@ -422,7 +532,7 @@ window.__ModuleLoader__.load({
         function formatNumber(value) {
           if (value == null || text(value).trim() === '') return '—'
           if (!finite(Number(value))) return '—'
-          return new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 }).format(Number(value))
+          return String(Number(value))
         }
 
         function formatStoryTime(value) {
@@ -432,7 +542,7 @@ window.__ModuleLoader__.load({
             const range = storyTime.end == null || text(storyTime.end).trim() === ''
               ? `${start} – 结束时间未记录`
               : `${start} – ${formatNumber(storyTime.end)}`
-            return [storyTime.timeline, storyTime.label, range].filter(item => text(item).trim()).join(' · ')
+            return [storyTime.label, storyTime.timeline, `坐标 ${range}`].filter(item => text(item).trim()).join(' · ')
           }
           if (storyTime.state === 'label-only') return `仅标签 · ${text(storyTime.label) || '未命名'}`
           return '时间未知'
@@ -455,9 +565,9 @@ window.__ModuleLoader__.load({
 
         function sourceRefLabel(ref) {
           const fields = []
-          if (Number.isSafeInteger(ref?.eventSeq)) fields.push(`#${ref.eventSeq}`)
           if (Number.isSafeInteger(ref?.turn)) fields.push(`第 ${ref.turn} 回合`)
-          if (text(ref?.role)) fields.push(ref.role === 'user' ? '用户' : ref.role === 'assistant' ? '助手' : text(ref.role))
+          if (text(ref?.role)) fields.push(ref.role === 'user' ? '用户原文' : ref.role === 'assistant' ? '剧情原文' : text(ref.role))
+          if (!fields.length && Number.isSafeInteger(ref?.eventSeq)) fields.push(`会话事件 ${ref.eventSeq}`)
           return fields.join(' · ') || '未知来源'
         }
 
@@ -507,11 +617,35 @@ window.__ModuleLoader__.load({
           return h('span', { className: `dst-explorer-time-pill ${storyTime.state}` }, formatStoryTime(storyTime))
         }
 
-        function SourceRefs({ refs }) {
+        function SourceRefs({ refs, onOpenSource }) {
           const values = list(refs)
           if (!values.length) return h('span', { className: 'dst-explorer-muted' }, '无来源记录')
           return h('ol', { className: 'dst-explorer-source-list' }, values.map((ref, index) =>
-            h('li', { key: `${ref?.eventSeq ?? 'unknown'}:${ref?.turn ?? 'unknown'}:${ref?.role ?? 'unknown'}:${index}` }, sourceRefLabel(ref))))
+            h('li', { key: `${ref?.eventSeq ?? 'unknown'}:${ref?.turn ?? 'unknown'}:${ref?.role ?? 'unknown'}:${index}` },
+              typeof onOpenSource === 'function'
+                ? h('button', { type: 'button', onClick: () => onOpenSource(ref), title: '返回对话并查看这段原文' }, sourceRefLabel(ref))
+                : sourceRefLabel(ref))))
+        }
+
+        function maintenanceFeedback(maintenance, model) {
+          const status = text(maintenance?.status).toLocaleLowerCase()
+          const pending = Number(maintenance?.pending ?? maintenance?.pendingCount ?? 0)
+          const running = Number(maintenance?.running ?? maintenance?.runningCount ?? 0)
+          const failed = Number(maintenance?.failed ?? maintenance?.failedCount ?? 0)
+          if (status === 'running' || status === 'processing' || running > 0) {
+            return { tone: 'busy', message: '正在整理这轮剧情，新的事件记忆会在完成后自动出现。' }
+          }
+          if (status === 'pending' || status === 'queued' || pending > 0) {
+            return { tone: 'busy', message: '剧情已进入记忆整理队列，完成后会自动更新。' }
+          }
+          if (status === 'failed' || status === 'error' || failed > 0) {
+            const reason = text(maintenance?.lastError || maintenance?.error).trim()
+            return { tone: 'error', message: reason ? `剧情记忆整理失败：${reason}` : '剧情记忆整理失败，稍后会自动重试。' }
+          }
+          const events = list(model?.nodes).length
+          const completed = Number(maintenance?.completed ?? maintenance?.completedCount ?? list(model?.appliedMaintenanceJobs).length)
+          if (events > 0) return { tone: 'ready', message: `已整理 ${events} 个剧情事件${completed > 0 ? ` · 完成 ${completed} 次记忆整理` : ''}` }
+          return { tone: 'waiting', message: '尚无剧情记忆。完成一个剧情回合后，系统会自动开始整理。' }
         }
 
         function EventButton({ eventId, children, className, selected, dimmed, matched, onChoose, register, style }) {
@@ -526,48 +660,158 @@ window.__ModuleLoader__.load({
           }, children)
         }
 
-        function GanttChart({ model, selectedId, query, matchedIds, onChoose, registerEvent }) {
-          const timelines = list(model?.timelines)
-          const untimed = []
-          for (const node of list(model?.nodes)) {
-            for (const row of list(node.rows)) {
-              const storyTime = timeOf(row?.storyTime)
-              if (storyTime.state !== 'normalized' || !finite(storyTime.start)) untimed.push({ eventId: node.eventId, row, storyTime })
-            }
+        const MIN_CLICKABLE_PERCENT = 8 / 450 * 100
+
+        function boundedTimelineViewport(minimum, maximum, timeline) {
+          const domainMinimum = timeline.min
+          const domainMaximum = timeline.max
+          const domainSpan = domainMaximum - domainMinimum
+          if (!(domainSpan > 0)) return { minimum: domainMaximum, maximum: domainMaximum }
+          let width = maximum - minimum
+          if (!finite(width) || !(width > 0) || width >= domainSpan) return { minimum: domainMinimum, maximum: domainMaximum }
+          let nextMinimum = minimum
+          let nextMaximum = maximum
+          if (nextMinimum < domainMinimum) {
+            nextMaximum += domainMinimum - nextMinimum
+            nextMinimum = domainMinimum
           }
+          if (nextMaximum > domainMaximum) {
+            nextMinimum -= nextMaximum - domainMaximum
+            nextMaximum = domainMaximum
+          }
+          nextMinimum = Math.max(domainMinimum, nextMinimum)
+          nextMaximum = Math.min(domainMaximum, nextMaximum)
+          width = nextMaximum - nextMinimum
+          return width > 0 ? { minimum: nextMinimum, maximum: nextMaximum } : { minimum: domainMinimum, maximum: domainMaximum }
+        }
+
+        function zoomTimelineViewport(viewport, timeline, factor) {
+          const width = viewport.maximum - viewport.minimum
+          if (!(width > 0)) return viewport
+          const nextWidth = width * factor
+          const middle = viewport.minimum + width / 2
+          const candidateMinimum = middle - nextWidth / 2
+          const candidateMaximum = middle + nextWidth / 2
+          if (!(candidateMaximum > candidateMinimum)) return viewport
+          const next = boundedTimelineViewport(candidateMinimum, candidateMaximum, timeline)
+          if (factor < 1 && !(next.maximum - next.minimum < width)) return viewport
+          return next
+        }
+
+        function moveTimelineViewport(viewport, timeline, direction) {
+          const width = viewport.maximum - viewport.minimum
+          if (!(width > 0)) return viewport
+          const distance = width * 0.4 * direction
+          return boundedTimelineViewport(viewport.minimum + distance, viewport.maximum + distance, timeline)
+        }
+
+        function coordinateDisplayStep(value) {
+          const source = String(value).toLocaleLowerCase()
+          const [coefficient, exponentText] = source.split('e')
+          const fractionDigits = coefficient.includes('.') ? coefficient.length - coefficient.indexOf('.') - 1 : 0
+          const exponent = exponentText === undefined ? 0 : Number(exponentText)
+          const writtenStep = 10 ** Math.min(0, exponent - fractionDigits)
+          const floatingStep = Math.abs(value) * Number.EPSILON * 16
+          return Math.max(Number.MIN_VALUE, writtenStep, floatingStep)
+        }
+
+        function focusTimelineViewport(timeline, intervals) {
+          let eventMinimum = Infinity
+          let eventMaximum = -Infinity
+          for (const interval of intervals) {
+            if (!finite(interval.start)) continue
+            const end = finite(interval.end) ? interval.end : timeline.max
+            eventMinimum = Math.min(eventMinimum, interval.start, end)
+            eventMaximum = Math.max(eventMaximum, interval.start, end)
+          }
+          if (!finite(eventMinimum) || !finite(eventMaximum)) return { minimum: timeline.min, maximum: timeline.max }
+          const eventSpan = eventMaximum - eventMinimum
+          const domainSpan = timeline.max - timeline.min
+          if (!(domainSpan > 0)) return { minimum: timeline.max, maximum: timeline.max }
+          if (!(eventSpan > 0)) {
+            const localStep = coordinateDisplayStep(eventMinimum)
+            return boundedTimelineViewport(eventMinimum - localStep * 20, eventMaximum + localStep * 20, timeline)
+          }
+          const padding = eventSpan * 2
+          // Anchor this viewport to the event's source coordinates. Deriving it from
+          // a percentage of a huge global minimum can erase very short intervals.
+          return boundedTimelineViewport(eventMinimum - padding, eventMaximum + padding, timeline)
+        }
+
+        function TimelineView({ timeline, model, selectedId, query, matchedIds, onChoose, registerEvent }) {
+          const overview = { minimum: timeline.min, maximum: timeline.max }
+          const [viewport, setViewport] = React.useState(overview)
+          const minimum = viewport.minimum
+          const maximum = viewport.maximum
+          const viewportSpan = maximum - minimum
+          const zeroSpan = !(timeline.span > 0)
+          const atOverview = minimum === timeline.min && maximum === timeline.max
+          const zoomedIn = zoomTimelineViewport(viewport, timeline, 0.5)
+          const canZoomIn = zoomedIn.minimum !== minimum || zoomedIn.maximum !== maximum
           const hasQuery = query.trim() !== ''
-          const timelineViews = timelines.map(timeline => {
-            const minimum = Number(timeline.min)
-            const maximum = Number(timeline.max)
-            const domainSpan = maximum - minimum
-            const span = finite(Number(timeline.span)) && Number(timeline.span) > 0 ? Number(timeline.span) : domainSpan
-            const tickPortions = domainSpan === 0 ? [0.5] : [0, 0.25, 0.5, 0.75, 1]
-            const ticks = tickPortions.map(portion => {
-              const current = domainSpan === 0 || portion === 1
-              return h('span', {
-                key: portion,
-                className: classes(portion === 0 && 'first', current && 'current'),
-                style: { left: `${portion * 100}%` },
-              }, current ? `当前 ${formatNumber(maximum)}` : formatNumber(minimum + (maximum - minimum) * portion))
-            })
-            const bars = list(timeline.intervals).map((interval, index) => {
+          const tickPortions = viewportSpan > 0 ? [0, 0.25, 0.5, 0.75, 1] : [1]
+          const ticks = tickPortions.map(portion => {
+            const coordinate = viewportSpan > 0
+              ? portion === 0 ? minimum : portion === 1 ? maximum : minimum + viewportSpan * portion
+              : timeline.max
+            const current = portion === 1 && maximum === timeline.max
+            return h('span', {
+              key: portion,
+              className: classes(portion === 0 && 'first', current && 'current'),
+              style: { left: `${portion * 100}%` },
+            }, current ? `最新 ${formatNumber(timeline.max)}` : formatNumber(coordinate))
+          })
+          const groups = groupTimelineIntervals(list(timeline.intervals))
+          const bars = groups.map(group => {
+            const eventId = text(group.eventId)
+            const matched = hasQuery && matchedIds.has(eventId)
+            const barTitle = eventTitle(nodeById(model, eventId))
+            const markers = group.intervals.flatMap(interval => {
               const storyTime = timeOf(interval)
               const start = storyTime.start
-              const endUnrecorded = storyTime.end == null || text(storyTime.end).trim() === ''
-              // A missing end stays unknown in the data, but is displayed through the
-              // latest known point on its own story timeline so ongoing events read as
-              // intervals instead of easily missed one-pixel markers.
-              const displayEnd = endUnrecorded ? maximum : storyTime.end
-              const point = !endUnrecorded && start === displayEnd
-              const left = domainSpan === 0 ? 50 : clamp((start - minimum) / span * 100, 0, 100)
-              const width = point || domainSpan === 0 ? 0 : Math.min(100 - left, Math.max(0, (displayEnd - start) / span * 100))
+              const endUnrecorded = !finite(storyTime.end)
+              const actualEnd = endUnrecorded ? timeline.max : storyTime.end
+              if (!finite(start) || actualEnd < minimum || start > maximum) return []
+              const point = !endUnrecorded && start === actualEnd
+              const visibleStart = Math.max(start, minimum)
+              const visibleEnd = Math.min(actualEnd, maximum)
+              const left = viewportSpan > 0 ? clamp((visibleStart - minimum) / viewportSpan * 100, 0, 100) : 100
+              const right = viewportSpan > 0 ? clamp((visibleEnd - minimum) / viewportSpan * 100, 0, 100) : 100
+              const width = viewportSpan > 0 ? clamp((visibleEnd - visibleStart) / viewportSpan * 100, 0, 100) : 0
+              const minimumMarker = !point && !zeroSpan && (
+                (width > 0 && width < MIN_CLICKABLE_PERCENT)
+                || (endUnrecorded && width === 0)
+              )
               const pointTransform = left <= 0 ? 'none' : left >= 100 ? 'translateX(-100%)' : 'translateX(-50%)'
-              const eventId = text(interval.eventId)
-              const matched = hasQuery && matchedIds.has(eventId)
-              const rowKey = text(interval.row?.key).trim()
-              const eventNode = nodeById(model, eventId)
-              const barTitle = rowKey && rowKey !== text(eventNode?.title) ? `${eventTitle(eventNode)} · ${rowKey}` : eventTitle(eventNode)
-              return h('div', { className: 'dst-explorer-bar-row', key: text(interval.rowId || interval.id || `${eventId}:${index}`) },
+              let style
+              if (zeroSpan) style = { left: '100%', width: '8px', transform: 'translateX(-100%)' }
+              else if (point) style = { left: `${left}%`, transform: pointTransform }
+              else if (endUnrecorded && minimumMarker) style = { right: '0', width: `${width}%`, minWidth: '8px' }
+              else if (endUnrecorded) style = { left: `${left}%`, right: '0' }
+              else if (minimumMarker && right >= 100) style = { right: '0', width: `${width}%`, minWidth: '8px' }
+              else style = { left: `${left}%`, width: `${width}%`, ...(minimumMarker ? { minWidth: '8px' } : {}) }
+              const timeDescription = [...new Set(interval.storyTimes.map(formatStoryTime))].join('\n')
+              const durationDescription = endUnrecorded
+                ? `真实起点 ${formatNumber(start)}\n真实终点 未记录\n真实时长 未知\n图示延伸至最新已知剧情时间 ${formatNumber(timeline.max)}`
+                : `真实起点 ${formatNumber(start)}\n真实终点 ${formatNumber(storyTime.end)}\n真实时长 ${formatNumber(storyTime.end - start)}`
+              const markerDescription = zeroSpan && endUnrecorded
+                ? '\n时间线上只有一个已知坐标；显示为标记，未推断事件时长。'
+                : endUnrecorded && width === 0 && start === timeline.max
+                  ? '\n开放事件的起点就是最新已知坐标；显示为右端标记，未推断事件时长。'
+                  : minimumMarker ? '\n此标记为便于点击而加宽，宽度不代表实际时长；放大后会按线性比例显示。' : ''
+              const title = `${barTitle}\n${timeDescription}\n${durationDescription}${markerDescription}`
+              return h('button', {
+                key: JSON.stringify([interval.start, interval.end ?? null]),
+                type: 'button',
+                className: classes('dst-explorer-bar', point && 'point', minimumMarker && 'minimum-marker', endUnrecorded && 'end-unrecorded', selectedId === eventId && 'selected', hasQuery && !matched && 'search-dim', matched && 'search-match'),
+                style,
+                title,
+                'aria-label': `打开事件 ${barTitle}：${title}`,
+                onClick: event => onChoose(eventId, event.currentTarget),
+              }, point || zeroSpan || width === 0 ? null : h('span', null, text(storyTime.label) || (endUnrecorded ? `${formatNumber(start)}–最新` : `${formatNumber(start)}–${formatNumber(storyTime.end)}`)))
+            })
+            return h('div', { className: 'dst-explorer-bar-row', key: eventId },
+              h('div', { className: 'dst-explorer-bar-label' },
                 h(EventButton, {
                   eventId,
                   selected: selectedId === eventId,
@@ -575,28 +819,63 @@ window.__ModuleLoader__.load({
                   matched,
                   onChoose,
                   register: element => registerEvent(eventId, element, 'gantt'),
-                }, h('span', { className: 'dst-explorer-bar-name', title: barTitle }, barTitle)),
-                h('div', { className: 'dst-explorer-bar-track' },
-                  h('button', {
-                    type: 'button',
-                    className: classes('dst-explorer-bar', point && 'point', endUnrecorded && 'end-unrecorded', selectedId === eventId && 'selected', hasQuery && !matched && 'search-dim', matched && 'search-match'),
-                    style: point || width === 0 ? { left: `${left}%`, transform: pointTransform } : { left: `${left}%`, width: `${width}%` },
-                    title: `${barTitle}\n${formatStoryTime(storyTime)}${endUnrecorded ? `\n图示延伸至当前剧情时间 ${formatNumber(maximum)}` : ''}`,
-                    'aria-label': `打开事件 ${eventId}：${formatStoryTime(storyTime)}${endUnrecorded ? `；图示延伸至当前剧情时间 ${formatNumber(maximum)}` : ''}`,
-                    onClick: event => onChoose(eventId, event.currentTarget),
-                  }, point || width === 0 ? null : h('span', null, text(storyTime.label) || (endUnrecorded ? `${formatNumber(start)}–当前` : `${formatNumber(start)}–${formatNumber(displayEnd)}`)))))
-            })
-            return h('article', { className: 'dst-explorer-timeline', key: text(timeline.timeline) },
-              h('div', { className: 'dst-explorer-timeline-head' },
-                h('strong', null, text(timeline.timeline) || '未命名时间线'),
-                h('span', null, `${formatNumber(minimum)} – ${formatNumber(maximum)}`)),
-              h('div', { className: 'dst-explorer-axis', 'aria-hidden': true }, ticks),
-              h('div', { className: 'dst-explorer-bars' }, bars))
+                }, h('span', { className: 'dst-explorer-bar-name', title: barTitle }, barTitle),
+                h('span', { className: 'dst-explorer-muted' }, `${group.rowCount} 条记忆`)),
+                h('button', {
+                  type: 'button',
+                  className: 'dst-explorer-focus-time',
+                  title: `聚焦 ${barTitle} 的剧情时间`,
+                  'aria-label': `聚焦事件时间：${barTitle}`,
+                  onClick: () => setViewport(focusTimelineViewport(timeline, group.intervals)),
+                }, '聚焦事件时间')),
+              h('div', { className: 'dst-explorer-bar-track' }, markers))
           })
-          const untimedItems = untimed.map(({ eventId, row, storyTime }, index) => {
+          return h('article', { className: 'dst-explorer-timeline' },
+            h('div', { className: 'dst-explorer-timeline-head' },
+              h('div', null,
+                h('strong', null, text(timeline.timeline) || '未命名时间线'),
+                h('span', { className: 'dst-explorer-viewport-range' }, `视窗 ${formatNumber(minimum)} – ${formatNumber(maximum)}`)),
+              h('div', { className: 'dst-explorer-timeline-controls', 'aria-label': `${text(timeline.timeline) || '未命名时间线'}视窗控制` },
+                h('button', { type: 'button', disabled: zeroSpan || !canZoomIn, onClick: () => setViewport(zoomedIn), 'aria-label': '放大时间线' }, '放大'),
+                h('button', { type: 'button', disabled: atOverview || zeroSpan, onClick: () => setViewport(zoomTimelineViewport(viewport, timeline, 2)), 'aria-label': '缩小时间线' }, '缩小'),
+                h('button', { type: 'button', disabled: minimum <= timeline.min || zeroSpan, onClick: () => setViewport(moveTimelineViewport(viewport, timeline, -1)), 'aria-label': '向前移动时间线' }, '向前'),
+                h('button', { type: 'button', disabled: maximum >= timeline.max || zeroSpan, onClick: () => setViewport(moveTimelineViewport(viewport, timeline, 1)), 'aria-label': '向后移动时间线' }, '向后'),
+                h('button', { type: 'button', disabled: atOverview, onClick: () => setViewport(overview), 'aria-label': '总览时间线' }, '总览'))),
+            h('div', { className: 'dst-explorer-timeline-domain' }, `全域 ${formatNumber(timeline.min)} – ${formatNumber(timeline.max)}`),
+            h('div', { className: 'dst-explorer-axis', 'aria-hidden': true }, ticks),
+            h('div', { className: 'dst-explorer-bars' }, bars))
+        }
+
+        function GanttChart({ model, selectedId, query, matchedIds, onChoose, registerEvent }) {
+          const timelines = list(model?.timelines)
+          const untimed = []
+          for (const node of list(model?.nodes)) {
+            const times = new Map()
+            let rowCount = 0
+            for (const row of list(node.rows)) {
+              const storyTime = timeOf(row?.storyTime)
+              if (storyTime.state !== 'normalized' || !finite(storyTime.start)) {
+                rowCount += 1
+                times.set(formatStoryTime(storyTime), storyTime)
+              }
+            }
+            if (rowCount) untimed.push({ eventId: node.eventId, rowCount, times: [...times.values()] })
+          }
+          const hasQuery = query.trim() !== ''
+          const timelineViews = timelines.map(timeline => h(TimelineView, {
+            key: `${text(timeline.timeline)}:${timeline.min}:${timeline.max}`,
+            timeline,
+            model,
+            selectedId,
+            query,
+            matchedIds,
+            onChoose,
+            registerEvent,
+          }))
+          const untimedItems = untimed.map(({ eventId, rowCount, times }) => {
             const matched = hasQuery && matchedIds.has(eventId)
             return h(EventButton, {
-              key: text(row?.id || `${eventId}:${index}`),
+              key: eventId,
               eventId,
               className: 'dst-explorer-untimed-item',
               selected: selectedId === eventId,
@@ -606,19 +885,19 @@ window.__ModuleLoader__.load({
               register: element => registerEvent(eventId, element, 'gantt'),
             },
             h('strong', null, eventTitle(nodeById(model, eventId))),
-            h(StoryTimePill, { value: storyTime }),
-            h('span', { className: 'dst-explorer-muted' }, text(row?.key)))
+            times.map(storyTime => h(StoryTimePill, { key: formatStoryTime(storyTime), value: storyTime })),
+            h('span', { className: 'dst-explorer-muted' }, `${rowCount} 条记忆`))
           })
           const untimedView = untimedItems.length ? h('article', { className: 'dst-explorer-timeline dst-explorer-untimed' },
             h('div', { className: 'dst-explorer-timeline-head' },
               h('strong', null, '无数值剧情时间'),
-              h('span', null, `${untimed.length} 条记忆`)),
+              h('span', null, `${untimed.length} 个事件`)),
             h('div', { className: 'dst-explorer-untimed-list' }, untimedItems)) : null
           return h('section', { className: 'dst-explorer-panel dst-explorer-gantt', 'aria-labelledby': 'dst-explorer-gantt-title' },
             h('header', { className: 'dst-explorer-panel-head' },
               h('div', null,
                 h('h2', { id: 'dst-explorer-gantt-title' }, '剧情时间'),
-                h('p', null, '每条时间线独立缩放；结束时间未记录的事件延伸至当前剧情时间。')),
+                h('p', null, '按原始数值计算间隔，每条时间线独立缩放；结束时间未记录的事件延伸至该轴最新已知位置。')),
               h('span', { className: 'dst-explorer-count' }, `${timelines.length} 条时间线`)),
             timelines.length === 0 && untimed.length === 0
               ? h('div', { className: 'dst-explorer-empty' }, '尚无可显示的剧情时间。')
@@ -674,9 +953,9 @@ window.__ModuleLoader__.load({
               style: { left: `${node.x}px`, top: `${node.y}px`, width: `${node.width}px`, height: `${node.height}px` },
             },
             h('span', { className: 'dst-explorer-graph-node-position' },
-            h('strong', { title: text(node.title) || eventId }, text(node.title) || text(list(node.rows)[0]?.key) || eventId),
-            h('span', { className: 'dst-explorer-node-id', title: eventId }, eventId),
-            h('span', { className: 'dst-explorer-node-summary' }, `${list(node.rows).length} 条记忆 · 层级 ${Number(node.rank) + 1}`),
+            h('strong', { title: eventTitle(node) }, eventTitle(node)),
+            node.summary ? h('span', { className: 'dst-explorer-node-summary', title: text(node.summary) }, text(node.summary)) : null,
+            h('span', { className: 'dst-explorer-node-meta' }, `${list(node.rows).length} 条记忆 · 层级 ${Number(node.rank) + 1}`),
             h('span', { className: 'dst-explorer-node-time' }, normalizedTimes.length ? formatStoryTime(normalizedTimes[0]) : '无标准化时间'),
             ))
           })))
@@ -698,7 +977,7 @@ window.__ModuleLoader__.load({
               : h('div', { className: 'dst-explorer-empty' }, '尚无由记忆组成的事件。'))
         }
 
-        function RelationList({ title, relations, direction, onNavigate }) {
+        function RelationList({ title, relations, direction, model, onNavigate, onOpenSource }) {
           const values = list(relations)
           return h('section', { className: 'dst-explorer-detail-section' },
             h('h3', null, title),
@@ -707,60 +986,60 @@ window.__ModuleLoader__.load({
                   const edge = edgeOf(relation)
                   const target = relatedEventId(relation, direction)
                   return h('li', { key: text(edge.id || `${target}:${index}`) },
-                    h('button', { type: 'button', onClick: () => onNavigate(target) }, target || '未知事件'),
+                    h('button', { type: 'button', onClick: () => onNavigate(target) }, eventTitle(nodeById(model, target))),
                     edge.reason ? h('p', null, text(edge.reason)) : null,
-                    h('dl', { className: 'dst-explorer-edge-meta' },
-                      detailPair('关系 ID', text(edge.id) || '未记录'),
-                      detailPair('类型', text(edge.kind) || '未记录'),
-                      detailPair('创建时间', formatDate(edge.createdAt)),
-                      detailPair('更新时间', formatDate(edge.updatedAt))),
-                    list(edge.sourceRefs).length ? h(SourceRefs, { refs: edge.sourceRefs }) : null,
-                    h('details', { className: 'dst-explorer-raw' },
-                      h('summary', null, '查看完整关系 JSON'),
+                    list(edge.sourceRefs).length ? h(SourceRefs, { refs: edge.sourceRefs, onOpenSource }) : null,
+                    h('details', { className: 'dst-explorer-technical' },
+                      h('summary', null, '技术信息'),
+                      h('dl', { className: 'dst-explorer-edge-meta' },
+                        detailPair('关系 ID', text(edge.id) || '未记录'),
+                        detailPair('类型', text(edge.kind) || '未记录'),
+                        detailPair('创建时间', formatDate(edge.createdAt)),
+                        detailPair('更新时间', formatDate(edge.updatedAt))),
                       h('pre', { className: 'dst-explorer-json' }, formatJson(edge))))
                 }))
               : h('p', { className: 'dst-explorer-muted' }, '无'))
         }
 
-        function MemoryDetail({ row, index }) {
+        function MemoryDetail({ row, index, onOpenSource }) {
           const storyTime = timeOf(row?.storyTime)
+          const description = describeMemory(row)
           return h('article', { className: 'dst-explorer-memory-detail' },
             h('header', null,
-              h('div', null,
-                h('span', classNameProps('dst-explorer-table-pill'), text(row?.table) || '未命名表'),
-                h('h3', null, text(row?.key) || `记忆 ${index + 1}`)),
-              h('span', { className: 'dst-explorer-importance' }, `重要度 ${Math.round(Number(row?.importance ?? 0) * 100)}%`)),
+              h('h3', null, description.title || `剧情记忆 ${index + 1}`)),
+            description.summary ? h('p', { className: 'dst-explorer-memory-summary' }, description.summary) : null,
+            description.facts.length ? h('section', { className: 'dst-explorer-facts' },
+              h('h4', null, '已确认的剧情事实'),
+              h('ul', null, description.facts.map((fact, factIndex) => h('li', { key: `${factIndex}:${fact}` }, fact)))) : null,
             h('dl', { className: 'dst-explorer-detail-grid' },
-              detailPair('记忆 ID', text(row?.id) || '未记录'),
               detailPair('剧情时间', h(StoryTimePill, { value: storyTime })),
-              storyTime.state === 'normalized' ? detailPair('开始时间', finite(storyTime.start) ? formatNumber(storyTime.start) : '开始时间未记录') : null,
-              storyTime.state === 'normalized' ? detailPair('结束时间', storyTime.end == null || text(storyTime.end).trim() === '' ? '结束时间未记录' : formatNumber(storyTime.end)) : null,
               detailPair('地点', formatLocation(row?.location)),
-              detailPair('人物', list(row?.characters).length ? list(row.characters).join('、') : '未记录'),
-              detailPair('关键词', list(row?.keywords).length ? list(row.keywords).join('、') : '未记录'),
-              detailPair('召回策略', text(row?.recallPolicy) || '未记录'),
-              detailPair('创建时间', formatDate(row?.createdAt)),
-              detailPair('更新时间', formatDate(row?.updatedAt))),
+              detailPair('人物', list(row?.characters).length ? list(row.characters).join('、') : '未记录')),
             h('section', { className: 'dst-explorer-detail-section' },
               h('h4', null, `来源（${list(row?.sourceRefs).length}）`),
-              h(SourceRefs, { refs: row?.sourceRefs })),
-            h('section', { className: 'dst-explorer-detail-section' },
-              h('h4', null, '结构化值'),
-              h('pre', { className: 'dst-explorer-json' }, formatJson(row?.value))),
-            h('details', { className: 'dst-explorer-raw' },
-              h('summary', null, '查看完整记忆 JSON'),
+              h(SourceRefs, { refs: row?.sourceRefs, onOpenSource })),
+            h('details', { className: 'dst-explorer-technical' },
+              h('summary', null, '技术信息'),
+              h('dl', { className: 'dst-explorer-detail-grid' },
+                detailPair('数据表', text(row?.table) || '未记录'),
+                detailPair('记录键', text(row?.key) || '未记录'),
+                detailPair('记忆 ID', text(row?.id) || '未记录'),
+                storyTime.state === 'normalized' ? detailPair('排序坐标（开始）', finite(storyTime.start) ? formatNumber(storyTime.start) : '未记录') : null,
+                storyTime.state === 'normalized' ? detailPair('排序坐标（结束）', storyTime.end == null || text(storyTime.end).trim() === '' ? '未记录' : formatNumber(storyTime.end)) : null,
+                detailPair('关键词', list(row?.keywords).length ? list(row.keywords).join('、') : '未记录'),
+                detailPair('召回策略', text(row?.recallPolicy) || '未记录'),
+                detailPair('重要度', `${Math.round(Number(row?.importance ?? 0) * 100)}%`),
+                detailPair('创建时间', formatDate(row?.createdAt)),
+                detailPair('更新时间', formatDate(row?.updatedAt))),
+              h('h4', null, '完整结构化数据'),
               h('pre', { className: 'dst-explorer-json' }, formatJson(row))))
-        }
-
-        function classNameProps(className) {
-          return { className }
         }
 
         function detailPair(label, value) {
           return h(React.Fragment, { key: label }, h('dt', null, label), h('dd', null, value))
         }
 
-        function DetailDialog({ dialogRef, node, onDismiss, onClosed, onNavigate }) {
+        function DetailDialog({ dialogRef, node, model, onDismiss, onClosed, onNavigate, onOpenSource }) {
           return h('dialog', {
             ref: dialogRef,
             className: 'dst-explorer-detail-dialog',
@@ -773,41 +1052,47 @@ window.__ModuleLoader__.load({
             h('header', { className: 'dst-explorer-detail-head' },
               h('div', null,
                 h('span', { className: 'dst-explorer-kicker' }, '事件详情'),
-                h('h2', null, text(node.title) || text(list(node.rows)[0]?.key) || text(node.eventId)),
-                h('p', null, `${text(node.eventId)} · ${list(node.rows).length} 条记忆`)),
+                h('h2', null, eventTitle(node)),
+                node.summary ? h('p', { className: 'dst-explorer-event-summary' }, text(node.summary)) : null),
               h('button', { type: 'button', className: 'dst-explorer-close', onClick: onDismiss, autoFocus: true, 'aria-label': '关闭事件详情' }, '×')),
             h('div', { className: 'dst-explorer-detail-body' },
-              h(RelationList, { title: '直接前置事件', relations: node.predecessors, direction: 'predecessor', onNavigate }),
-              h(RelationList, { title: '直接后续事件', relations: node.successors, direction: 'successor', onNavigate }),
+              h(RelationList, { title: '直接前置事件', relations: node.predecessors, direction: 'predecessor', model, onNavigate, onOpenSource }),
+              h(RelationList, { title: '直接后续事件', relations: node.successors, direction: 'successor', model, onNavigate, onOpenSource }),
               h('section', { className: 'dst-explorer-detail-section' },
-                h('h3', null, '聚合信息'),
+                h('h3', null, '剧情信息'),
                 h('dl', { className: 'dst-explorer-detail-grid' },
                   detailPair('人物', list(node.characters).length ? list(node.characters).join('、') : '未记录'),
                   detailPair('地点', list(node.locations).length ? list(node.locations).map(formatLocation).join('；') : '未记录'),
-                  detailPair('关键词', list(node.keywords).length ? list(node.keywords).join('、') : '未记录'),
-                  detailPair('平均重要度', finite(Number(node.importance?.average)) ? `${Math.round(Number(node.importance.average) * 100)}%` : '未记录'),
-                  detailPair('最高重要度', finite(Number(node.importance?.max)) ? `${Math.round(Number(node.importance.max) * 100)}%` : '未记录'))),
+                  detailPair('记忆数量', `${list(node.rows).length} 条`))),
               h('section', { className: 'dst-explorer-detail-section' },
                 h('h3', null, `记忆（${list(node.rows).length}）`),
                 h('div', { className: 'dst-explorer-memory-list' }, list(node.rows).map((row, index) =>
-                  h(MemoryDetail, { key: text(row?.id || index), row, index })))))) : null)
+                  h(MemoryDetail, { key: text(row?.id || index), row, index, onOpenSource })))),
+              h('details', { className: 'dst-explorer-technical dst-explorer-event-technical' },
+                h('summary', null, '事件技术信息'),
+                h('dl', { className: 'dst-explorer-detail-grid' },
+                  detailPair('事件 ID', text(node.eventId) || '未记录'),
+                  detailPair('关键词', list(node.keywords).length ? list(node.keywords).join('、') : '未记录'),
+                  detailPair('平均重要度', finite(Number(node.importance?.average)) ? `${Math.round(Number(node.importance.average) * 100)}%` : '未记录'),
+                  detailPair('最高重要度', finite(Number(node.importance?.max)) ? `${Math.round(Number(node.importance.max) * 100)}%` : '未记录'))))) : null)
         }
 
-        function UngroupedRows({ rows }) {
+        function UngroupedRows({ rows, onOpenSource }) {
           const values = list(rows)
           if (!values.length) return null
           return h('details', { className: 'dst-explorer-ungrouped' },
             h('summary', null, `未关联事件的记忆（${values.length}）`),
             h('div', { className: 'dst-explorer-memory-list' }, values.map((row, index) =>
-              h(MemoryDetail, { key: text(row?.id || index), row, index }))))
+              h(MemoryDetail, { key: text(row?.id || index), row, index, onOpenSource }))))
         }
 
-        function EventExplorerView({ document: eventDocument, loading = false, refreshing = false, error = null, onRefresh, onEdit, sessionId }) {
+        function EventExplorerView({ document: eventDocument, maintenance = null, loading = false, refreshing = false, error = null, onRefresh, onEdit, onOpenSource, sessionId }) {
           const [selectedId, setSelectedId] = React.useState(null)
           const [query, setQuery] = React.useState('')
           const [searchCursor, setSearchCursor] = React.useState(-1)
           const [scale, setScale] = React.useState(1)
           const [pan, setPan] = React.useState({ x: 0, y: 0 })
+          const [sourceNotice, setSourceNotice] = React.useState('')
           const graphViewport = React.useRef(null)
           const dialogRef = React.useRef(null)
           const restoreFocus = React.useRef(null)
@@ -830,6 +1115,20 @@ window.__ModuleLoader__.load({
           const matches = React.useMemo(() => normalizedQuery ? searchEntries.filter(entry => entry.haystack.includes(normalizedQuery)).map(entry => entry.id) : searchEntries.map(entry => entry.id), [searchEntries, normalizedQuery])
           const matchedIds = React.useMemo(() => new Set(matches), [matches])
           const selectedNode = selectedId ? nodeById(computed.model, selectedId) : null
+          const maintenanceState = maintenanceFeedback(maintenance, computed.model)
+
+          const openSource = React.useCallback(ref => {
+            if (typeof onOpenSource !== 'function') return
+            setSourceNotice('正在返回来源回合…')
+            try {
+              Promise.resolve(onOpenSource(ref)).then(
+                () => setSourceNotice(''),
+                caught => setSourceNotice(`无法打开来源回合：${caught instanceof Error ? caught.message : text(caught)}`),
+              )
+            } catch (caught) {
+              setSourceNotice(`无法打开来源回合：${caught instanceof Error ? caught.message : text(caught)}`)
+            }
+          }, [onOpenSource])
 
           const registerEvent = React.useCallback((eventId, element, surface) => {
             const id = text(eventId)
@@ -914,6 +1213,7 @@ window.__ModuleLoader__.load({
             setSearchCursor(-1)
             setScale(1)
             setPan({ x: 0, y: 0 })
+            setSourceNotice('')
             fittedSession.current = null
             eventElements.current.clear()
           }, [sessionId])
@@ -1025,6 +1325,15 @@ window.__ModuleLoader__.load({
             shownError ? h('div', { className: 'dst-explorer-error', role: 'alert' },
               h('span', null, text(shownError)),
               typeof onRefresh === 'function' ? h('button', { type: 'button', onClick: () => onRefresh() }, '重试') : null) : null,
+            sourceNotice ? h('div', {
+              className: classes('dst-explorer-maintenance', sourceNotice.startsWith('无法') ? 'error' : 'busy'),
+              role: sourceNotice.startsWith('无法') ? 'alert' : 'status',
+            }, sourceNotice) : null,
+            !loading || eventDocument ? h('div', {
+              className: classes('dst-explorer-maintenance', maintenanceState.tone),
+              role: maintenanceState.tone === 'error' ? 'alert' : 'status',
+              'aria-live': 'polite',
+            }, maintenanceState.message) : null,
             loading && !eventDocument ? h('div', { className: 'dst-explorer-loading', role: 'status' }, '正在读取事件…') : null,
             computed.model && (!loading || eventDocument) ? h('main', { className: 'dst-explorer-content', 'aria-busy': refreshing === true },
               h(GanttChart, { model: computed.model, selectedId, query: normalizedQuery, matchedIds, onChoose: chooseEvent, registerEvent }),
@@ -1044,13 +1353,15 @@ window.__ModuleLoader__.load({
                 onZoom: zoomBy,
                 onFit: fitGraph,
               }),
-              h(UngroupedRows, { rows: computed.model.ungrouped })) : null,
+              h(UngroupedRows, { rows: computed.model.ungrouped, onOpenSource: openSource })) : null,
             h(DetailDialog, {
               dialogRef,
               node: selectedNode,
+              model: computed.model,
               onDismiss: dismissDetails,
               onClosed: handleDialogClosed,
               onNavigate: eventId => { setSelectedId(eventId); centerGraphEvent(eventId) },
+              onOpenSource: openSource,
             }))
         }
 
@@ -1064,9 +1375,12 @@ window.__ModuleLoader__.load({
         // The public View marker opts into the host's fixed-height layout. Reserve its
         // measured composer seat so the graph remains usable above the native input.
         const viewportCss = `
+      .dst-explorer-axis>span{white-space:nowrap}
       .dst-explorer-root{width:100%;padding-bottom:calc(var(--dsh-composer-height,152px) + 8px);container-type:inline-size;container-name:dst-events}
+      .dst-explorer-maintenance{flex:0 0 auto;padding:7px 18px;border-bottom:1px solid var(--dsw-alias-border-l3,#edf0f4);background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-secondary,#667085);font-size:12px}.dst-explorer-maintenance.busy{background:#fff8e8;color:#80550a}.dst-explorer-maintenance.ready{background:#eef8f1;color:#28613a}.dst-explorer-maintenance.error{background:#fff0f0;color:#9b1c1c}.dst-explorer-memory-summary,.dst-explorer-event-summary{white-space:pre-wrap;overflow-wrap:anywhere}.dst-explorer-memory-summary{margin:0 0 12px;font-size:14px;line-height:1.7}.dst-explorer-facts{margin:0 0 13px}.dst-explorer-facts h4{margin:0 0 6px}.dst-explorer-facts ul{margin:0;padding-left:21px}.dst-explorer-facts li{padding:2px 0}.dst-explorer-source-list button{height:auto;padding:1px 0;border:0;background:none;color:var(--dsw-alias-brand-primary,#24548a);cursor:pointer;font:inherit;text-align:left;text-decoration:underline;text-underline-offset:2px}.dst-explorer-technical{margin-top:12px;padding-top:10px;border-top:1px dashed var(--dsw-alias-border-l2,#dfe3ea)}.dst-explorer-technical>summary{color:var(--dsw-alias-label-secondary,#667085);cursor:pointer;font-size:12px}.dst-explorer-technical[open]>summary{margin-bottom:8px}.dst-explorer-technical>.dst-explorer-json{margin-top:10px}.dst-explorer-event-technical{margin-bottom:20px}.dst-explorer-node-meta{overflow:hidden;color:var(--dsw-alias-label-tertiary,#87909f);font-size:10px;text-overflow:ellipsis;white-space:nowrap}
       .dst-explorer-content{grid-template-rows:minmax(156px,34%) minmax(220px,1fr) auto;gap:10px;padding:10px}
       .dst-explorer-graph-viewport{min-height:0}
+      .dst-explorer-timeline-head>div:first-child{display:flex;min-width:0;flex-direction:column;gap:1px}.dst-explorer-viewport-range,.dst-explorer-timeline-domain{color:var(--dsw-alias-label-secondary,#667085);font-size:10px;font-variant-numeric:tabular-nums}.dst-explorer-timeline-domain{margin:0 0 2px var(--dst-gantt-label-width);padding-left:10px}.dst-explorer-timeline-controls{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px}.dst-explorer-timeline-controls button,.dst-explorer-focus-time{min-height:24px;padding:2px 7px;border:1px solid var(--dsw-alias-border-l1,#ccd5e3);border-radius:6px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-secondary,#667085);cursor:pointer;font:10px/1.2 system-ui,sans-serif}.dst-explorer-timeline-controls button:disabled{opacity:.42;cursor:not-allowed}.dst-explorer-bar-label{display:grid;min-width:0;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:4px}.dst-explorer-bar-label>.dst-explorer-event-button{min-width:0;padding:3px 6px;border-radius:6px}.dst-explorer-focus-time{white-space:nowrap}.dst-explorer-bar.minimum-marker{z-index:1}
       @container dst-events (max-width:850px){.dst-explorer-toolbar{flex-wrap:wrap;gap:8px;padding:10px}.dst-explorer-heading{width:100%;min-width:0}.dst-explorer-search{min-width:0;max-width:none;order:3;width:100%}.dst-explorer-refresh{margin-left:auto}.dst-explorer-heading h1{font-size:16px}.dst-explorer-kicker{letter-spacing:0}}
       `
         return { EventExplorer, css: css + viewportCss }
@@ -1076,8 +1390,9 @@ window.__ModuleLoader__.load({
     const eventExplorerUI = createEventExplorerUI(React, eventExplorerModel)
     // END GENERATED EVENT EXPLORER
     const {
-      Menu, MarkdownText, JsonBlock,
+      Menu, MarkdownText, JsonBlock, Tooltip,
       IconChevronDownOutline14, IconSettingsOutline14,
+      IconRefreshOutline16, IconEditOutline16, IconRightUpOutline16,
     } = require('@deepseek-ai/dsh-client-ui-primitives')
     const API = '/api/dsh-sillytavern'
 
@@ -1344,26 +1659,45 @@ self.onmessage = event => {
       }
       const notify = runtime => { for (const listener of runtime.listeners) listener() }
       const post = (registration, message) => registration.getWindow()?.postMessage({ __dshSillyTavern: true, channel: registration.channel, ...message }, '*')
+      const frameError = (message, code) => Object.assign(new Error(message), { code })
+      const readyFrames = runtime => [...runtime.frames].map(channel => frames.get(channel)).filter(registration => registration?.ready === true)
       const callFrame = (registration, kind, payload = {}) => new Promise((resolve, reject) => {
+        const target = registration.ready === true ? registration.getWindow() : null
+        if (target === null || target === undefined) {
+          registration.ready = false
+          reject(frameError('script callback owner was detached', 'dsh-frame-detached'))
+          return
+        }
         const id = `host-${++frameCallSeq}`
-        const timer = window.setTimeout(() => { frameCalls.delete(id); reject(new Error(`script callback ${kind} timed out`)) }, 10000)
+        const timer = window.setTimeout(() => {
+          frameCalls.delete(id)
+          registration.ready = false
+          reject(frameError(`script callback ${kind} timed out`, 'dsh-frame-timeout'))
+        }, 10000)
         frameCalls.set(id, { channel: registration.channel, resolve, reject, timer })
-        post(registration, { event: 'compat-call', payload: { id, kind, ...payload } })
+        target.postMessage({ __dshSillyTavern: true, channel: registration.channel, event: 'compat-call', payload: { id, kind, ...payload } }, '*')
       })
+      const callFrames = async (owners, kind, payload) => {
+        const settled = await Promise.allSettled(owners.map(owner => callFrame(owner, kind, payload)))
+        const detached = settled.find(item => item.status === 'rejected' && item.reason?.code === 'dsh-frame-detached')
+        if (detached) throw detached.reason
+        const failed = settled.find(item => item.status === 'rejected' && item.reason?.code !== 'dsh-frame-timeout')
+        if (failed) throw failed.reason
+        return settled.flatMap((item, index) => item.status === 'fulfilled' ? [{ owner: owners[index], value: item.value }] : [])
+      }
       const drainWrites = async runtime => {
         await runtime.queue
         if (runtime.writeError) { const error = runtime.writeError; runtime.writeError = null; throw error }
       }
       const prepareRuntime = async runtime => {
-        const owners = [...runtime.frames].map(channel => frames.get(channel)).filter(Boolean)
-        await Promise.all(owners.map(owner => callFrame(owner, 'barrier')))
+        const barriers = await callFrames(readyFrames(runtime), 'barrier')
         await drainWrites(runtime)
-        const results = await Promise.all(owners.map(owner => callFrame(owner, 'filters')))
+        const results = await callFrames(barriers.map(item => item.owner), 'filters')
         await drainWrites(runtime)
-        return { eligibleInjectionIds: results.flatMap(result => result?.eligibleInjectionIds || []), ownerFrameIds: owners.map(owner => owner.channel) }
+        return { eligibleInjectionIds: results.flatMap(item => item.value?.eligibleInjectionIds || []), ownerFrameIds: results.map(item => item.owner.channel) }
       }
       const pollLifecycle = async runtime => {
-        if (runtime.frames.size === 0 || runtime.polling) return
+        if (readyFrames(runtime).length === 0 || runtime.polling) return
         runtime.polling = true
         try {
           const requests = await api(`/compat/lifecycle?sessionId=${encodeURIComponent(runtime.id)}&clientId=${encodeURIComponent(lifecycleClientId)}`)
@@ -1373,21 +1707,27 @@ self.onmessage = event => {
               if (request.kind === 'prepare') result = await prepareRuntime(runtime)
               else if (request.kind === 'macros') {
                 let texts = request.payload.texts
-                for (const channel of runtime.frames) {
-                  const owner = frames.get(channel)
-                  if (owner) texts = (await callFrame(owner, 'macros', { texts })).texts
+                for (const owner of readyFrames(runtime)) {
+                  try { texts = (await callFrame(owner, 'macros', { texts })).texts }
+                  catch (failure) {
+                    if (failure?.code === 'dsh-frame-timeout') continue
+                    throw failure
+                  }
                 }
                 await drainWrites(runtime)
                 result = { texts }
               }
               else throw new Error(`unknown lifecycle request ${request.kind}`)
-            } catch (failure) { error = failure?.message || String(failure) }
+            } catch (failure) {
+              if (failure?.code === 'dsh-frame-detached') continue
+              error = failure?.message || String(failure)
+            }
             await api('/compat/lifecycle/result', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, clientId: lifecycleClientId, id: request.id, result, error }) })
           }
         } catch (error) { console.error('[dsh-sillytavern] lifecycle coordination failed', error) }
         finally {
           runtime.polling = false
-          if (runtime.frames.size > 0 && sessions.get(runtime.id) === runtime) runtime.pollTimer = window.setTimeout(() => void pollLifecycle(runtime), 250)
+          if (readyFrames(runtime).length > 0 && sessions.get(runtime.id) === runtime) runtime.pollTimer = window.setTimeout(() => void pollLifecycle(runtime), 250)
         }
       }
       const broadcastState = runtime => {
@@ -1697,13 +2037,20 @@ self.onmessage = event => {
         }
         if (message.event === 'frame-resize') {
           const height = Math.ceil(Number(message.payload?.height))
-          if (Number.isFinite(height) && height > 0) registration.onResize?.(height)
+          if (Number.isFinite(height) && height >= 0) registration.onResize?.(height)
+          return
+        }
+        if (message.event === 'frame-error') {
+          registration.onError?.(String(message.payload?.message || '脚本运行失败'))
           return
         }
         if (message.event === 'frame-ready') {
+          registration.ready = true
           registration.onReady?.()
           const runtime = sessionFor(registration.sessionId)
           if (runtime.snapshot !== null) post(registration, { event: 'compat-state', payload: clone(runtime.snapshot) })
+          window.clearTimeout(runtime.pollTimer)
+          void pollLifecycle(runtime)
           return
         }
         if (message.event === 'compat-event') {
@@ -1734,16 +2081,16 @@ self.onmessage = event => {
         applyEventState,
         setComposer(sessionId, composer) { const runtime = sessionFor(sessionId); runtime.composer = composer; return () => { if (runtime.composer === composer) runtime.composer = null } },
         register(registration) {
+          registration.ready = false
           frames.set(registration.channel, registration)
           const runtime = sessionFor(registration.sessionId)
           runtime.frames.add(registration.channel)
-          window.clearTimeout(runtime.pollTimer)
-          void pollLifecycle(runtime)
           return () => {
+            registration.ready = false
             frames.delete(registration.channel)
             runtime.frames.delete(registration.channel)
-            for (const [id, call] of frameCalls) if (call.channel === registration.channel) { window.clearTimeout(call.timer); frameCalls.delete(id); call.reject(new Error('script callback owner was destroyed')) }
-            if (runtime.frames.size === 0) {
+            for (const [id, call] of frameCalls) if (call.channel === registration.channel) { window.clearTimeout(call.timer); frameCalls.delete(id); call.reject(frameError('script callback owner was detached', 'dsh-frame-detached')) }
+            if (readyFrames(runtime).length === 0) {
               window.clearTimeout(runtime.pollTimer)
               void api('/compat/lifecycle/disconnect', { method: 'POST', body: JSON.stringify({ sessionId: runtime.id, clientId: lifecycleClientId }) }).catch(error => console.error(error))
             }
@@ -1927,18 +2274,22 @@ self.onmessage = event => {
 
     function LibraryTab({ library, session, reload }) {
       const [status, setStatus] = React.useState('')
+      const [replacement, setReplacement] = React.useState(null)
+      const [bindingBusy, setBindingBusy] = React.useState(false)
       const [deletingId, setDeletingId] = React.useState(null)
       const [deleteDialog, setDeleteDialog] = React.useState(null)
       const started = sessionHasStarted(session)
-      const bind = async card => {
-        if (!session) return
+      const bind = async (card, confirmed = false) => {
+        if (!session || bindingBusy) return
         const replacing = session.binding !== null
         if (replacing && started) { setStatus('当前会话已经开始对话，不能更换角色卡。'); return }
-        if (replacing && !window.confirm(`将当前角色替换为“${card.name}”？`)) return
+        if (replacing && !confirmed) { setReplacement({ card, sessionId: session.sessionId, cardId: session.binding?.cardId }); return }
+        setBindingBusy(true)
         try {
           await api('/bind', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, cardId: card.id, replace: replacing, expectedCardId: session.binding?.cardId || null }) })
-          setStatus(''); overlay.changed(); reload()
+          setReplacement(null); setStatus(''); overlay.changed(); reload()
         } catch (error) { setStatus(error instanceof Error ? error.message : String(error)) }
+        finally { setBindingBusy(false) }
       }
       const remove = async card => {
         setDeletingId(card.id)
@@ -1962,11 +2313,15 @@ self.onmessage = event => {
         finally { setDeletingId(null) }
       }
       return h('div', null,
+        replacement && replacement.sessionId === session?.sessionId && replacement.cardId === session?.binding?.cardId ? h(ConfirmPanel, { title: '更换当前角色', busy: bindingBusy, danger: false, confirmLabel: '确认更换', onCancel: () => setReplacement(null), onConfirm: () => { void bind(replacement.card, true) } }, h('p', null, `将当前角色替换为“${replacement.card.nickname || replacement.card.name}”？`), status ? h('p', { role: 'status', className: 'dst-error' }, status) : null) : null,
         h('div', { className: 'dst-section-title' }, `全局角色库（${library.cards.length}）`),
-        library.cards.length === 0 ? h('p', { className: 'dst-muted' }, '还没有角色卡。请从当前会话左下角“+”导入。') : null,
+        h('div', { className: 'dst-actions' }, h(Button, { disabled: !session || started, onClick: () => overlay.open('import', session.sessionId) }, '导入角色卡…')),
+        h('p', { className: 'dst-muted' }, started ? '在新剧情中可以导入其他角色卡；当前剧情的角色已固定。' : '选择一张角色卡，然后关闭管理页，选择开场并填写玩家身份。也可以导入 PNG、APNG 或 JSON 角色卡。'),
+        library.cards.length === 0 ? h('p', { className: 'dst-muted' }, '还没有角色卡。点击“导入角色卡”开始。') : null,
         h('div', { className: 'dst-card-grid' }, library.cards.map(card => h('article', { className: 'dst-card', key: card.id },
+          session && card.format !== 'json-v3' ? h('img', { className: 'dst-card-cover', src: `${API}/card/cover?sessionId=${encodeURIComponent(session.sessionId)}&id=${encodeURIComponent(card.id)}`, alt: `${card.nickname || card.name} 封面`, loading: 'lazy', onError: event => { event.currentTarget.hidden = true } }) : null,
           h('strong', null, card.nickname || card.name),
-          h('span', { className: 'dst-muted' }, `V3 · ${card.format} · ${card.creator || 'unknown'}`),
+          h('span', { className: 'dst-muted' }, card.creator ? `作者：${card.creator}` : '作者未填写'),
           h('div', { className: 'dst-tags' }, (card.tags || []).slice(0, 5).map(tag => h('span', { key: tag }, tag))),
           h('div', { className: 'dst-actions' },
             session ? h(Button, { className: 'small', disabled: deletingId === card.id || session.binding?.cardId === card.id || (started && session.binding !== null), title: started && session.binding?.cardId !== card.id ? '对话开始后不能更换角色卡' : undefined, onClick: () => void bind(card) }, session.binding?.cardId === card.id ? '当前角色' : '用于当前会话') : null,
@@ -1998,26 +2353,50 @@ self.onmessage = event => {
       const [variables, setVariables] = React.useState(() => JSON.stringify(session.binding?.variables || {}, null, 2))
       const [globalVariables, setGlobalVariables] = React.useState(() => JSON.stringify(session.globalVariables || {}, null, 2))
       const [status, setStatus] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [sessionDirty, setSessionDirty] = React.useState(false)
+      const [globalDirty, setGlobalDirty] = React.useState(false)
+      const dirty = sessionDirty || globalDirty
+      const edit = (setter, markDirty) => event => { setter(event.target.value); markDirty(true); setStatus('尚未保存') }
       const save = async () => {
-        try {
+        if (!dirty) return
+        setBusy(true)
+        setStatus('正在保存…')
+        const sessionRequest = sessionDirty ? Promise.resolve().then(() => {
           const parsedVariables = JSON.parse(variables)
           if (!parsedVariables || typeof parsedVariables !== 'object' || Array.isArray(parsedVariables)) throw new Error('变量必须是 JSON 对象')
+          return api('/session/update', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, patch: { userPersona: { name, description }, variables: parsedVariables } }) })
+        }) : null
+        const globalRequest = globalDirty ? Promise.resolve().then(() => {
           const parsedGlobalVariables = JSON.parse(globalVariables)
           if (!parsedGlobalVariables || typeof parsedGlobalVariables !== 'object' || Array.isArray(parsedGlobalVariables)) throw new Error('全局变量必须是 JSON 对象')
-          await Promise.all([
-            api('/session/update', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, patch: { userPersona: { name, description }, variables: parsedVariables } }) }),
-            api('/regex-sources', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, variables: parsedGlobalVariables }) }),
-          ])
-          setStatus('已保存'); overlay.changed(); reload()
-        } catch (error) { setStatus(error.message) }
+          return api('/regex-sources', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, variables: parsedGlobalVariables }) })
+        }) : null
+        const [sessionResult, globalResult] = await Promise.allSettled([sessionRequest, globalRequest])
+        const messages = []
+        const failureMessage = reason => reason && typeof reason.message === 'string' ? reason.message : String(reason)
+        let saved = false
+        if (sessionDirty) {
+          if (sessionResult.status === 'fulfilled') { setSessionDirty(false); messages.push('角色设定与会话变量已保存'); saved = true }
+          else messages.push(`角色设定与会话变量保存失败：${failureMessage(sessionResult.reason)}`)
+        }
+        if (globalDirty) {
+          if (globalResult.status === 'fulfilled') { setGlobalDirty(false); messages.push('全局变量已保存'); saved = true }
+          else messages.push(`全局变量保存失败：${failureMessage(globalResult.reason)}`)
+        }
+        setStatus(messages.join('；'))
+        if (saved) { overlay.changed(); reload() }
+        setBusy(false)
       }
       return h('div', null,
         h('div', { className: 'dst-section-title' }, '用户角色设定'),
-        h(Field, { label: '称呼' }, h('input', { value: name, onChange: event => setName(event.target.value) })),
-        h(Field, { label: '设定' }, h('textarea', { rows: 8, value: description, onChange: event => setDescription(event.target.value) })),
-        h(Field, { label: '会话变量（JSON 对象，{{getvar::key}}）' }, h('textarea', { rows: 6, value: variables, onChange: event => setVariables(event.target.value), spellCheck: false })),
-        h(Field, { label: '全局变量（JSON 对象，{{globalvar::key}}）' }, h('textarea', { rows: 6, value: globalVariables, onChange: event => setGlobalVariables(event.target.value), spellCheck: false })),
-        h('div', { className: 'dst-actions' }, h(Button, { onClick: () => void save() }, '保存角色设定与变量'), h('span', { className: 'dst-muted' }, status)))
+        h('p', { className: 'dst-muted' }, '称呼和设定仅用于当前剧情。写下你希望扮演的身份，以及希望角色如何与你互动。'),
+        h(Field, { label: '称呼' }, h('input', { value: name, disabled: busy, onChange: edit(setName, setSessionDirty) })),
+        h(Field, { label: '设定' }, h('textarea', { rows: 8, value: description, disabled: busy, onChange: edit(setDescription, setSessionDirty) })),
+        h('details', { className: 'dst-advanced-settings' }, h('summary', null, '高级：会话变量与全局变量'),
+          h(Field, { label: '会话变量（JSON 对象，{{getvar::key}}）' }, h('textarea', { rows: 6, value: variables, disabled: busy, onChange: edit(setVariables, setSessionDirty), spellCheck: false })),
+          h(Field, { label: '全局变量（JSON 对象，{{globalvar::key}}）' }, h('textarea', { rows: 6, value: globalVariables, disabled: busy, onChange: edit(setGlobalVariables, setGlobalDirty), spellCheck: false }))),
+        h('div', { className: 'dst-actions' }, h(Button, { disabled: busy || !dirty, onClick: () => void save() }, busy ? '保存中…' : '保存角色设定与变量'), h('span', { className: dirty ? 'dst-warning' : 'dst-status', role: 'status' }, status)))
     }
 
     function CardEditTab({ session, library, reload }) {
@@ -2031,7 +2410,7 @@ self.onmessage = event => {
       }) : {})
       const [defaultWorldbookId, setDefaultWorldbookId] = React.useState(() => record?.defaultWorldbookId || '')
       const [status, setStatus] = React.useState('')
-      if (!record) return h('p', { className: 'dst-muted' }, '当前会话尚未绑定角色。')
+      if (!record) return h('div', null, h('p', { className: 'dst-muted' }, '先从角色库选择角色，或导入角色卡，再查看和编辑设定。'), h(Button, { onClick: () => overlay.open('import', session.sessionId) }, '导入角色卡…'))
       const update = (key, value) => setForm(previous => ({ ...previous, [key]: value }))
       const save = async () => {
         try {
@@ -2202,6 +2581,15 @@ self.onmessage = event => {
       return { ...record, id: String(record.id || ''), name: String(record.name || book.name || ''), book: { ...book, name: String(record.name || book.name || '') } }
     }
 
+    function availableWorldbookCopyName(originalName, occupiedNames) {
+      const base = `${String(originalName || '世界书').trim() || '世界书'} · 当前剧情副本`
+      const occupied = occupiedNames instanceof Set ? occupiedNames : new Set(occupiedNames || [])
+      if (!occupied.has(base)) return base
+      let suffix = 2
+      while (occupied.has(`${base} ${suffix}`)) suffix += 1
+      return `${base} ${suffix}`
+    }
+
     function WorldbookEditor({ sessionId, worldbook, diagnostics, reload }) {
       const normalized = normalizeWorldbookRecord(worldbook)
       const initial = normalized.book
@@ -2210,6 +2598,8 @@ self.onmessage = event => {
       const [entryRows, setEntryRows] = React.useState(() => (Array.isArray(initial.entries) ? initial.entries : []).map(entry => ({ uiKey: `worldbook-entry-${++keySequence.current}`, value: entry })))
       const [status, setStatus] = React.useState('')
       const [busy, setBusy] = React.useState(false)
+      const [query, setQuery] = React.useState('')
+      const [enabledFilter, setEnabledFilter] = React.useState('all')
       const updateBook = React.useCallback((key, value) => setBook(previous => {
         const next = { ...previous }
         if (value === undefined) delete next[key]
@@ -2248,8 +2638,16 @@ self.onmessage = event => {
       const nonNegativeInteger = value => value === '' ? undefined : Math.max(0, Math.trunc(Number(value) || 0))
       const diagnosticWarnings = Array.isArray(diagnostics?.warnings) ? diagnostics.warnings : []
       const diagnosticBudget = diagnostics?.budget
+      const depthProjection = diagnostics?.depthProjection
       const diagnosticTime = typeof diagnostics?.generatedAt === 'string' ? new Date(diagnostics.generatedAt) : undefined
       const diagnosticTimeLabel = diagnosticTime !== undefined && Number.isFinite(diagnosticTime.getTime()) ? diagnosticTime.toLocaleString() : ''
+      const search = query.trim().toLocaleLowerCase()
+      const visibleRows = entryRows.map((row, index) => ({ row, index })).filter(({ row }) => {
+        const entry = row.value
+        const enabled = entry.enabled !== false
+        return (enabledFilter === 'all' || enabled === (enabledFilter === 'enabled'))
+          && (search === '' || [entry.comment, entry.name, entry.content, ...(entry.keys || []), ...(entry.secondary_keys || [])].join('\n').toLocaleLowerCase().includes(search))
+      })
       return h('div', { className: 'dst-worldbook' },
         h('div', { className: 'dst-actions dst-worldbook-save' }, h('span', { className: 'dst-muted' }, status), h(Button, { disabled: busy, onClick: () => void save() }, busy ? '保存中…' : '保存世界书')),
         h('p', { className: 'dst-muted' }, '编辑工作区内独立保存的世界书资源。修改会影响所有引用该世界书的角色卡与 Session。未显示的字段与 extensions 会原样保留。'),
@@ -2258,22 +2656,34 @@ self.onmessage = event => {
           : h('section', { className: 'dst-worldbook-book' },
               h('strong', null, '最近一次生成诊断'),
               h('p', { className: 'dst-muted' }, `${diagnosticTimeLabel ? `${diagnosticTimeLabel} · ` : ''}激活 ${Array.isArray(diagnostics.activeEntryIds) ? diagnostics.activeEntryIds.length : 0} 个条目 · 预算 ${Number(diagnosticBudget?.usedTokens) || 0}/${Number(diagnosticBudget?.tokens) || 0}${diagnosticBudget?.overflowed === true ? ' · 已达到上限' : ''}`),
+              depthProjection?.status === 'injected'
+                ? h('p', { className: 'dst-muted' }, `@Depth 内容已加入模型请求：${depthProjection.injectedEntries}/${depthProjection.expectedEntries} 项。`)
+                : depthProjection?.status === 'skipped'
+                  ? h('p', { className: 'dst-warning' }, `@Depth 内容未加入模型请求。${depthProjection.reason || '请检查插入内容后重新生成。'}`)
+                  : depthProjection?.status === 'not-needed'
+                    ? h('p', { className: 'dst-muted' }, '本次没有需要单独插入的 @Depth 内容。')
+                    : h('p', { className: 'dst-warning' }, '已完成世界书组装，尚未确认 @Depth 内容加入模型请求。'),
               diagnosticWarnings.length === 0
                 ? h('p', { className: 'dst-muted' }, '最近一次组装未发现世界书警告。')
                 : h('div', { className: 'dst-warning' }, h('strong', null, `运行时警告（${diagnosticWarnings.length}）`), h('ul', null, diagnosticWarnings.map((warning, index) => h('li', { key: `${index}:${warning}` }, warning))))),
-        h('section', { className: 'dst-worldbook-book' },
+        h('fieldset', { disabled: busy, 'aria-busy': busy, style: { border: 0, margin: 0, minWidth: 0, padding: 0 } },
+          h('section', { className: 'dst-worldbook-book' },
+            h('div', { className: 'dst-inline-fields' },
+              h(Field, { label: '世界书名称' }, h('input', { value: book.name ?? '', onChange: event => updateBook('name', event.target.value) })),
+              h(Field, { label: '扫描深度' }, h('input', { type: 'number', min: 0, max: 100, step: 1, value: book.scan_depth ?? '', placeholder: '使用默认值', onChange: event => updateBook('scan_depth', event.target.value === '' ? undefined : Math.max(0, Math.min(100, Math.trunc(Number(event.target.value) || 0)))) })),
+              h(Field, { label: '书内 Token 上限（留空=不额外限制，0=禁用）' }, h('input', { type: 'number', min: 0, step: 1, value: book.token_budget ?? '', placeholder: '不额外限制', onChange: event => updateBook('token_budget', nonNegativeInteger(event.target.value)) }))),
+            h('p', { className: 'dst-muted' }, '该上限只会收紧按模型上下文比例计算的世界书预算，不会提高全局预算；设为 0 时仅“忽略预算”的条目仍可插入。'),
+            h(Field, { label: '描述' }, h('textarea', { rows: 3, value: book.description ?? '', onChange: event => updateBook('description', event.target.value) })),
+            h('label', { className: 'dst-worldbook-check dst-worldbook-setting' }, h('input', { type: 'checkbox', checked: book.recursive_scanning === true, onChange: event => updateBook('recursive_scanning', event.target.checked) }), h('span', null, '递归扫描（Recursive Scanning）'))),
+          h('div', { className: 'dst-worldbook-list-head' },
+            h('strong', null, `条目（${entryRows.length}）`),
+            h(Button, { className: 'small', onClick: addEntry }, '新增条目')),
           h('div', { className: 'dst-inline-fields' },
-            h(Field, { label: '世界书名称' }, h('input', { value: book.name ?? '', onChange: event => updateBook('name', event.target.value) })),
-            h(Field, { label: '扫描深度' }, h('input', { type: 'number', min: 0, max: 100, step: 1, value: book.scan_depth ?? '', placeholder: '使用默认值', onChange: event => updateBook('scan_depth', event.target.value === '' ? undefined : Math.max(0, Math.min(100, Math.trunc(Number(event.target.value) || 0)))) })),
-            h(Field, { label: '书内 Token 上限（留空=不额外限制，0=禁用）' }, h('input', { type: 'number', min: 0, step: 1, value: book.token_budget ?? '', placeholder: '不额外限制', onChange: event => updateBook('token_budget', nonNegativeInteger(event.target.value)) }))),
-          h('p', { className: 'dst-muted' }, '该上限只会收紧按模型上下文比例计算的世界书预算，不会提高全局预算；设为 0 时仅“忽略预算”的条目仍可插入。'),
-          h(Field, { label: '描述' }, h('textarea', { rows: 3, value: book.description ?? '', onChange: event => updateBook('description', event.target.value) })),
-          h('label', { className: 'dst-worldbook-check dst-worldbook-setting' }, h('input', { type: 'checkbox', checked: book.recursive_scanning === true, onChange: event => updateBook('recursive_scanning', event.target.checked) }), h('span', null, '递归扫描（Recursive Scanning）'))),
-        h('div', { className: 'dst-worldbook-list-head' },
-          h('strong', null, `条目（${entryRows.length}）`),
-          h(Button, { className: 'small', onClick: addEntry }, '新增条目')),
-        entryRows.length === 0 ? h('p', { className: 'dst-muted' }, '世界书还没有条目。') : null,
-        h('div', { className: 'dst-worldbook-list' }, entryRows.map((row, index) => h(WorldbookEntryEditor, { key: row.uiKey, rowKey: row.uiKey, index, entry: row.value, onChange: updateEntry, onRemove: removeEntry }))))
+            h(Field, { label: '搜索世界书条目' }, h('input', { type: 'search', value: query, placeholder: '名称、关键词或正文', onChange: event => setQuery(event.target.value) })),
+            h(Field, { label: '条目状态' }, h('select', { value: enabledFilter, onChange: event => setEnabledFilter(event.target.value) }, h('option', { value: 'all' }, '全部条目'), h('option', { value: 'enabled' }, '已启用'), h('option', { value: 'disabled' }, '已停用')))),
+          h('p', { className: 'dst-muted', role: 'status' }, `显示 ${visibleRows.length} / ${entryRows.length} 条；搜索只影响显示，保存仍保留所有条目。`),
+          entryRows.length === 0 ? h('p', { className: 'dst-muted' }, '世界书还没有条目。') : null,
+          h('div', { className: 'dst-worldbook-list' }, visibleRows.map(({ row, index }) => h(WorldbookEntryEditor, { key: row.uiKey, rowKey: row.uiKey, index, entry: row.value, onChange: updateEntry, onRemove: removeEntry })))))
     }
 
     function WorldbookTab({ session, library, editorSelection, onEditorSelection, reload }) {
@@ -2286,12 +2696,19 @@ self.onmessage = event => {
       const [status, setStatus] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [deleteDialog, setDeleteDialog] = React.useState(null)
+      const pendingEditorWorldbookId = React.useRef(null)
       const editorState = useAsync(signal => editorWorldbookId
         ? api(`/worldbook?sessionId=${encodeURIComponent(session.sessionId)}&id=${encodeURIComponent(editorWorldbookId)}`, { signal })
         : null, [session.sessionId, editorWorldbookId, editorRevision])
+      const loadedEditorWorldbook = editorState.value ? normalizeWorldbookRecord(editorState.value) : null
+      const editorRecordReady = loadedEditorWorldbook?.id === editorWorldbookId
       React.useEffect(() => {
         const available = editorWorldbookId !== '' && worldbooks.some(item => String(item.id) === editorWorldbookId)
-        if (available) return
+        if (available) {
+          if (pendingEditorWorldbookId.current === editorWorldbookId) pendingEditorWorldbookId.current = null
+          return
+        }
+        if (pendingEditorWorldbookId.current === editorWorldbookId) return
         const fallback = worldbooks.some(item => String(item.id) === currentWorldbookId) ? currentWorldbookId : String(worldbooks[0]?.id || '')
         if (fallback !== editorWorldbookId) onEditorSelection(fallback)
       }, [editorWorldbookId, currentWorldbookId, worldbooks.map(item => item.id).join('|')])
@@ -2304,7 +2721,10 @@ self.onmessage = event => {
           const result = await api('/worldbook/create', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, name: name.trim(), book: { name: name.trim(), description: '', entries: [], extensions: {} } }) })
           const created = normalizeWorldbookRecord(result)
           setStatus(`已创建“${created.name || name.trim()}”。`)
-          if (created.id) onEditorSelection(created.id)
+          if (created.id) {
+            pendingEditorWorldbookId.current = created.id
+            onEditorSelection(created.id)
+          }
           overlay.changed(); reload()
         } catch (error) { setStatus(`创建失败：${error instanceof Error ? error.message : String(error)}`) }
         finally { setBusy(false) }
@@ -2316,6 +2736,32 @@ self.onmessage = event => {
           setStatus(value ? '已更新当前 Session 的世界书引用。' : '当前 Session 已不引用世界书。')
           overlay.changed(); reload()
         } catch (error) { setStatus(`绑定失败：${error instanceof Error ? error.message : String(error)}`) }
+        finally { setBusy(false) }
+      }
+      const copyForSession = async () => {
+        const original = editorRecordReady ? loadedEditorWorldbook : null
+        if (!original?.book) return
+        setBusy(true)
+        try {
+          const occupiedNames = new Set(worldbooks.map(worldbook => String(worldbook.name || '')).filter(Boolean))
+          let name
+          let result
+          while (result === undefined) {
+            name = availableWorldbookCopyName(original.name, occupiedNames)
+            try {
+              result = await api('/worldbook/create', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, name, book: { ...original.book, name } }) })
+            } catch (error) {
+              if (error?.code !== 'worldbook-name-conflict' && !/already exists/i.test(String(error?.message || error))) throw error
+              occupiedNames.add(name)
+            }
+          }
+          const created = normalizeWorldbookRecord(result)
+          await api('/session/update', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId, patch: { worldbookId: created.id } }) })
+          pendingEditorWorldbookId.current = created.id
+          onEditorSelection(created.id)
+          setStatus(`已创建“${name}”并用于当前剧情，可以在下方编辑。`)
+          overlay.changed(); reload()
+        } catch (error) { setStatus(`复制失败：${error instanceof Error ? error.message : String(error)}`) }
         finally { setBusy(false) }
       }
       const remove = async confirm => {
@@ -2349,6 +2795,7 @@ self.onmessage = event => {
             worldbooks.map(worldbook => h('option', { key: worldbook.id, value: worldbook.id }, worldbook.name || '未命名世界书')))),
           h('div', { className: 'dst-actions dst-worldbook-resource-actions' },
             h(Button, { className: 'secondary', disabled: busy, onClick: () => void create() }, '新建世界书'),
+            h(Button, { className: 'secondary', disabled: busy || !session.card || !editorRecordReady, onClick: () => void copyForSession() }, '复制到当前剧情再编辑'),
             h(Button, { className: 'danger', disabled: busy || !selectedSummary, onClick: () => setDeleteDialog({ worldbook: selectedSummary, references: null, inspected: false, error: '' }) }, '删除正在编辑的世界书')),
           h(Field, { label: '当前 Session 引用的世界书（与上方编辑选择相互独立）' }, h('select', { value: currentWorldbookId, disabled: busy || !session.card, onChange: event => void bind(event.target.value) },
             h('option', { value: '' }, '不使用世界书'),
@@ -2356,9 +2803,9 @@ self.onmessage = event => {
           h('p', { className: 'dst-muted' }, session.card ? 'Session 保存的是世界书 ID 引用；两个 Session 引用同一本世界书时，编辑该资源会同时影响它们。' : '当前 Session 尚未选择角色卡；仍可管理全局世界书，但暂时不能建立 Session 引用。')),
         status ? h('p', { className: 'dst-status' }, status) : null,
         editorWorldbookId === '' ? h('p', { className: 'dst-muted' }, '请新建或选择一个世界书。') : null,
-        editorState.loading ? h('p', { className: 'dst-loading' }, '正在读取世界书…') : null,
+        editorState.loading || editorWorldbookId !== '' && !editorRecordReady && !editorState.error ? h('p', { className: 'dst-loading' }, '正在读取世界书…') : null,
         editorState.error ? h('p', { className: 'dst-error' }, editorState.error) : null,
-        editorState.value ? h(WorldbookEditor, { key: `${editorWorldbookId}:${editorRevision}`, sessionId: session.sessionId, worldbook: editorState.value, diagnostics, reload: () => { setEditorRevision(value => value + 1); reload() } }) : null,
+        editorRecordReady ? h(WorldbookEditor, { key: `${editorWorldbookId}:${editorRevision}`, sessionId: session.sessionId, worldbook: loadedEditorWorldbook, diagnostics, reload: () => { setEditorRevision(value => value + 1); reload() } }) : null,
         deleteDialog ? h(ConfirmPanel, {
           title: `删除世界书“${deleteDialog.worldbook.name || '未命名世界书'}”`,
           busy,
@@ -2591,6 +3038,7 @@ self.onmessage = event => {
         h('div', { className: 'dst-event-context-form' },
           h('div', { className: 'dst-section-title' }, '剧情上下文'),
           h('p', { className: 'dst-muted' }, '新写记忆使用标准化剧情时间；开始时间必填，结束时间可留空。'),
+          h('p', { className: 'dst-muted' }, '时间标签可按世界观格式补零，并注明原文精度（如日、亿年）；开始和结束坐标保持该时间线原有单位，不因展示补零换算。'),
           h('div', { className: 'dst-inline-fields' },
             h(Field, { label: '时间标签（label）' }, h('input', { value: storyTimeLabel, onChange: event => setStoryTimeLabel(event.target.value) })),
             h(Field, { label: '时间线（timeline，必填）' }, h('input', { required: true, value: storyTimeTimeline, onChange: event => setStoryTimeTimeline(event.target.value) }))),
@@ -3604,7 +4052,12 @@ self.onmessage = event => {
     function trustedDocument(script, channel, initialSnapshot, metadata) {
       script = executableScript(script)
       const bootstrap = compatibilityBootstrap(channel, initialSnapshot, { ...metadata, scriptId: script.id })
-      const sizing = `<script>(()=>{const bridgeChannel=${JSON.stringify(channel)};let frame=0,last=-1,observer;const measure=()=>{frame=0;const root=document.documentElement,body=document.body;const height=Math.ceil(Math.max(root?.offsetHeight||0,body?.scrollHeight||0,body?.offsetHeight||0));if(Number.isFinite(height)&&height>0&&height!==last){last=height;parent.postMessage({__dshSillyTavern:true,channel:bridgeChannel,event:'frame-resize',payload:{height}},'*')}};const schedule=()=>{if(frame===0)frame=requestAnimationFrame(measure)};addEventListener('load',schedule,{once:true});document.fonts?.ready?.then(schedule,()=>{});if(typeof ResizeObserver==='function'){observer=new ResizeObserver(schedule);observer.observe(document.documentElement);if(document.body)observer.observe(document.body)}schedule()})()<\/script>`
+      // Include the body's document-space bottom margin independently of the
+      // current iframe viewport. Otherwise scrollbar removal drops that margin
+      // from rootScroll and starts a shrink/grow loop. Keep the overflow gate
+      // so a collapsed document can still shrink below its previous viewport;
+      // an empty body must not grow just to accommodate its default margins.
+      const sizing = `<script>(()=>{const bridgeChannel=${JSON.stringify(channel)};let frame=0,last=-1,observer;const report=message=>parent.postMessage({__dshSillyTavern:true,channel:bridgeChannel,event:'frame-error',payload:{message:String(message||'Script error')}},'*');addEventListener('error',event=>report(event.error?.stack||event.message));addEventListener('unhandledrejection',event=>report(event.reason?.stack||event.reason));const measure=()=>{frame=0;const root=document.documentElement,body=document.body;const viewport=Math.ceil(root?.clientHeight||0);const rootScroll=Math.ceil(root?.scrollHeight||0);const scrollY=window.scrollY||0;const bodyRect=body?.getBoundingClientRect();const bodyHeight=Math.max(body?.scrollHeight||0,body?.offsetHeight||0,bodyRect?.height||0);const bodyBottom=bodyHeight>0?(bodyRect?.top||0)+scrollY+bodyHeight+(parseFloat(getComputedStyle(body).marginBottom)||0):0;const childBottom=body?[...body.children].reduce((height,node)=>{const rect=node.getBoundingClientRect?.();return rect&&(rect.width>0||rect.height>0)?Math.max(height,Math.ceil(rect.bottom+scrollY)):height},0):0;const height=Math.ceil(Math.max(bodyHeight,bodyBottom,childBottom,(bodyHeight>0||childBottom>0)&&rootScroll>viewport?rootScroll:0));if(Number.isFinite(height)&&height>=0&&height!==last){last=height;parent.postMessage({__dshSillyTavern:true,channel:bridgeChannel,event:'frame-resize',payload:{height}},'*')}};const schedule=()=>{if(frame===0)frame=requestAnimationFrame(measure)};const observeDocument=()=>{if(observer){observer.observe(document.documentElement);if(document.body)observer.observe(document.body)}measure()};addEventListener('load',measure,{once:true});if(document.readyState==='loading')addEventListener('DOMContentLoaded',observeDocument,{once:true});else observeDocument();document.fonts?.ready?.then(schedule,()=>{});if(typeof ResizeObserver==='function')observer=new ResizeObserver(schedule)})()<\/script>`
       const ready = `<script>window.__dshTavernReady?.()<\/script>`
       if (script.kind === 'html') {
         const source = compatibleHtmlSource(script.source)
@@ -3619,7 +4072,7 @@ self.onmessage = event => {
         return `<!doctype html><html><head>${bootstrap}${sizing}</head><body>${source}${ready}</body></html>`
       }
       const encoded = btoa(unescape(encodeURIComponent(String(script.source))))
-      const runner = `<script>(async()=>{const bytes=Uint8Array.from(atob(${JSON.stringify(encoded)}),c=>c.charCodeAt(0));const source=new TextDecoder().decode(bytes);const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));try{await import(url);window.__dshTavernReady?.()}finally{URL.revokeObjectURL(url)}})().catch(error=>{document.body.innerHTML='<pre style="color:#b91c1c;white-space:pre-wrap"></pre>';document.querySelector('pre').textContent=error.stack||String(error)})<\/script>`
+      const runner = `<script>(async()=>{const bytes=Uint8Array.from(atob(${JSON.stringify(encoded)}),c=>c.charCodeAt(0));const source=new TextDecoder().decode(bytes);const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));try{await import(url)}catch(error){document.body.innerHTML='<pre style="color:#b91c1c;white-space:pre-wrap"></pre>';document.querySelector('pre').textContent=error.stack||String(error);parent.postMessage({__dshSillyTavern:true,channel:${JSON.stringify(channel)},event:'frame-error',payload:{message:error.stack||String(error)}},'*')}finally{URL.revokeObjectURL(url);window.__dshTavernReady?.()}})()<\/script>`
       return `<!doctype html><html><head><meta charset="utf-8">${bootstrap}${sizing}<style>body{font:14px/1.5 system-ui;margin:12px;color:#172033}pre{white-space:pre-wrap}</style></head><body><div id="app"></div>${runner}</body></html>`
     }
 
@@ -3667,7 +4120,8 @@ self.onmessage = event => {
     }
 
     function TrustedFrame({ sessionId, script, eventState, className = 'dst-trusted-frame', title, actions, hidden = false, initialSnapshotOverride = null }) {
-      const channel = React.useMemo(() => `dst-${sessionId}-${script.id}-${Math.random().toString(36).slice(2)}`, [sessionId, script.id])
+      const [attempt, setAttempt] = React.useState(0)
+      const channel = React.useMemo(() => `dst-${sessionId}-${script.id}-${Math.random().toString(36).slice(2)}`, [sessionId, script.id, script.source, attempt])
       const frame = React.useRef(null)
       const snapshot = useCompatSnapshot(sessionId)
       const surface = script.id === 'opening-html' ? 'opening' : script.id.startsWith('conversation-') ? 'message' : hidden ? 'background' : 'preview'
@@ -3682,9 +4136,13 @@ self.onmessage = event => {
       }
       const [height, setHeight] = React.useState(null)
       const [armedChannel, setArmedChannel] = React.useState(null)
+      const [renderState, setRenderState] = React.useState({ status: 'loading', error: null })
       const actionsRef = React.useRef(actions)
       actionsRef.current = actions
+      const runtimeReady = boot.current.snapshot !== null
       React.useLayoutEffect(() => {
+        setRenderState({ status: 'loading', error: null })
+        if (!runtimeReady) { setArmedChannel(null); return undefined }
         setHeight(null)
         const unregister = compatRuntime.register({
           channel,
@@ -3693,24 +4151,49 @@ self.onmessage = event => {
           getWindow: () => frame.current?.contentWindow,
           get actions() { return actionsRef.current },
           onResize: next => setHeight(previous => previous === next ? previous : next),
+          onReady: () => setRenderState(previous => previous.error === null ? { status: 'ready', error: null } : previous),
+          onError: error => setRenderState({ status: 'error', error }),
         })
         setArmedChannel(channel)
         return unregister
-      }, [channel, sessionId])
-      const runtimeReady = boot.current.snapshot !== null
+      }, [channel, sessionId, runtimeReady])
+      React.useEffect(() => {
+        if (hidden || renderState.status === 'error' || renderState.status === 'ready' && height !== null) return undefined
+        const timer = window.setTimeout(() => setRenderState({ status: 'error', error: runtimeReady ? '脚本未完成加载或尺寸测量。' : '脚本运行环境未就绪。' }), 8000)
+        return () => window.clearTimeout(timer)
+      }, [channel, hidden, runtimeReady, renderState.status, height])
       const transportReady = typeof window.addEventListener !== 'function' || armedChannel === channel
       const bootMessageId = boot.current.currentMessageId
       const srcDoc = React.useMemo(() => runtimeReady && transportReady ? trustedDocument(script, channel, boot.current.snapshot, { surface, currentMessageId: bootMessageId, currentSourceSeq: sourceSeq }) : '', [channel, script.kind, script.source, runtimeReady, transportReady, surface, bootMessageId, sourceSeq])
-      if (!runtimeReady) return null
-      return h('iframe', {
+      const retry = async () => {
+        setRenderState({ status: 'loading', error: null })
+        setHeight(null)
+        try {
+          if (sessionId) compatRuntime.set(sessionId, await api(`/compat/runtime?sessionId=${encodeURIComponent(sessionId)}`), `frame-reload:${Date.now()}`)
+          setAttempt(value => value + 1)
+        } catch (error) {
+          setRenderState({ status: 'error', error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+      const iframe = runtimeReady ? h('iframe', {
+        key: transportReady ? channel : `${channel}:arming`,
         ref: frame,
         className,
         title: title || script.name,
         'aria-label': title || script.name,
         sandbox: 'allow-scripts allow-forms allow-popups allow-downloads allow-modals',
         srcDoc,
-        style: hidden ? { display: 'none' } : height === null ? undefined : { height, minHeight: 0 },
-      })
+        style: hidden ? { display: 'none' } : height === null ? { position: 'absolute', width: '100%', height: 600, minHeight: 0, visibility: 'hidden', pointerEvents: 'none' } : { height, minHeight: 0 },
+      }) : null
+      if (hidden) return iframe
+      const pending = renderState.status !== 'error' && !(renderState.status === 'ready' && height !== null)
+      const empty = renderState.status === 'ready' && height === 0
+      return h('div', { className: 'dst-trusted-frame-shell' },
+        pending ? h('div', { className: 'dst-script-frame-status', role: 'status' }, runtimeReady ? '正在渲染脚本内容…' : '正在准备脚本运行环境…') : null,
+        renderState.status === 'error' ? h('div', { className: 'dst-script-frame-error', role: 'alert' }, h('span', null, `脚本渲染失败：${renderState.error}`), h(Button, { className: 'secondary small', onClick: () => void retry() }, '重新加载')) : null,
+        empty ? h('div', { className: 'dst-script-frame-status', role: 'status' }, '脚本没有输出可见内容。') : null,
+        iframe,
+        renderState.status === 'error' || empty ? h('details', { className: 'dst-script-frame-source' }, h('summary', null, '查看脚本原文'), h('pre', null, String(script.source || ''))) : null)
     }
 
     function ScriptPreview({ sessionId, script, sample }) {
@@ -3854,11 +4337,62 @@ self.onmessage = event => {
       return { ...state, reload }
     }
 
+    let playerSessions = null
+    const pendingPlayerDrafts = new Map()
+    async function openPlayerBranch(sessionId, cut, draft = '', submit = false) {
+      if (!playerSessions) throw new Error('会话导航尚未就绪')
+      const sessions = playerSessions
+      const created = await api('/player/branch', { method: 'POST', body: JSON.stringify({ sessionId, ...cut }) })
+      const nextId = created.sessionId
+      try { await sessions.refresh() }
+      catch (error) { throw new Error(`新分支已创建，但会话列表刷新失败；稍后刷新列表后可打开该分支。${error instanceof Error ? ` ${error.message}` : ''}`) }
+      if (playerSessions !== sessions || sessions.list.getSnapshot().current !== sessionId) {
+        window.alert('新分支已创建。你已切换到其他会话，可稍后从会话列表打开新分支。')
+        return { sessionId: nextId, opened: false }
+      }
+      pendingPlayerDrafts.set(nextId, { text: draft, submit })
+      try { sessions.open(nextId) }
+      catch (error) { pendingPlayerDrafts.delete(nextId); throw error }
+      overlay.close()
+      return { sessionId: nextId, opened: true }
+    }
+
+    function PlayerNewStory({ sessionId }) {
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const create = async () => {
+        setBusy(true); setError('')
+        try { await openPlayerBranch(sessionId, { fresh: true }) }
+        catch (error) { setError(error.message) }
+        finally { setBusy(false) }
+      }
+      return h('div', { className: 'dst-player-new-story' }, h(Button, { className: 'secondary small', disabled: busy, onClick: () => void create() }, busy ? '正在创建新剧情…' : '用当前角色开启新剧情'), error ? h('span', { role: 'alert' }, error) : null)
+    }
+
+    function ForkInheritanceNotice({ session, reload }) {
+      const inheritance = session?.fork?.inheritance
+      const [busy, setBusy] = React.useState(false)
+      const [notice, setNotice] = React.useState('')
+      if (!inheritance) return null
+      const repair = async () => {
+        setBusy(true)
+        try {
+          await api('/session/repair-fork', { method: 'POST', body: JSON.stringify({ sessionId: session.sessionId }) })
+          setNotice('已从来源剧情恢复分支设定。'); overlay.changed(); reload()
+        } catch (error) { setNotice(`恢复失败：${error instanceof Error ? error.message : String(error)}`) }
+        finally { setBusy(false) }
+      }
+      return h('section', { className: inheritance.exact ? 'dst-muted' : 'dst-warning' },
+        h('p', null, inheritance.exact ? '角色与剧情状态已按分支点继承。' : inheritance.status === 'repairable' ? '这个旧分支缺少角色与剧情状态记录。可以从来源剧情恢复设定；缺少历史快照的部分将采用来源剧情的当前设定，无法精确还原当时的状态。' : inheritance.status === 'unavailable' ? '这个分支缺少可恢复的来源记录，暂时无法还原剧情设定。' : '已继承来源剧情的设定。部分旧状态没有历史快照，不能保证与分支时完全一致，请核对玩家设定与剧情记忆。'),
+        inheritance.status === 'repairable' && inheritance.repairable ? h(Button, { className: 'secondary small', disabled: busy, onClick: () => void repair() }, busy ? '正在恢复…' : '从来源剧情恢复分支设定') : null,
+        notice ? h('p', { role: 'status' }, notice) : null)
+    }
+
     function ManagerContent({ sessionId }) {
       const state = useTavernSettings(sessionId)
       const [tab, setTab] = React.useState('library')
       if (!sessionId) return h('div', { className: 'dst-warning' }, '酒馆数据按工作区隔离。请从一个具体 Session 的角色菜单打开管理页。')
-      if (state.loading) return h('div', { className: 'dst-loading' }, '正在读取酒馆数据…')
+      if (state.loading && !state.value) return h('div', { className: 'dst-loading' }, '正在读取酒馆数据…')
       if (state.error) return h('div', { className: 'dst-error' }, state.error)
       if (!state.value) return null
       const { library, session } = state.value
@@ -3866,6 +4400,8 @@ self.onmessage = event => {
       const tabs = [['library', '角色库'], ['card', '角色卡'], ['scripts', '角色脚本']]
       return h('div', { className: 'dst-manager-content' },
         session?.card ? h('div', { className: 'dst-current' }, `当前角色：${session.card.card.data.nickname || session.card.card.data.name}`) : sessionId ? h('div', { className: 'dst-current empty' }, '当前会话尚未绑定角色') : null,
+        h(ForkInheritanceNotice, { session, reload }),
+        session?.card ? h(PlayerNewStory, { sessionId }) : null,
         h('p', { className: 'dst-manager-hint' }, '世界书、用户设定/变量、工作区脚本和提示词模板已移到对话旁的标签页；事件在“时间线”中查看和编辑。'),
         h('nav', { className: 'dst-tabs' }, tabs.map(([id, label]) => h(Button, { key: id, className: tab === id ? 'tab active' : 'tab', onClick: () => { if (id === tab) return; setTab(id); if (tab === 'scripts') reload() } }, label))),
         h('div', { className: 'dst-tab-body' },
@@ -3878,13 +4414,13 @@ self.onmessage = event => {
       const state = useTavernSettings(sessionId)
       const [worldbookEditorId, setWorldbookEditorId] = React.useState(null)
       const reload = React.useCallback(() => { state.reload(); onSaved?.() }, [state.reload, onSaved])
-      if (state.loading) return h('div', { className: 'dst-loading', role: 'status' }, '正在读取酒馆数据…')
+      if (state.loading && !state.value) return h('div', { className: 'dst-loading', role: 'status' }, '正在读取酒馆数据…')
       if (state.error) return h('div', { className: 'dst-error', role: 'alert' }, state.error, h(Button, { className: 'secondary small', onClick: reload }, '重试'))
       if (!state.value) return null
       const { library, session } = state.value
       return h('div', { className: 'dst-session-content' },
         page === 'worldbook' ? h(WorldbookTab, { key: sessionId, session, library, editorSelection: worldbookEditorId, onEditorSelection: setWorldbookEditorId, reload }) : null,
-        page === 'persona' ? h(PersonaTab, { key: `${sessionId}:${session.binding?.revision ?? 0}:${session.regexRevision ?? 0}`, session, reload }) : null,
+        page === 'persona' ? h(PersonaTab, { key: sessionId, session, reload }) : null,
         page === 'event' ? h(EventTab, { key: `${sessionId}:${session.event?.revision ?? 0}`, session, reload }) : null,
         page === 'scripts' ? h(ScriptsTab, { key: `${sessionId}:${session.regexRevision ?? 0}`, session, scope: 'workspace', reload }) : null,
         page === 'templates' ? h(TemplatesTab, { library, sessionId, reload }) : null)
@@ -3928,7 +4464,7 @@ self.onmessage = event => {
         const measure = () => {
           // Expanded chrome: 16px mug + 14px chevron + 16px padding + two 4px gaps.
           // The hidden label keeps its natural width, so collapsing cannot cause a toggle loop.
-          const expandedWidth = text.getBoundingClientRect().width + 54
+          const expandedWidth = Math.min(text.getBoundingClientRect().width + 54, 180)
           let fits = expandedWidth <= 180
           if (fits && row) {
             const style = getComputedStyle(row)
@@ -4235,6 +4771,89 @@ self.onmessage = event => {
         rendered.status === 'error' ? h('p', { className: 'dst-script-render-error' }, `脚本渲染失败：${rendered.message}`) : null)
     }
 
+    function TavernMessageActions({ sessionId, messageId }) {
+      const recovery = useAsync(signal => api(`/player/recovery?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, messageId])
+      const entry = recovery.value?.turns?.find(turn => turn.assistantIds.includes(messageId))
+      const [editing, setEditing] = React.useState(false)
+      const [draft, setDraft] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const branch = async (cut, text, submit) => {
+        setBusy(true); setError('')
+        try { await openPlayerBranch(sessionId, cut, text, submit) }
+        catch (error) { setError(error.message) }
+        finally { setBusy(false) }
+      }
+      if (!entry) return null
+      const retryText = Object.hasOwn(entry, 'retryText') ? entry.retryText : entry.text
+      const hasSteering = typeof entry.steeringText === 'string' && entry.steeringText.trim() !== ''
+      const canContinue = entry.reason === 'completed'
+      const action = (label, Icon, unavailable, description, onClick) => h(Tooltip, { label: description || label, side: 'bottom' },
+        h('button', {
+          type: 'button', className: 'dst-player-message-action',
+          'aria-label': label, 'aria-description': description || undefined,
+          'aria-disabled': unavailable || undefined,
+          onClick: unavailable ? undefined : onClick,
+        }, h('span', { 'aria-hidden': true }, h(Icon))))
+      return h('div', { className: 'dst-player-message-actions' },
+        action('重生成 · 保留原分支', IconRefreshOutline16, busy || !retryText, busy ? '正在创建分支…' : !retryText ? '本轮没有可重放的行动' : '', () => void branch({ beforeTurn: entry.turn }, retryText, true)),
+        action('编辑行动后重试', IconEditOutline16, busy || !retryText, busy ? '正在创建分支…' : !retryText ? '本轮没有可编辑的行动' : '', () => { setDraft(retryText); setEditing(true) }),
+        action('从这里继续', IconRightUpOutline16, busy || !canContinue, busy ? '正在创建分支…' : !canContinue ? '这轮回复未完成，不能从回复之后继续' : '从这里继续：在本轮之后创建新剧情分支', () => void branch({ afterTurn: entry.turn }, '', false)),
+        hasSteering ? h('div', { className: 'dst-muted' }, h('p', null, '本轮还有中途追加的行动。重生成只会自动重放开场行动；请在新回复生成时按需要再次追加：'), h('blockquote', null, entry.steeringText)) : null,
+        editing ? h('div', { className: 'dst-player-action-editor' },
+          h('textarea', { 'aria-label': '修改本轮行动', value: draft, disabled: busy, onChange: event => setDraft(event.target.value), rows: 4 }),
+          h('p', { className: 'dst-muted' }, '会从本轮行动之前创建新分支，保留原来的剧情候选。'),
+          h(Button, { disabled: busy || !draft.trim(), onClick: () => void branch({ beforeTurn: entry.turn }, draft, true) }, busy ? '正在创建分支…' : '在新分支生成'),
+          h(Button, { className: 'secondary', disabled: busy, onClick: () => setEditing(false) }, '取消')) : null,
+        error ? h('p', { role: 'alert' }, error) : null)
+    }
+
+    function TavernFailureNode({ node, sessionId, useInput, inputActions }) {
+      const recovery = useAsync(signal => api(`/player/recovery?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, node.data.seq])
+      const draft = String(useInput(state => state.draft) ?? '')
+      const phase = useInput(state => state.phase)
+      const [notice, setNotice] = React.useState('')
+      const failed = recovery.value?.failedTurns?.find(item => item.turn === node.data.turn)
+      const hasStructuredRecovery = failed && Object.hasOwn(failed, 'retryText')
+      const retryText = hasStructuredRecovery ? failed.retryText : failed?.text || ''
+      const retryInputs = hasStructuredRecovery ? failed.inputs?.filter(item => item.target === 'next-turn') || [] : failed?.inputs || []
+      const persisted = retryInputs.some(item => item.persisted)
+      const hasSteering = typeof failed?.steeringText === 'string' && failed.steeringText.trim() !== ''
+      const needsBranch = recovery.value?.turns?.some(item => item.turn > (failed?.turn ?? Infinity)) === true
+      const technical = String(node.data.message || failed?.error?.message || '未知错误')
+      const reason = /callback|barrier|owner disconnected/i.test(technical)
+        ? '角色脚本暂时没有完成响应，这轮剧情未能继续。'
+        : '这轮回复没有生成完成，可以恢复行动后继续。'
+      const restore = () => {
+        const original = retryText
+        inputActions.setDraft(draft.trim() && draft !== original ? `${draft}\n${original}` : original)
+        setNotice('行动已恢复到输入框，可以编辑后发送。')
+      }
+      const retry = async () => {
+        if (needsBranch) {
+          try { await openPlayerBranch(sessionId, { beforeTurn: failed.turn }, retryText, true) }
+          catch (error) { setNotice(`创建重试分支失败：${error.message}`) }
+          return
+        }
+        inputActions.setDraft(persisted ? '请继续完成上一条尚未完成的玩家行动，从中断处继续剧情。' : retryText)
+        inputActions.submit()
+        setNotice(persisted ? '已请求继续未完成的回复。' : '已重新发送这轮行动。')
+      }
+      return h('section', { className: 'dst-player-failure', role: 'alert' },
+        h('strong', null, '本轮剧情未完成'), h('p', null, reason),
+        failed?.text ? h(React.Fragment, null,
+          h('div', { className: 'dst-muted' }, '你的行动'), h('blockquote', null, failed.text),
+          hasSteering ? h('p', { className: 'dst-muted' }, '其中包含本轮中途追加的行动；自动重试只会重放开场行动，请在新回复生成时按需要再次追加。') : null,
+          h('p', { className: 'dst-muted' }, persisted ? '开场行动已在对话中，继续时会接着已有内容生成。' : hasSteering ? '开场行动尚未写入剧情上下文，重试会重新发送开场行动。' : '行动尚未写入剧情上下文，重试会重新发送这段原文。'),
+          h('div', { className: 'dst-actions' },
+            h(Button, { className: 'secondary', disabled: phase !== 'plain', onClick: restore }, '恢复输入 / 编辑'),
+            h(Button, { disabled: phase !== 'plain' || draft.trim() !== '', onClick: () => void retry(), title: draft.trim() ? '请先处理输入框中的草稿' : undefined }, needsBranch ? '从这轮创建重试分支' : persisted ? '继续未完成的回复' : '重试这轮')),
+          draft.trim() ? h('p', { className: 'dst-muted' }, '输入框中已有草稿；处理后可直接重试，恢复输入会追加到现有草稿。') : null)
+          : h('p', { className: 'dst-muted' }, recovery.loading ? '正在找回这轮行动…' : recovery.error ? `读取行动失败：${recovery.error}` : '这轮没有可恢复的玩家文字，请在输入框中继续。'),
+        notice ? h('p', { className: 'dst-status', role: 'status' }, notice) : null,
+        h('details', null, h('summary', null, '技术详情'), h('pre', null, technical)))
+    }
+
     function TavernUserNode({ node, renderMessageImages, sessionId }) {
       const scripts = useSessionStore(scriptPolicies, sessionId)
       const scope = useSessionStore(scriptScopes, sessionId)
@@ -4278,7 +4897,7 @@ self.onmessage = event => {
     }
 
     function TavernCharacterSelect({ sessionId, blocks, registerMessageRenderers, appendInput }) {
-      const version = useOverlay().version
+      const version = useOverlay().dataVersion
       const eventState = useSessionEventState(sessionId)
       const eventCardId = eventState?.card?.id || null
       const session = useAsync(signal => api(`/session?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version, eventCardId])
@@ -4286,11 +4905,14 @@ self.onmessage = event => {
       const library = useAsync(signal => api(`/library?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version])
       const verifiedScripts = useSessionStore(scriptPolicies, sessionId)
       const [busy, setBusy] = React.useState(false)
+      const [replacement, setReplacement] = React.useState(null)
+      const [selectionError, setSelectionError] = React.useState('')
       const ownedBlock = React.useRef(Object.freeze({ reason: '正在切换角色卡…' }))
       const previousBlock = React.useRef(undefined)
       const appendInputRef = React.useRef(appendInput)
       appendInputRef.current = appendInput
-      const cardRecord = session.value?.card
+      const cardRecord = session.value?.card || compatibility.value?.cardRecord
+      const previewBinding = session.value?.binding || compatibility.value?.state?.binding
       const eventTail = eventState?.history?.at(-1)?.seq ?? -1
       const eventCursor = eventState?.cursor ?? -1
       const compatChatRevision = eventState?.compatChatRevision ?? -1
@@ -4340,15 +4962,15 @@ self.onmessage = event => {
           card: cardRecord?.card || null,
           character: data,
           char: data.nickname || data.name || 'Character',
-          user: session.value?.binding?.userPersona?.name || 'User',
-          persona: session.value?.binding?.userPersona || { name: 'User', description: '' },
-          variables: session.value?.binding?.variables || {},
+          user: previewBinding?.userPersona?.name || compatibility.value?.persona?.name || 'User',
+          persona: previewBinding?.userPersona || compatibility.value?.persona || { name: 'User', description: '' },
+          variables: previewBinding?.variables || {},
           globalVariables: session.value?.globalVariables || {},
-          currentSwipeId: Number(session.value?.binding?.openingSwipeId || 0),
+          currentSwipeId: Number(previewBinding?.openingSwipeId || 0),
           messages,
         }
-        scriptScopes.set(sessionId, scope, `${cardRecord?.id || 'none'}:${session.value?.binding?.revision || 0}:${eventCursor}:${compatChatRevision}:${globalVariablesToken}`)
-      }, [sessionId, cardRecord?.id, cardRecord?.updatedAt, session.value?.binding?.revision, eventCursor, compatChatRevision, globalVariablesToken])
+        scriptScopes.set(sessionId, scope, `${cardRecord?.id || 'none'}:${previewBinding?.revision || 0}:${eventCursor}:${compatChatRevision}:${globalVariablesToken}`)
+      }, [sessionId, cardRecord?.id, cardRecord?.updatedAt, previewBinding?.revision, eventCursor, compatChatRevision, globalVariablesToken])
       React.useEffect(() => {
         scriptEvents.set(sessionId, eventState, `${eventCursor}:${compatChatRevision}:${eventTail}:${eventState?.history?.length || 0}:${eventState?.unavailable === true}:${eventState?.card?.id || 'none'}`)
       }, [sessionId, eventState, eventCursor, compatChatRevision, eventTail])
@@ -4357,23 +4979,27 @@ self.onmessage = event => {
         previousBlock.current = undefined
       }
       React.useEffect(() => releaseBlock, [sessionId, blocks])
-      if (session.error || session.loading || compatibility.error || compatibility.loading || library.error || library.loading) return null
-      const currentId = session.value?.binding?.cardId || ''
-      const locked = currentId !== '' && sessionHasStarted(session.value)
-      const selectCard = async id => {
-        if (!id || id === currentId || busy) return
-        if (locked) { window.alert('当前会话已经开始对话，不能更换角色卡。'); return }
+      if (session.error || compatibility.error || library.error) return h('span', { className: 'dst-character-load-error', role: 'status' }, '角色设置加载失败 ', h(Button, { className: 'secondary small', onClick: () => overlay.changed() }, '重试'), h(Button, { className: 'secondary small', onClick: () => overlay.open('manager', sessionId) }, '管理酒馆模式'))
+      if (!session.value || !compatibility.value || !library.value) return h('span', { className: 'dst-muted' }, '正在加载角色…')
+      const currentId = session.value?.binding?.cardId || cardRecord?.id || ''
+      const locked = Boolean(session.value?.binding?.cardId) && sessionHasStarted(session.value)
+      const selectCard = async (id, confirmed = false) => {
+        if (!id || id === session.value?.binding?.cardId || busy) return
+        if (locked) { setSelectionError('当前会话已经开始对话，不能更换角色卡。'); return }
         const currentName = cardLabel(session.value?.card?.card?.data)
         const next = library.value.cards.find(card => card.id === id)
-        if (currentId && !window.confirm(`将当前角色“${currentName}”替换为“${cardLabel(next)}”？`)) return
+        const boundCardId = session.value?.binding?.cardId || null
+        setSelectionError('')
+        if (boundCardId && !confirmed) { setReplacement({ id, sessionId, boundCardId, currentName, nextName: cardLabel(next) }); return }
         previousBlock.current = blocks.storeFor(sessionId).getSnapshot()
         blocks.set(sessionId, ownedBlock.current)
         setBusy(true)
         try {
-          await api('/bind', { method: 'POST', body: JSON.stringify({ sessionId, cardId: id, replace: currentId !== '', expectedCardId: currentId || null }) })
+          await api('/bind', { method: 'POST', body: JSON.stringify({ sessionId, cardId: id, replace: boundCardId !== null, expectedCardId: boundCardId }) })
+          setReplacement(null)
           overlay.changed()
         } catch (error) {
-          window.alert(`切换角色失败：${error instanceof Error ? error.message : String(error)}`)
+          setSelectionError(`切换角色失败：${error instanceof Error ? error.message : String(error)}`)
         } finally {
           releaseBlock()
           setBusy(false)
@@ -4391,6 +5017,8 @@ self.onmessage = event => {
           onChange: id => { void selectCard(id) },
           onManage: () => overlay.open('manager', sessionId),
         }),
+        replacement && replacement.sessionId === sessionId && replacement.boundCardId === session.value?.binding?.cardId ? h(ConfirmPanel, { title: '更换当前角色', busy, danger: false, confirmLabel: '确认更换', onCancel: () => { setReplacement(null); setSelectionError('') }, onConfirm: () => { void selectCard(replacement.id, true) } }, h('p', null, `将当前角色“${replacement.currentName}”替换为“${replacement.nextName}”？`), selectionError ? h('p', { role: 'status', className: 'dst-error' }, selectionError) : null) : null,
+        selectionError && !replacement ? h('span', { role: 'status', className: 'dst-error' }, selectionError) : null,
         ...backgroundScripts.map(script => h(TrustedFrame, { key: `background:${cardRecord?.id || 'none'}:${script.id}:${script.approvedHash}`, sessionId, script, eventState, hidden: true, title: `${script.name} 后台脚本` })))
     }
 
@@ -4398,13 +5026,43 @@ self.onmessage = event => {
       return summary?.projectionValues?.agentPreset ?? summary?.agentPreset
     }
 
+    let pendingSourceJump = null
     function TavernEventsSession(props) {
       const state = props.useEventExplorer(value => value)
       const [editing, setEditing] = React.useState(false)
       if (editing) return h('section', { className: 'dst-session-page', 'data-session-id': props.sessionId, 'data-conversation-composer-overlay': '' },
         h('header', { className: 'dst-session-header' }, h('h1', null, '编辑事件'), h(Button, { className: 'secondary small', onClick: () => { props.refreshEvents(); setEditing(false) } }, '返回时间线')),
         h(SessionSettingsContent, { key: props.sessionId, sessionId: props.sessionId, page: 'event', onSaved: props.refreshEvents }))
-      return h(eventExplorerUI.EventExplorer, { ...state, sessionId: props.sessionId, onRefresh: props.refreshEvents, onEdit: () => setEditing(true) })
+      const openSource = ref => {
+        const turn = Number(ref.turn)
+        pendingSourceJump?.()
+        const scope = [...document.querySelectorAll('.dst-explorer-root[data-session-id]')].find(element => element.dataset.sessionId === props.sessionId)?.closest('[data-phase]')
+        props.openView('chat', `turn:${turn}`)
+        return new Promise((resolve, reject) => {
+          let timer
+          const cleanup = () => { observer.disconnect(); clearTimeout(timer); if (pendingSourceJump === cancel) pendingSourceJump = null }
+          const cancel = () => { cleanup(); resolve() }
+          const observer = new MutationObserver(locate)
+          pendingSourceJump = cancel
+          function locate() {
+            if (props.isCurrentSession?.() === false) { cancel(); return true }
+            const labels = [`跳转到第 ${turn} 轮`, `加载并跳转到第 ${turn} 轮`, `Jump to turn ${turn}`, `Load and jump to turn ${turn}`]
+            const button = [...(scope?.querySelectorAll('nav button[aria-label], [aria-label="轮次导航"] button, [aria-label="Turn navigation"] button') || [])].find(item => labels.includes(item.getAttribute('aria-label')))
+            if (!button) return false
+            cleanup()
+            button.click(); resolve(); return true
+          }
+          if (locate()) return
+          observer.observe(document.body, { childList: true, subtree: true })
+          timer = setTimeout(() => {
+            cleanup()
+            if (props.isCurrentSession?.() === false) { resolve(); return }
+            const message = `已打开对话，请在轮次导航中选择第 ${turn} 轮。`
+            window.alert(message); reject(new Error(message))
+          }, 5000)
+        })
+      }
+      return h(eventExplorerUI.EventExplorer, { ...state, sessionId: props.sessionId, onRefresh: props.refreshEvents, onEdit: () => setEditing(true), onOpenSource: openSource })
     }
 
     function TavernEventsView(props) {
@@ -4425,6 +5083,54 @@ self.onmessage = event => {
     function TavernPersonaView(props) { return h(TavernSettingsView, { ...props, page: 'persona', title: '用户设定/变量' }) }
     function TavernScriptsView(props) { return h(TavernSettingsView, { ...props, page: 'scripts', title: '脚本' }) }
     function TavernTemplatesView(props) { return h(TavernSettingsView, { ...props, page: 'templates', title: '提示词模板' }) }
+
+    function TavernPlayerChrome({ children, sessionId, inputActions, phase }) {
+      const [advanced, setAdvanced] = React.useState(false)
+      const marker = React.useRef(null)
+      React.useEffect(() => {
+        const pending = pendingPlayerDrafts.get(sessionId)
+        if (!pending || phase !== 'plain') return
+        pendingPlayerDrafts.delete(sessionId)
+        inputActions.setDraft(pending.text)
+        if (pending.submit) inputActions.submit()
+      }, [sessionId, inputActions, phase])
+      React.useLayoutEffect(() => {
+        const root = marker.current?.closest('[data-phase]')
+        if (!root) return
+        root.dataset.dstPlayerTools = advanced ? 'expanded' : 'collapsed'
+        const original = new Map()
+        const placeholder = '输入你的行动或台词…'
+        const update = () => {
+          for (const input of root.querySelectorAll('[data-composer-input]')) {
+            if (!original.has(input)) original.set(input, { label: input.getAttribute('aria-label'), placeholder: input.getAttribute('data-placeholder') })
+            if (input.getAttribute('aria-label') !== placeholder) input.setAttribute('aria-label', placeholder)
+            if (input.getAttribute('data-placeholder') !== placeholder) input.setAttribute('data-placeholder', placeholder)
+          }
+          for (const hint of root.querySelectorAll('[data-composer-placeholder]')) {
+            if (!original.has(hint)) original.set(hint, { text: hint.textContent })
+            if (hint.textContent !== placeholder) hint.textContent = placeholder
+          }
+        }
+        update()
+        const observer = new MutationObserver(update)
+        observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-label', 'data-placeholder'] })
+        return () => {
+          observer.disconnect()
+          delete root.dataset.dstPlayerTools
+          for (const [element, value] of original) {
+            if (value.text !== undefined) { if (element.textContent === placeholder) element.textContent = value.text; continue }
+            for (const [name, text] of [['aria-label', value.label], ['data-placeholder', value.placeholder]]) if (element.getAttribute(name) === placeholder) {
+              if (text === null) element.removeAttribute(name); else element.setAttribute(name, text)
+            }
+          }
+        }
+      }, [sessionId, advanced])
+      const toolsLabel = advanced ? '收起高级工具' : '高级工具'
+      return h('div', { ref: marker, style: { display: 'contents' } }, children,
+        h(Button, { className: 'dst-player-advanced', title: toolsLabel, 'aria-label': toolsLabel, 'aria-expanded': advanced, onClick: () => setAdvanced(value => !value) },
+          h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true, focusable: false },
+            h('path', { d: 'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.77 3.77Z' }))))
+    }
 
     function ComposerCharacterSelect(props) {
       const agentPreset = props.useSessions(state => sessionAgentPreset(state.byId[props.sessionId]))
@@ -4447,7 +5153,7 @@ self.onmessage = event => {
         inputActions.setDraft(next)
         return { draft: next }
       }, [])
-      return agentPreset === 'sillytavern' ? h(TavernCharacterSelect, { ...props, appendInput }) : null
+      return agentPreset === 'sillytavern' ? h(TavernPlayerChrome, { sessionId: props.sessionId, inputActions: props.inputActions, phase }, h(TavernCharacterSelect, { ...props, appendInput })) : null
     }
 
     function greetingSegments(input, allowHtmlFragments = false, stripOpeningMarkers = true) {
@@ -4552,14 +5258,18 @@ self.onmessage = event => {
         if (rules.length > 0 && String(text || '') !== '') regexEngine.run(text, rules, controller.signal, { placement: 2, isMarkdown: true, depth }, scope).then(value => { if (!controller.signal.aborted) setRendered(value.text) }).catch(() => undefined)
         return () => controller.abort()
       }, [text, fingerprint, scope, depth])
-      return h(GreetingContent, { ...props, sessionId, text: rendered })
+      const personalized = String(rendered ?? '').replace(/<(user|char)>/gi, (_match, name) => String(name.toLowerCase() === 'user' ? scope?.user || 'User' : scope?.char || 'Character'))
+      return h(GreetingContent, { ...props, sessionId, text: personalized })
     }
 
     function TavernOpeningGreetingContent({ sessionId, version }) {
       const [swipeId, setSwipeId] = React.useState(null)
       const [notice, setNotice] = React.useState(null)
+      const [reloadVersion, setReloadVersion] = React.useState(0)
+      const [selecting, setSelecting] = React.useState(false)
+      const sectionRef = React.useRef(null)
       const preparedSwipes = React.useRef(new Map())
-      const greeting = useAsync(signal => api(`/greeting?sessionId=${encodeURIComponent(sessionId)}${swipeId === null ? '' : `&swipeId=${swipeId}`}`, { signal }), [sessionId, version, swipeId])
+      const greeting = useAsync(signal => api(`/greeting?sessionId=${encodeURIComponent(sessionId)}${swipeId === null ? '' : `&swipeId=${swipeId}`}`, { signal }), [sessionId, version, swipeId, reloadVersion])
       const openingRuntime = useAsync(signal => api(`/compat/runtime?sessionId=${encodeURIComponent(sessionId)}`, { signal }), [sessionId, version, swipeId])
       React.useEffect(() => {
         if (openingRuntime.value) compatRuntime.set(sessionId, openingRuntime.value, `opening:${openingRuntime.value.bindingRevision}:${openingRuntime.value.cardRecord?.id || 'none'}:${openingRuntime.value.chatRevision ?? -1}`)
@@ -4594,8 +5304,25 @@ self.onmessage = event => {
         setNotice(next)
         return next.text
       }, [])
-      if (greeting.error || !greeting.value?.text) return null
+      React.useLayoutEffect(() => {
+        const content = sectionRef.current?.querySelector('.dst-opening-text')
+        if (content) content.scrollTop = 0
+      }, [greeting.value?.text])
+      const chooseOpening = async nextSwipe => {
+        setSelecting(true)
+        try {
+          const selected = await api('/opening/select', { method: 'POST', body: JSON.stringify({ sessionId, swipeId: nextSwipe }) })
+          setSwipeId(Number(selected.swipeId))
+          setNotice({ severity: 'info', text: '开场已切换。输入你的行动或台词开始剧情。' })
+        } catch (error) { setNotice({ severity: 'error', text: `切换失败：${error.message}` }) }
+        finally { setSelecting(false) }
+      }
+      if (greeting.error) return h('div', { className: 'dst-error', role: 'alert' }, `开场加载失败：${greeting.error}`, h(Button, { onClick: () => setReloadVersion(value => value + 1) }, '重新加载开场'))
+      if (!greeting.value?.text) return h('div', { className: 'dst-opening-empty', role: 'status' }, greeting.loading ? '正在加载角色开场…' : '先选择角色卡，再选择开场并填写玩家身份。', h(Button, { onClick: () => overlay.open('manager', sessionId) }, '选择或导入角色卡'))
+      const selectedSwipe = Number(greeting.value.swipeId || 0)
+      const swipeCount = Number(greeting.value.swipeCount || 1)
       return h('section', {
+        ref: sectionRef,
         className: 'dst-opening-greeting',
         'aria-label': '角色开场预览',
         'aria-live': 'polite',
@@ -4603,13 +5330,18 @@ self.onmessage = event => {
       },
       h('header', { className: 'dst-opening-header' },
         h(TavernMugIcon, { className: 'dst-opening-icon' }),
-        h('strong', { className: 'dst-opening-name' }, greeting.value.characterName)),
+        h('strong', { className: 'dst-opening-name' }, greeting.value.characterName),
+        swipeCount > 1 ? h('div', { className: 'dst-actions dst-opening-controls' },
+          h(Button, { className: 'secondary small', disabled: selecting || selectedSwipe === 0, onClick: () => void chooseOpening(selectedSwipe - 1) }, '上一开场'),
+          h('select', { 'aria-label': '选择开场', value: selectedSwipe, disabled: selecting, onChange: event => void chooseOpening(Number(event.target.value)) }, Array.from({ length: swipeCount }, (_, index) => h('option', { key: index, value: index }, index === 0 ? '角色介绍 / 初始开场' : `开场 ${index + 1}`))),
+          h(Button, { className: 'secondary small', disabled: selecting || selectedSwipe === swipeCount - 1, onClick: () => void chooseOpening(selectedSwipe + 1) }, '下一开场'),
+          selectedSwipe > 0 ? h(Button, { className: 'secondary small', disabled: selecting, onClick: () => void chooseOpening(0) }, '重新选开场') : null) : null),
       h(RegexGreetingContent, { sessionId, text: greeting.value.text, onSetChatMessages: setChatMessages, onCommitSwipe: commitSwipe, onTriggerSlash: triggerSlash }),
       h('footer', { className: `dst-opening-hint${notice ? ` ${notice.severity}` : ''}`, role: notice ? 'status' : undefined }, notice?.text || '发送第一条消息后开始对话'))
     }
 
     function TavernOpeningGreeting({ sessionId }) {
-      const version = useOverlay().version
+      const version = useOverlay().dataVersion
       return h(TavernOpeningGreetingContent, { key: sessionId, sessionId, version })
     }
 
@@ -4678,27 +5410,41 @@ self.onmessage = event => {
 .dst-opening-greeting{box-sizing:border-box;width:100%;height:max(320px,calc(100dvh - 260px));min-height:0;margin:0 0 8px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1,#dfe3ea);border-radius:16px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#182033);box-shadow:0 4px 18px rgba(15,23,42,.06);font:14px/1.55 system-ui,sans-serif;display:flex;flex:0 0 auto;flex-direction:column;overflow:hidden}.dst-opening-header{display:flex;flex:0 0 auto;align-items:center;gap:7px;margin-bottom:8px}.dst-opening-icon{flex:0 0 auto;color:var(--dsw-alias-brand-primary,#326fd1)}.dst-opening-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.dst-opening-text{display:flex;flex:1 1 auto;flex-direction:column;gap:10px;min-height:0;max-height:none;overflow:auto;white-space:normal;overflow-wrap:anywhere}.dst-opening-html{display:block;box-sizing:border-box;width:100%;height:auto;min-height:0;flex:0 0 auto;border:0;border-radius:10px;background:var(--dsw-alias-bg-base,#fff)}.dst-opening-hint{flex:0 0 auto;margin-top:9px;color:var(--dsw-alias-label-secondary,#64748b);font-size:12px}.dst-opening-message{box-sizing:border-box;width:100%;padding:4px 16px 12px;color:var(--dsw-alias-label-primary,#182033);font:15px/1.65 system-ui,sans-serif}.dst-opening-message .dst-opening-text{display:flex;flex-direction:column;gap:10px;max-height:none;overflow:visible}.dst-opening-message .dst-opening-html{min-height:0;flex:0 0 auto}@media(max-width:560px){.dst-opening-greeting{height:max(320px,calc(100dvh - 300px))}}.dst-composer-character{display:inline-flex;align-items:center;min-width:0;max-width:min(100%,220px);flex:0 1 auto}.dst-character-menu{min-width:0;max-width:100%;flex:0 1 auto}.dst-character-seat{position:relative;display:inline-flex;align-items:center;gap:4px;box-sizing:border-box;max-width:min(100%,220px);min-width:0;min-height:28px;padding:0 8px;border:0;border-radius:16px;background:transparent;color:var(--dsw-alias-label-primary,var(--dsh-text,#182033));font:500 13px/20px system-ui,sans-serif;white-space:nowrap;overflow:hidden;cursor:pointer}.dst-character-seat:not(:disabled):hover,.dst-character-seat[aria-expanded='true']{background:var(--dsw-alias-interactive-bg-hover,#eef2f7)}.dst-character-seat:disabled{cursor:default;color:var(--dsw-alias-label-quaternary,#9aa1ad)}.dst-character-seat.compact{max-width:180px}.dst-character-icon,.dst-character-chevron{flex:0 0 auto;color:var(--dsw-alias-label-primary,#182033)}.dst-character-chevron{color:var(--dsw-alias-label-caption,#81858c)}.dst-character-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dst-character-seat.compact .dst-character-label{flex:0 0 auto;width:max-content}.dst-character-seat.compact.icon-only{width:28px;max-width:28px;flex:0 0 28px;justify-content:center;padding:0 6px}.dst-character-seat.compact.icon-only .dst-character-label{position:absolute;visibility:hidden;pointer-events:none}.dst-character-seat.compact.icon-only .dst-character-chevron{display:none}.dst-character-seat:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#8fb5f5);outline-offset:2px}
 `
     const RUNTIME_CSS = `
+.dst-trusted-frame-shell{position:relative;display:block;width:100%;min-width:0}.dst-opening-text>.dst-trusted-frame-shell,.dst-script-conversation>.dst-trusted-frame-shell{flex:0 0 auto}.dst-script-frame-status,.dst-script-frame-error{box-sizing:border-box;width:100%;padding:10px 12px;border:1px dashed var(--dsw-alias-border-l2,#cbd5e1);border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f8fafc);color:var(--dsw-alias-label-secondary,#64748b);font-size:12px}.dst-script-frame-error{display:flex;align-items:center;justify-content:space-between;gap:10px;border-style:solid;border-color:#fecaca;background:#fff7f7;color:#b91c1c}.dst-script-frame-error>span{min-width:0;overflow-wrap:anywhere}.dst-script-frame-source{margin-top:6px;color:var(--dsw-alias-label-secondary,#64748b);font-size:12px}.dst-script-frame-source>summary{cursor:pointer}.dst-script-frame-source>pre{box-sizing:border-box;max-height:280px;margin:7px 0 0;padding:10px;overflow:auto;border-radius:8px;background:#0f172a;color:#e2e8f0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
 .dst-event-empty-state{margin:12px 0;padding:28px 16px;border:1px dashed #cbd5e1;border-radius:11px;color:#64748b;text-align:center}.dst-memory-table{gap:12px}.dst-memory-row{content-visibility:auto;contain-intrinsic-size:180px;display:flex;flex-direction:column;gap:12px;border-radius:12px;padding:14px;background:var(--dsh-surface,#fff)}.dst-memory-row-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dst-memory-identity{display:flex;min-width:0;align-items:center;gap:8px}.dst-memory-identity strong{overflow-wrap:anywhere}.dst-memory-table-name{flex:none;padding:2px 8px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:11px;font-weight:700}.dst-memory-meta{display:flex;flex:none;align-items:center;justify-content:flex-end;gap:8px;color:#64748b;font-size:11px}.dst-memory-value{min-width:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--dsh-surface,#fff) 94%,#326fd1 6%)}.dst-memory-fields{display:flex;flex-direction:column;margin:0}.dst-memory-field{display:grid;grid-template-columns:minmax(90px,25%) minmax(0,1fr);gap:12px;padding:7px 0;border-bottom:1px solid #dce3ed}.dst-memory-field:first-child{padding-top:0}.dst-memory-field:last-child{padding-bottom:0;border-bottom:0}.dst-memory-field dt{color:#64748b;font-size:12px;font-weight:650;overflow-wrap:anywhere}.dst-memory-field dd{min-width:0;margin:0;overflow-wrap:anywhere;white-space:pre-wrap}.dst-memory-array{display:flex;flex-direction:column;gap:5px;margin:0;padding-left:24px}.dst-memory-array>li{padding-left:3px}.dst-memory-scalar.number{color:#6b21a8;font-variant-numeric:tabular-nums}.dst-memory-scalar.boolean{display:inline-block;padding:1px 7px;border-radius:999px;background:#e8f1ff;color:#24548a;font-size:12px}.dst-memory-scalar.boolean.false{background:#f1f5f9;color:#64748b}.dst-memory-scalar.null,.dst-memory-scalar.empty,.dst-memory-empty{color:#94a3b8;font-style:italic}.dst-memory-nested{min-width:0;border:1px solid #dce3ed;border-radius:8px;background:var(--dsh-surface,#fff)}.dst-memory-nested>summary{padding:5px 8px;color:#326fd1;cursor:pointer;font-size:12px;user-select:none}.dst-memory-nested>.dst-memory-fields,.dst-memory-nested>.dst-memory-array{margin:0 8px 8px}.dst-memory-row-actions{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dst-memory-raw{min-width:0;color:#64748b;font-size:12px}.dst-memory-raw>summary{cursor:pointer;user-select:none}.dst-memory-raw pre{box-sizing:border-box;max-width:min(720px,calc(100vw - 96px));max-height:300px;margin:8px 0 0;padding:10px;overflow:auto;border-radius:8px;background:#0f172a;color:#e2e8f0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:640px){.dst-memory-row-head{flex-direction:column}.dst-memory-meta{flex-wrap:wrap;justify-content:flex-start}.dst-memory-field{grid-template-columns:1fr;gap:3px}.dst-memory-row-actions{align-items:flex-end}}
 .dst-event-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:22px 0 10px}.dst-event-section-head>.dst-section-title{margin:0}.dst-event-empty{padding:14px;border:1px dashed #cbd5e1;border-radius:10px}.dst-event-graph{display:flex;flex-direction:column;gap:14px}.dst-event-node{content-visibility:auto;contain-intrinsic-size:260px;border:1px solid #cbd5e1;border-radius:12px;padding:14px;background:color-mix(in srgb,var(--dsh-surface,#fff) 97%,#326fd1 3%)}.dst-event-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.dst-event-head strong{overflow-wrap:anywhere}.dst-event-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}.dst-event-relations{min-width:0;padding:9px 10px;border:1px solid #dce3ed;border-radius:9px;background:var(--dsh-surface,#fff);font-size:12px}.dst-event-relations>strong{display:block;margin-bottom:4px;color:#475569}.dst-event-relations ul{display:flex;flex-direction:column;gap:4px;margin:0;padding-left:18px}.dst-event-relations li{overflow-wrap:anywhere}.dst-event-relations code{color:#24548a}.dst-event-relations small{display:block;color:#64748b}.dst-event-memory-rows{margin-top:12px}.dst-event-ungrouped{margin-top:22px}.dst-memory-provenance{flex-basis:100%}@media(max-width:640px){.dst-event-section-head{display:block}.dst-event-links{grid-template-columns:1fr}}
-.dst-markdown-content{display:flow-root;min-width:0;overflow-wrap:anywhere}.dst-markdown-content>*>:first-child,.dst-legacy-font>*>:first-child{margin-top:0}.dst-markdown-content>*>:last-child,.dst-legacy-font>*>:last-child{margin-bottom:0}.dst-legacy-font{margin:0 0 1em;color:inherit}.dst-assistant-message{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary,#182033);font:15px/1.65 system-ui,sans-serif}.dst-assistant-message>*>:first-child{margin-top:0}.dst-assistant-message>[data-turn-process-inline][hidden]{margin-bottom:0}.dst-user-row{display:flex;flex-direction:column;align-items:flex-end;gap:6px}.dst-user-stack{display:flex;flex-direction:column;align-items:flex-end;gap:8px;min-width:0;max-width:min(calc(var(--dsh-chat-content-width,748px)*.702),82%)}.dst-user-message{box-sizing:border-box;max-width:100%;padding:10px 16px;border-radius:22px;background:var(--dsw-specific-bubble,var(--dsw-alias-bg-layer-2,#eef2f7));color:var(--dsw-alias-label-primary,#182033);font-size:var(--dsh-content-font-size,14px);line-height:calc(22px + var(--dsh-content-font-delta,0px));white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}.dst-user-message>*>:first-child{margin-top:0}.dst-user-message>*>:last-child{margin-bottom:0}.dst-assistant-reasoning{margin:8px 0;color:var(--dsw-alias-label-secondary,#64748b)}.dst-assistant-reasoning>summary{cursor:pointer}.dst-assistant-reasoning>pre,.dst-assistant-unknown{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.55 ui-monospace,monospace}.dst-assistant-stopped,.dst-script-render-error{display:block;margin-top:6px;color:#b45309;font-size:12px}.dst-script-rendering{padding:8px 0;color:var(--dsw-alias-label-secondary,#64748b);font-size:13px}.dst-script-conversation{display:flex;width:100%;min-width:0;flex-direction:column;gap:10px}.dst-script-conversation .dst-trusted-frame{display:block;width:100%;height:280px;min-height:0;border:0;border-radius:12px;background:var(--dsw-alias-bg-base,#fff)}
+.dst-markdown-content{display:flow-root;min-width:0;overflow-wrap:anywhere}.dst-markdown-content>*>:first-child,.dst-legacy-font>*>:first-child{margin-top:0}.dst-markdown-content>*>:last-child,.dst-legacy-font>*>:last-child{margin-bottom:0}.dst-legacy-font{margin:0 0 1em;color:inherit}.dst-assistant-message{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary,#182033);font:15px/1.65 system-ui,sans-serif}.dst-assistant-message>*>:first-child{margin-top:0}.dst-assistant-message>[data-turn-process-inline][hidden]{margin-bottom:0}.dst-user-row{display:flex;flex-direction:column;align-items:flex-end;gap:6px}.dst-user-stack{display:flex;flex-direction:column;align-items:flex-end;gap:8px;min-width:0;max-width:min(calc(var(--dsh-chat-content-width,748px)*.702),82%)}.dst-user-message{box-sizing:border-box;max-width:100%;padding:10px 16px;border-radius:22px;background:var(--dsw-specific-bubble,var(--dsw-alias-bg-layer-2,#eef2f7));color:var(--dsw-alias-label-primary,#182033);font-size:var(--dsh-content-font-size,14px);line-height:calc(22px + var(--dsh-content-font-delta,0px));white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}.dst-user-message>*>:first-child{margin-top:0}.dst-user-message>*>:last-child{margin-bottom:0}.dst-assistant-reasoning{margin:8px 0;color:var(--dsw-alias-label-secondary,#64748b)}.dst-assistant-reasoning>summary{cursor:pointer}.dst-assistant-reasoning>pre,.dst-assistant-unknown{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.55 ui-monospace,monospace}.dst-assistant-stopped,.dst-script-render-error{display:block;margin-top:6px;color:#b45309;font-size:12px}.dst-script-rendering{padding:8px 0;color:var(--dsw-alias-label-secondary,#64748b);font-size:13px}.dst-script-conversation{display:flex;width:100%;min-width:0;flex-direction:column;gap:10px}.dst-script-conversation .dst-trusted-frame{display:block;width:100%;min-height:0;border:0;border-radius:12px;background:var(--dsw-alias-bg-base,#fff)}
 .dst-story-progress-toggle{box-sizing:border-box;display:flex;align-items:center;width:100%;min-width:0;height:33px;margin-bottom:8px;padding:0 0 8px;border:0;border-bottom:1px solid var(--dsw-alias-border-l2,#e2e8f0);background:none;color:var(--dsw-alias-label-secondary,#64748b);cursor:pointer;text-align:left;font:inherit}.dst-story-progress-label{min-width:0;overflow:hidden;font-size:14px;line-height:24px;text-overflow:ellipsis;white-space:nowrap}.dst-story-progress-chevron{flex:none;width:16px;height:16px;margin-left:6px;color:var(--dsw-alias-label-tertiary,#81858c);transform:rotate(-90deg);transition:transform 100ms ease}.dst-story-progress-toggle[data-open] .dst-story-progress-chevron{transform:rotate(0deg)}.dst-story-progress-toggle:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#8fb5f5);outline-offset:2px}[data-chat-flow-kind='system-prompt']:has([data-dst-system-prompt-hidden]){display:none}@media(prefers-reduced-motion:reduce){.dst-story-progress-chevron{transition:none}}
 `
 
-    const inject = ['slots', 'commandUi', 'conversation']
+    const inject = ['slots', 'commandUi', 'conversation', 'sessions']
+    const PLAYER_CSS = `
+.dst-player-new-story{padding:8px 16px}.dst-player-message-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.dst-player-message-action{display:inline-flex;align-items:center;justify-content:center;flex:none;box-sizing:border-box;width:calc(28px + var(--dsh-content-font-delta,0px));height:calc(28px + var(--dsh-content-font-delta,0px));padding:6px;border:0;border-radius:28px;background:transparent;color:var(--dsw-alias-label-tertiary,#87909f);cursor:pointer}.dst-player-message-action>span{display:inline-flex}.dst-player-message-action svg{width:calc(15px + var(--dsh-content-font-delta,0px));height:calc(15px + var(--dsh-content-font-delta,0px))}.dst-player-message-action:hover{background:var(--dsw-alias-interactive-bg-hover,#f3f4f6);color:var(--dsw-alias-label-secondary,#667085)}.dst-player-message-action:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#326fd1);outline-offset:2px}.dst-player-message-action[aria-disabled="true"]{opacity:.4;cursor:default}.dst-player-message-action[aria-disabled="true"]:hover{background:transparent;color:var(--dsw-alias-label-tertiary,#87909f)}.dst-player-action-editor{width:100%;padding:10px}.dst-player-action-editor textarea{box-sizing:border-box;width:100%;padding:10px;border:1px solid var(--dsw-alias-border-l1,#dfe3ea);border-radius:8px;resize:vertical;font:inherit}.dst-player-action-editor .dst-button{margin-right:8px}
+[data-dst-player-tools="collapsed"] [aria-label^="访问模式"],[data-dst-player-tools="collapsed"] [aria-label^="上下文已用"],[data-dst-player-tools="collapsed"] div:has(>[aria-label="子代理模型"]){display:none!important}
+.dst-button.dst-player-advanced{display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;width:30px;height:30px;padding:0;border-radius:50%;background:var(--dsw-alias-bg-layer-2,#f3f4f6);color:inherit;transition:background-color .15s,color .15s}.dst-player-advanced svg{display:block;flex:none}.dst-button.dst-player-advanced:hover{background:color-mix(in srgb,currentColor 10%,var(--dsw-alias-bg-layer-2,#f3f4f6))}.dst-button.dst-player-advanced[aria-expanded="true"]{background:color-mix(in srgb,#326fd1 14%,var(--dsw-alias-bg-layer-1,#fff));color:#326fd1}.dst-button.dst-player-advanced:focus-visible{outline:2px solid #326fd1;outline-offset:2px}
+.dst-card-cover{display:block;width:100%;height:160px;object-fit:cover;object-position:center 25%;border-radius:8px}.dst-card-cover[hidden]{display:none}
+.dst-character-seat.compact .dst-character-label{flex:1 1 auto;width:auto}.dst-character-seat.compact{min-width:100px}.dst-character-seat.compact.icon-only{width:100px;max-width:100px;flex:0 1 100px;padding:0 6px;justify-content:flex-start}.dst-character-seat.compact.icon-only .dst-character-label{position:static;visibility:visible;pointer-events:auto}.dst-character-seat.compact.icon-only .dst-character-chevron{display:block}
+.dst-opening-header{flex-wrap:wrap}.dst-opening-controls{margin-left:auto;flex-wrap:wrap;gap:6px}.dst-opening-controls select{min-width:130px;max-width:240px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1,#dfe3ea);border-radius:7px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit}.dst-advanced-settings{margin:16px 0}.dst-advanced-settings>summary{cursor:pointer;font-weight:600;margin-bottom:12px}.dst-player-failure{margin:12px 16px;padding:16px;border:1px solid #e4b4a8;border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);font:14px/1.6 system-ui,sans-serif}.dst-player-failure p{margin:6px 0}.dst-player-failure blockquote{white-space:pre-wrap;margin:8px 0;padding:10px 12px;background:var(--dsw-alias-bg-layer-2,#f5f6f8);border-radius:8px}.dst-player-failure details{margin-top:12px}.dst-player-failure pre{white-space:pre-wrap;overflow-wrap:anywhere}.dst-player-failure .dst-actions{display:flex;gap:8px;flex-wrap:wrap}
+`
+
     function apply(ctx) {
       const conversation = ctx.get('conversation')
-      if (conversation === undefined) return
+      const sessions = ctx.get('sessions')
+      if (conversation === undefined || sessions === undefined) return
+      playerSessions = sessions
+      ctx.effect(() => () => { playerSessions = null; pendingPlayerDrafts.clear() })
       const style = document.createElement('style')
       style.dataset.dshSillyTavern = 'true'
-      style.textContent = `${CSS}${RUNTIME_CSS}${eventExplorerUI.css}${SESSION_CSS}`
+      style.textContent = `${CSS}${RUNTIME_CSS}${eventExplorerUI.css}${SESSION_CSS}${PLAYER_CSS}`
       document.head.appendChild(style)
       ctx.effect(() => () => style.remove())
       ctx.effect(() => () => overlay.reset())
+      ctx.effect(() => () => { pendingSourceJump?.(); pendingSourceJump = null })
       ctx.effect(() => compatRuntime.start())
       ctx.effect(() => () => { scriptPolicies.reset(); scriptScopes.reset(); scriptEvents.reset(); compatRuntime.reset(); regexEngine.dispose() })
       const eventSources = new Map()
       ctx.effect(() => () => { for (const source of eventSources.values()) source.dispose(); eventSources.clear() })
-      const registerEventView = () => ctx.slots.inject('conversation.view', () => ctx.slots.register({
+      const registerEventView = () => ctx.slots.register({
         name: 'conversation.view', id: 'sillytavern-events', order: 20, label: '时间线',
         inject: sessionId => {
           let source = eventSources.get(sessionId)
@@ -4713,16 +5459,18 @@ self.onmessage = event => {
             })
             eventSources.set(sessionId, source)
           }
-          return { hooks: { eventExplorer: source }, refreshEvents: source.refresh }
+          return { hooks: { eventExplorer: source }, refreshEvents: source.refresh, isCurrentSession: () => ctx.get('sessions')?.list.getSnapshot().current === sessionId }
         },
-      }, TavernEventsView))
+      }, TavernEventsView)
       const registerMessageRenderers = () => {
         const disposeAssistant = ctx.slots.register({ name: 'conversation.chat.node', key: 'assistant-step', priority: -20 }, TavernAssistantNode)
         const disposeUser = ctx.slots.register({ name: 'conversation.chat.node', key: 'user', priority: -20 }, TavernUserNode)
         const disposeSteering = ctx.slots.register({ name: 'conversation.chat.node', key: 'steering', priority: -20 }, TavernUserNode)
         const disposeTurnProcess = ctx.slots.register({ name: 'conversation.chat.node', key: 'turn-process', locale: 'chat', priority: -20 }, TavernTurnProcessNode)
         const disposeSystemPrompt = ctx.slots.register({ name: 'conversation.chat.node', key: 'system-prompt', locale: 'chat', priority: -20 }, TavernSystemPromptNode)
-        return () => { disposeSystemPrompt(); disposeTurnProcess(); disposeSteering(); disposeUser(); disposeAssistant() }
+        const disposeFailure = ctx.slots.register({ name: 'conversation.chat.node', key: 'turn-error', priority: -20 }, TavernFailureNode)
+        const disposeMessageActions = ctx.slots.register({ name: 'conversation.chat.assistant-actions', id: 'sillytavern-player-actions', order: 15 }, TavernMessageActions)
+        return () => { disposeMessageActions(); disposeFailure(); disposeSystemPrompt(); disposeTurnProcess(); disposeSteering(); disposeUser(); disposeAssistant() }
       }
 
       ctx.effect(() => ctx.commandUi.decorate({
@@ -4748,13 +5496,33 @@ self.onmessage = event => {
       ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'sillytavern', order: 18, label: '酒馆模式' }, SettingsSection))
       ctx.slots.inject('conversation.chat.commandview', () => ctx.slots.register({ name: 'conversation.chat.commandview', key: 'st-opening' }, TavernOpeningMessage))
       ctx.slots.inject('conversation.chat.commandview', () => ctx.slots.register({ name: 'conversation.chat.commandview', key: 'narrator' }, TavernNarratorMessage))
-      registerEventView()
-      for (const [id, order, label, component] of [
-        ['sillytavern-worldbook', 21, '世界书', TavernWorldbookView],
-        ['sillytavern-persona', 22, '用户设定/变量', TavernPersonaView],
-        ['sillytavern-scripts', 23, '脚本', TavernScriptsView],
-        ['sillytavern-templates', 24, '提示词模板', TavernTemplatesView],
-      ]) ctx.slots.inject('conversation.view', () => ctx.slots.register({ name: 'conversation.view', id, order, label }, component))
+      // DSH derives the tab bar from the global slot roster, before rendering
+      // any view component. Keep these entries mounted only for a Tavern seat.
+      ctx.slots.inject('conversation.view', () => {
+        let disposeViews = null
+        const syncViews = () => {
+          const state = sessions.list.getSnapshot()
+          const enabled = sessionAgentPreset(state.byId[state.current]) === 'sillytavern'
+          if (enabled === (disposeViews !== null)) return
+          if (!enabled) {
+            const dispose = disposeViews
+            disposeViews = null
+            dispose()
+            return
+          }
+          const disposers = [registerEventView()]
+          for (const [id, order, label, component] of [
+            ['sillytavern-worldbook', 21, '世界书', TavernWorldbookView],
+            ['sillytavern-persona', 22, '用户设定/变量', TavernPersonaView],
+            ['sillytavern-scripts', 23, '脚本', TavernScriptsView],
+            ['sillytavern-templates', 24, '提示词模板', TavernTemplatesView],
+          ]) disposers.push(ctx.slots.register({ name: 'conversation.view', id, order, label }, component))
+          disposeViews = () => { for (const dispose of disposers.reverse()) dispose() }
+        }
+        const unsubscribe = sessions.list.subscribe(syncViews)
+        syncViews()
+        return () => { unsubscribe(); disposeViews?.(); disposeViews = null }
+      })
     }
 
     exports.apply = apply

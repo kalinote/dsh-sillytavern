@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { resolve } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { assertTrustedLoopbackRequest, decodeBase64, readJsonBody, sendJson } from './src/http.js'
 import { assembleSillyTavernPrompt, compactedEventSeqs, initialGreetingView, injectWorldbookDepthMessages, sessionEventDelta, sessionEvents, sessionMessages } from './src/prompt.js'
 import { createEventMaintenanceJob, EventMaintenanceManager } from './src/event-maintenance.js'
@@ -15,6 +16,7 @@ import { CompatibilityGenerationBroker } from './src/compat-generation.js'
 import { projectCompatibilityChat } from './src/compat-chat-projection.js'
 import { CompatibilityLifecycle } from './src/compat-lifecycle.js'
 import { buildCompatibilityGenerationOptions, compatibilityPromptState } from './src/compat-prompt-builder.js'
+import { playerRecovery } from './src/player-recovery.js'
 
 export const name = 'dsh-sillytavern'
 export const VERSION = '0.10.0'
@@ -23,7 +25,7 @@ export const inject = ['agents', 'agentPresets', 'llm', 'sessions', 'subagents']
 const REQUEST_BINDING_PATTERN = /<!-- dsh-sillytavern-request:([0-9a-f-]{36}) -->/gi
 const MAX_REQUEST_BINDINGS_PER_AGENT = 16
 
-function stripRequestBinding(system) {
+function stripRequestBindingText(system) {
   if (typeof system !== 'string') return { id: undefined, system }
   let id
   const replaced = system.replace(REQUEST_BINDING_PATTERN, (_match, value) => {
@@ -33,6 +35,41 @@ function stripRequestBinding(system) {
   return id === undefined
     ? { id, system }
     : { id, system: replaced.replace(/\n{3,}/g, '\n\n').trimEnd() }
+}
+
+// Current DSH requests carry the assembled system prompt in message text
+// blocks. Keep the legacy system field working, and copy only changed nodes:
+// the agent-loop owns and freezes its request and durable message surface.
+function stripRequestBinding(options) {
+  const legacy = stripRequestBindingText(options.system)
+  let id = legacy.id
+  let projected = legacy.system === options.system ? options : { ...options, system: legacy.system }
+  let changed = false
+  const messages = options.messages?.map(message => {
+    if (message?.role !== 'system') return message
+    if (typeof message.content === 'string') {
+      const marker = stripRequestBindingText(message.content)
+      if (marker.id === undefined) return message
+      id = marker.id
+      changed = true
+      return { ...message, content: marker.system }
+    }
+    if (!Array.isArray(message.content)) return message
+    let contentChanged = false
+    const content = message.content.map(block => {
+      if (block?.type !== 'text') return block
+      const marker = stripRequestBindingText(block.text)
+      if (marker.id === undefined) return block
+      id = marker.id
+      contentChanged = true
+      return { ...block, text: marker.system }
+    })
+    if (!contentChanged) return message
+    changed = true
+    return { ...message, content }
+  })
+  if (changed) projected = { ...projected, messages }
+  return { id, options: projected }
 }
 
 function contentText(content) {
@@ -55,6 +92,38 @@ export async function apply(ctx, config = {}) {
     ttlMs: config.compatibilityGenerationTtlMs ?? 5 * 60 * 1000,
   })
   let active = true
+  const agentResumes = new Map()
+
+  const persistedPreset = session => sessionEvents(session).findLast(event => event.type === 'agent-preset/selected' && typeof event.data?.agentPreset === 'string')?.data.agentPreset
+    ?? session?.header?.agentPreset
+
+  const resumeAgent = sessionId => {
+    const id = String(sessionId)
+    const current = agentResumes.get(id)
+    if (current !== undefined) return current
+    const pending = (async () => {
+      if (!active) throw new Error('plugin is disposed')
+      const attached = ctx.sessions.get?.(id)
+      if (attached?.header?.origin === 'subagent') throw new Error('session is not an ordinary Agent session')
+      const handle = await ctx.agents.resume({
+        resumeSessionId: id,
+        setup: async agentCtx => {
+          const agent = agentCtx.agent
+          if (agent === undefined || String(agent.id) !== id) throw new Error('resumed Agent identity does not match the requested session')
+          if (agent.session?.header?.origin === 'subagent') throw new Error('session is not an ordinary Agent session')
+          const preset = persistedPreset(agent.session)
+          if (preset !== 'sillytavern') throw new Error('session is not using the sillytavern Agent preset')
+          await ctx.agentPresets.mount(agentCtx, preset)
+        },
+      })
+      return handle.agent
+    })()
+    agentResumes.set(id, pending)
+    void pending.finally(() => {
+      if (agentResumes.get(id) === pending) agentResumes.delete(id)
+    }).catch(() => {})
+    return pending
+  }
 
   const eligible = agent => agent?.session?.header?.origin !== 'subagent'
     && ctx.agentPresets.composedPreset(agent.ctx) === 'sillytavern'
@@ -90,6 +159,7 @@ export async function apply(ctx, config = {}) {
   }
   ctx.effect(() => async () => {
     active = false
+    agentResumes.clear()
     lifecycle.dispose()
     for (const pending of preparingGenerations.values()) pending.controller.abort(new Error('plugin disposed'))
     preparingGenerations.clear()
@@ -105,6 +175,7 @@ export async function apply(ctx, config = {}) {
   const modelInfoWarnings = new Set()
   const requestBindingWarnings = new Set()
   const worldbookDiagnostics = new WeakMap()
+  const promptDiagnosticRevisions = new WeakMap()
   const worldbookDiagnosticSequences = new WeakMap()
   const worldbookDiagnosticSuccesses = new WeakMap()
   const maintenanceFallbackWarnings = new WeakSet()
@@ -120,6 +191,7 @@ export async function apply(ctx, config = {}) {
     store,
     eligible,
     ensure,
+    repairForkInheritance: (agent, options, signal) => store.repairForkInheritance(agent, options, signal),
     async promptFor(agent, signal, route = {}) {
       const preparedClients = await lifecycle.request(agent.id, 'prepare', {}, signal)
       await store.waitCompatibilityWrites(agent, signal)
@@ -201,6 +273,7 @@ export async function apply(ctx, config = {}) {
       const onceIds = injections.filter(item => item.once === true).map(item => String(item.id))
       if (onceIds.length) await store.consumeOnceInjections(agent, onceIds, store.sessionView(agent).binding.revision, signal)
       prompt.compatProjection = compatProjection
+      promptDiagnosticRevisions.set(prompt, diagnosticGeneration)
       if (diagnosticGeneration > (worldbookDiagnosticSuccesses.get(agent) ?? 0)) {
         const budget = prompt.worldbookBudget ?? {}
         worldbookDiagnosticSuccesses.set(agent, diagnosticGeneration)
@@ -210,6 +283,11 @@ export async function apply(ctx, config = {}) {
           generatedAt: new Date().toISOString(),
           warnings: (Array.isArray(prompt.worldbookWarnings) ? prompt.worldbookWarnings : []).slice(0, 64).map(value => String(value).slice(0, 1024)),
           activeEntryIds: (Array.isArray(prompt.activeWorldbookEntries) ? prompt.activeWorldbookEntries : []).slice(0, 256).map(value => String(value).slice(0, 256)),
+          depthProjection: {
+            status: depthCount > 0 ? 'pending' : 'not-needed',
+            expectedEntries: depthCount,
+            injectedEntries: 0,
+          },
           budget: {
             tokens: Number.isSafeInteger(budget.tokens) ? budget.tokens : 0,
             usedTokens: Number.isSafeInteger(budget.usedTokens) ? budget.usedTokens : 0,
@@ -229,6 +307,7 @@ export async function apply(ctx, config = {}) {
       }
       bindings.set(id, {
         prompt,
+        diagnosticRevision: promptDiagnosticRevisions.get(prompt),
         provider: typeof route.provider === 'string' ? route.provider : '',
         model: typeof route.model === 'string' ? route.model : '',
       })
@@ -291,8 +370,8 @@ export async function apply(ctx, config = {}) {
     if (state === undefined) return next()
     const history = sessionMessages(agent)
     if (regexRequests.has(options)) return transformRawAssistantStream(next(), state, history)
-    const marker = stripRequestBinding(options.system)
-    let depthProjected = marker.system === options.system ? options : { ...options, system: marker.system }
+    const marker = stripRequestBinding(options)
+    let depthProjected = marker.options
     const preparedBinding = marker.id === undefined ? undefined : requestBindings.get(agent)?.get(marker.id)
     const chatProjection = preparedBinding?.provider === options.provider && preparedBinding?.model === options.model ? preparedBinding.prompt.compatProjection : undefined
     depthProjected = projectCompatibilityChat(depthProjected, sessionEvents(agent.session), chatProjection ?? store.compatChatProjection(agent))
@@ -304,12 +383,30 @@ export async function apply(ctx, config = {}) {
           console.warn(`[dsh-sillytavern] request-bound world-info projection ${marker.id} was not found; @depth entries were skipped`)
         }
       } else if (prepared.provider !== options.provider || prepared.model !== options.model) {
+        const diagnostics = worldbookDiagnostics.get(agent)
+        if (diagnostics !== undefined && diagnostics.revision === prepared.diagnosticRevision) {
+          worldbookDiagnostics.set(agent, { ...diagnostics, depthProjection: {
+            ...diagnostics.depthProjection, status: 'skipped', injectedEntries: 0,
+            reason: '模型路由已变化，请重新生成以重新组装世界书。',
+          } })
+        }
         if (!requestBindingWarnings.has(marker.id)) {
           requestBindingWarnings.add(marker.id)
           console.warn(`[dsh-sillytavern] request route changed from ${prepared.provider}/${prepared.model} to ${options.provider}/${options.model}; @depth entries were skipped`)
         }
       } else {
         depthProjected = injectWorldbookDepthMessages(depthProjected, prepared.prompt.worldbookDepthEntries, randomUUID)
+        const diagnostics = worldbookDiagnostics.get(agent)
+        if (diagnostics !== undefined && diagnostics.revision === prepared.diagnosticRevision) {
+          const entries = prepared.prompt.worldbookDepthEntries ?? []
+          const injectedEntries = Array.isArray(depthProjected.messages)
+            ? entries.filter(entry => String(entry?.content ?? '').trim() !== '').length : 0
+          worldbookDiagnostics.set(agent, { ...diagnostics, depthProjection: {
+            status: entries.length === 0 ? 'not-needed' : injectedEntries > 0 ? 'injected' : 'skipped',
+            expectedEntries: entries.length,
+            injectedEntries,
+          } })
+        }
       }
     }
     const projected = promptRegexRequest(depthProjected, state)
@@ -321,23 +418,101 @@ export async function apply(ctx, config = {}) {
   }, { prepend: true })
 
   const agentFor = async (sessionId, refresh = true) => {
-    const agent = ctx.agents.get(String(sessionId))
-    if (agent === undefined) throw new Error('session has no live Agent')
+    const id = String(sessionId)
+    let agent = ctx.agents.get(id)
+    if (agent === undefined) {
+      try {
+        agent = await resumeAgent(id)
+      } catch (error) {
+        agent = ctx.agents.get(id)
+        if (agent === undefined) throw error
+      }
+    }
     if (!eligible(agent)) throw new Error('session is not using the sillytavern Agent preset')
     if (refresh || store.sessionSync(agent) === undefined) await ensure(agent)
-    if (ctx.agents.get(String(sessionId)) !== agent) {
+    if (ctx.agents.get(id) !== agent) {
       store.disposeSession(agent)
       throw new Error('session has no live Agent')
     }
     return agent
   }
 
+  const branchPlayerSession = async body => {
+    const source = await agentFor(body.sessionId)
+    const events = sessionEvents(source.session)
+    const fresh = body.fresh === true
+    const hasBeforeTurn = Object.hasOwn(body, 'beforeTurn')
+    const hasAfterTurn = Object.hasOwn(body, 'afterTurn')
+    if (Number(fresh) + Number(hasBeforeTurn) + Number(hasAfterTurn) > 1) throw new TypeError('fresh, beforeTurn, and afterTurn are mutually exclusive')
+    let beforeTurn
+    let afterTurn
+    let cut
+    if (fresh) {
+      cut = 0
+    } else if (hasBeforeTurn) {
+      beforeTurn = Number(body.beforeTurn)
+      if (!Number.isSafeInteger(beforeTurn) || beforeTurn <= 0) throw new TypeError('beforeTurn must be a positive safe integer')
+      const index = events.findIndex(event => event.type === 'turn/start' && Number(event.data?.turn) === beforeTurn)
+      if (index === -1) throw new RangeError(`turn ${beforeTurn} was not found in the source session`)
+      cut = index
+    } else if (hasAfterTurn) {
+      afterTurn = Number(body.afterTurn)
+      if (!Number.isSafeInteger(afterTurn) || afterTurn <= 0) throw new TypeError('afterTurn must be a positive safe integer')
+      const index = events.findIndex(event => event.type === 'turn/end' && Number(event.data?.turn) === afterTurn && event.data?.reason?.kind === 'completed')
+      if (index === -1) throw new RangeError(`completed turn ${afterTurn} was not found in the source session`)
+      cut = index + 1
+      while (cut < events.length && events[cut]?.type !== 'turn/start') cut += 1
+    } else {
+      const completedIndex = events.findLastIndex(event => event.type === 'turn/end' && event.data?.reason?.kind === 'completed')
+      if (completedIndex === -1) throw new Error('source session has no completed turn; use fresh=true to start a new story')
+      cut = completedIndex + 1
+      while (cut < events.length && events[cut]?.type !== 'turn/start') cut += 1
+    }
+    if (!fresh) {
+      const availability = await store.branchAvailability(source, cut)
+      if (!availability.available) {
+        const error = new Error('the source session has no binding snapshot at or before the requested branch boundary')
+        error.code = 'fork-inheritance-unavailable'
+        error.details = { sourceSessionId: String(source.id), inheritedEventCount: cut }
+        throw error
+      }
+    }
+    const childId = `session-${randomUUID()}`
+    if (fresh) store.prepareFreshFork(childId, source)
+    const presetId = ctx.agentPresets.composedPreset(source.ctx) ?? 'sillytavern'
+    const resolvedPreset = typeof ctx.agentPresets.resolve === 'function' ? (await ctx.agentPresets.resolve(presetId)).id : presetId
+    const agentOptions = {}
+    for (const field of ['provider', 'model', 'reasoningEffort']) if (source.options?.[field] !== undefined) agentOptions[field] = source.options[field]
+    let handle
+    try {
+      handle = await ctx.agents.create({
+        sessionId: childId,
+        seed: events.slice(0, cut),
+        inheritedEventCount: cut,
+        meta: {
+          ...(source.session.header.cwd === undefined ? {} : { cwd: source.session.header.cwd }),
+          parentSession: String(source.id),
+          isSeeded: true,
+          agentPreset: resolvedPreset,
+        },
+        ...(Object.keys(agentOptions).length === 0 ? {} : { agentOptions }),
+        ...(typeof ctx.agentPresets.mount !== 'function' ? {} : { setup: async agentCtx => { await ctx.agentPresets.mount(agentCtx, resolvedPreset) } }),
+      })
+    } finally {
+      store.cancelPreparedFork(childId)
+    }
+    const child = handle.agent
+    child.inbox?.clear()
+    await store.ensureSession(child)
+    const registry = ctx.get('workspaceRegistry')
+    const workspace = registry?.list().find(item => resolve(item.path) === resolve(store.workspaceOf(source)))
+    if (workspace !== undefined && !(workspace.sessionIds ?? []).map(String).includes(childId)) await workspace.attachSession(childId)
+    return { sessionId: childId }
+  }
+
   const greetingFor = async (sessionId, swipeId) => {
     const id = String(sessionId)
-    const agent = ctx.agents.get(id)
-    if (agent === undefined) throw new Error('session has no live Agent')
-    if (!eligible(agent)) throw new Error('session is not using the sillytavern Agent preset')
-    await store.ensureSession(agent)
+    const agent = await agentFor(id)
     const state = await store.greetingState(agent)
     if (ctx.agents.get(id) !== agent) {
       store.disposeSession(agent)
@@ -603,6 +778,16 @@ export async function apply(ctx, config = {}) {
         sendJson(res, card === undefined ? 404 : 200, card === undefined ? { ok: false, error: 'card not found' } : { ok: true, value: card })
         return
       }
+      if (req.method === 'GET' && route === '/card/cover') {
+        const agent = await agentFor(url.searchParams.get('sessionId'))
+        const card = store.getCard(url.searchParams.get('id'), agent)
+        if (!card || card.format === 'json-v3') { res.writeHead(404); res.end(); return }
+        const extension = card.format === 'apng-v3' ? '.apng' : '.png'
+        const bytes = await readFile(join(store.rootForWorkspace(store.workspaceOf(agent)), 'originals', `${card.id}${extension}`))
+        res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'private, max-age=3600' })
+        res.end(bytes)
+        return
+      }
       if (req.method === 'GET' && route === '/worldbook') {
         const agent = await agentFor(url.searchParams.get('sessionId'))
         await store.refreshLibrary(agent)
@@ -624,6 +809,11 @@ export async function apply(ctx, config = {}) {
         sendJson(res, 200, { ok: true, value: { card: view.card === null ? null : { id: view.card.id, name: view.card.card.data.nickname || view.card.card.data.name }, history, messages: projected, cursor: delta.cursor, hasMore: delta.hasMore, compatChatRevision: store.compatChatProjection(agent).revision } })
         return
       }
+      if (req.method === 'GET' && route === '/player/recovery') {
+        const agent = await agentFor(url.searchParams.get('sessionId'))
+        sendJson(res, 200, { ok: true, value: playerRecovery(sessionEvents(agent.session)) })
+        return
+      }
       if (req.method === 'GET' && route === '/greeting') {
         const swipeParam = url.searchParams.get('swipeId')
         const swipeValue = swipeParam === null ? undefined : Number(swipeParam)
@@ -639,12 +829,13 @@ export async function apply(ctx, config = {}) {
       }
       if (req.method === 'GET' && route === '/events') {
         const agent = await agentFor(url.searchParams.get('sessionId'), false)
-        const document = await store.eventSnapshot(agent)
+        const [document, maintenance] = await Promise.all([store.eventSnapshot(agent), eventMaintenance.readStatus(agent)])
         const unchanged = url.searchParams.get('revision') === String(document.revision)
         sendJson(res, 200, { ok: true, value: {
           sessionId: String(agent.id),
           revision: document.revision,
           unchanged,
+          maintenance,
           ...(unchanged ? {} : { document }),
         } })
         return
@@ -759,6 +950,17 @@ export async function apply(ctx, config = {}) {
         if (Object.hasOwn(patch, 'openingSwipeId')) throw new Error('openingSwipeId must be changed through /opening/select')
         const agent = await agentFor(body.sessionId)
         sendJson(res, 200, { ok: true, value: await store.updateSession(agent, patch) })
+        return
+      }
+      if (route === '/session/repair-fork') {
+        const agent = await agentFor(body.sessionId)
+        const fork = store.sessionView(agent).fork
+        const parentAgent = fork === null ? undefined : ctx.agents.get(fork.parentSessionId)
+        sendJson(res, 200, { ok: true, value: { session: await store.repairForkInheritance(agent, { parentAgent }) } })
+        return
+      }
+      if (route === '/player/branch') {
+        sendJson(res, 200, { ok: true, value: await branchPlayerSession(body) })
         return
       }
       if (route === '/compat/variables/replace') {
@@ -922,7 +1124,7 @@ export async function apply(ctx, config = {}) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const code = typeof error?.code === 'string' ? error.code : undefined
-      const status = ['replace-confirmation-required', 'binding-changed', 'session-started', 'session-revision-conflict', 'regex-revision-conflict', 'compatibility-revision-conflict', 'chat-revision-conflict', 'worldbook-revision-conflict', 'worldbook-name-conflict', 'worldbook-references-required', 'card-active-sessions', 'card-references-required'].includes(code) ? 409
+      const status = ['replace-confirmation-required', 'binding-changed', 'session-started', 'session-revision-conflict', 'regex-revision-conflict', 'compatibility-revision-conflict', 'chat-revision-conflict', 'worldbook-revision-conflict', 'worldbook-name-conflict', 'worldbook-references-required', 'card-active-sessions', 'card-references-required', 'fork-inheritance-unavailable', 'not-repairable-fork'].includes(code) ? 409
         : /untrusted API request/.test(message) ? 403
         : /not found|no live Agent/.test(message) ? 404
         : /not using/.test(message) ? 403
@@ -940,6 +1142,7 @@ export async function apply(ctx, config = {}) {
       await store.ensureSelectedSession(agent)
       await store.startSession(agent)
     }
+    await store.checkpointBranchState(agent)
     repairOpeningOrphan(agent)
     await resumeEventMaintenance(agent, 'Agent recovery')
   }
@@ -976,6 +1179,10 @@ export async function apply(ctx, config = {}) {
   ctx.on('agent/inbox/claimed', finishPendingOpeningOnClaim)
   ctx.on('agent/inbox/discarded', discardPendingOpening)
   ctx.on('agent/status', retryOpeningWhenIdle)
+  ctx.on('session/created', session => {
+    const parent = session?.header?.parentSession === undefined ? undefined : ctx.agents.get(String(session.header.parentSession))
+    if (parent !== undefined) store.captureForkPoint(session, parent)
+  })
   ctx.on('agent/created', ({ agent }) => recoverAgent(agent, 'Agent creation'))
   ctx.on('agent-preset/selected', sessionId => {
     const agent = ctx.agents.get(sessionId)
