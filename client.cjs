@@ -749,12 +749,12 @@ window.__ModuleLoader__.load({
           const zoomedIn = zoomTimelineViewport(viewport, timeline, 0.5)
           const canZoomIn = zoomedIn.minimum !== minimum || zoomedIn.maximum !== maximum
           const hasQuery = query.trim() !== ''
-          const tickPortions = viewportSpan > 0 ? [0, 0.25, 0.5, 0.75, 1] : [1]
+          const tickPortions = viewportSpan > 0 ? [0, 0.25, 0.5, 0.75, 1] : [0]
           const ticks = tickPortions.map(portion => {
             const coordinate = viewportSpan > 0
               ? portion === 0 ? minimum : portion === 1 ? maximum : minimum + viewportSpan * portion
               : timeline.max
-            const current = portion === 1 && maximum === timeline.max
+            const current = (viewportSpan > 0 ? portion === 1 : portion === 0) && maximum === timeline.max
             return h('span', {
               key: portion,
               className: classes(portion === 0 && 'first', current && 'current'),
@@ -784,7 +784,7 @@ window.__ModuleLoader__.load({
               )
               const pointTransform = left <= 0 ? 'none' : left >= 100 ? 'translateX(-100%)' : 'translateX(-50%)'
               let style
-              if (zeroSpan) style = { left: '100%', width: '8px', transform: 'translateX(-100%)' }
+              if (zeroSpan) style = { left: '0%', width: '8px', transform: 'none' }
               else if (point) style = { left: `${left}%`, transform: pointTransform }
               else if (endUnrecorded && minimumMarker) style = { right: '0', width: `${width}%`, minWidth: '8px' }
               else if (endUnrecorded) style = { left: `${left}%`, right: '0' }
@@ -824,10 +824,23 @@ window.__ModuleLoader__.load({
                 h('button', {
                   type: 'button',
                   className: 'dst-explorer-focus-time',
-                  title: `聚焦 ${barTitle} 的剧情时间`,
+                  title: `聚焦事件时间：${barTitle}`,
                   'aria-label': `聚焦事件时间：${barTitle}`,
                   onClick: () => setViewport(focusTimelineViewport(timeline, group.intervals)),
-                }, '聚焦事件时间')),
+                }, h('svg', {
+                  width: 16,
+                  height: 16,
+                  viewBox: '0 0 24 24',
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  strokeWidth: 2,
+                  strokeLinecap: 'round',
+                  strokeLinejoin: 'round',
+                  'aria-hidden': true,
+                  focusable: false,
+                },
+                h('circle', { cx: 11, cy: 11, r: 6 }),
+                h('path', { d: 'm16 16 4 4' })) )),
               h('div', { className: 'dst-explorer-bar-track' }, markers))
           })
           return h('article', { className: 'dst-explorer-timeline' },
@@ -1376,6 +1389,9 @@ window.__ModuleLoader__.load({
         // measured composer seat so the graph remains usable above the native input.
         const viewportCss = `
       .dst-explorer-axis>span{white-space:nowrap}
+      .dst-explorer-axis>span.first.current{transform:none}
+      .dst-explorer-focus-time{display:inline-grid;width:28px;height:28px;min-width:28px;min-height:28px;place-items:center;padding:0}
+      .dst-explorer-focus-time svg{display:block}
       .dst-explorer-root{width:100%;padding-bottom:calc(var(--dsh-composer-height,152px) + 8px);container-type:inline-size;container-name:dst-events}
       .dst-explorer-maintenance{flex:0 0 auto;padding:7px 18px;border-bottom:1px solid var(--dsw-alias-border-l3,#edf0f4);background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-secondary,#667085);font-size:12px}.dst-explorer-maintenance.busy{background:#fff8e8;color:#80550a}.dst-explorer-maintenance.ready{background:#eef8f1;color:#28613a}.dst-explorer-maintenance.error{background:#fff0f0;color:#9b1c1c}.dst-explorer-memory-summary,.dst-explorer-event-summary{white-space:pre-wrap;overflow-wrap:anywhere}.dst-explorer-memory-summary{margin:0 0 12px;font-size:14px;line-height:1.7}.dst-explorer-facts{margin:0 0 13px}.dst-explorer-facts h4{margin:0 0 6px}.dst-explorer-facts ul{margin:0;padding-left:21px}.dst-explorer-facts li{padding:2px 0}.dst-explorer-source-list button{height:auto;padding:1px 0;border:0;background:none;color:var(--dsw-alias-brand-primary,#24548a);cursor:pointer;font:inherit;text-align:left;text-decoration:underline;text-underline-offset:2px}.dst-explorer-technical{margin-top:12px;padding-top:10px;border-top:1px dashed var(--dsw-alias-border-l2,#dfe3ea)}.dst-explorer-technical>summary{color:var(--dsw-alias-label-secondary,#667085);cursor:pointer;font-size:12px}.dst-explorer-technical[open]>summary{margin-bottom:8px}.dst-explorer-technical>.dst-explorer-json{margin-top:10px}.dst-explorer-event-technical{margin-bottom:20px}.dst-explorer-node-meta{overflow:hidden;color:var(--dsw-alias-label-tertiary,#87909f);font-size:10px;text-overflow:ellipsis;white-space:nowrap}
       .dst-explorer-content{grid-template-rows:minmax(156px,34%) minmax(220px,1fr) auto;gap:10px;padding:10px}

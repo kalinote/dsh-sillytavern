@@ -21,7 +21,7 @@ function render(document, initialStates = [], extra = {}) {
     useEffect() {},
     memo: component => component,
   }
-  const { EventExplorer } = createUI(React, model)
+  const { EventExplorer, css } = createUI(React, model)
   function expand(value) {
     if (Array.isArray(value)) return value.flatMap(expand)
     if (value == null || value === false) return []
@@ -36,7 +36,7 @@ function render(document, initialStates = [], extra = {}) {
   }
   visit(tree)
   const content = nodes => nodes.map(node => typeof node === 'string' ? node : content(node.children)).join(' ')
-  return { elements, changes, text: content(tree), content,
+  return { elements, changes, text: content(tree), content, css,
     byClass: name => elements.filter(element => element.props.className?.split(' ').includes(name)) }
 }
 
@@ -82,6 +82,12 @@ test('event view renders every grouped node and independent timeline, with click
   assert.equal(result.byClass('point').length, 2, 'known zero-duration events keep their circular point markers')
   assert.equal(result.byClass('end-unrecorded').length, 1, 'a missing end uses a distinct ongoing interval style')
   assert.equal(result.byClass('current').length, 2, 'every independent timeline labels its latest known point as current')
+  const focusButtons = result.byClass('dst-explorer-focus-time')
+  assert.ok(focusButtons.length > 0)
+  assert.ok(focusButtons.every(button => button.props.children[0].type === 'svg'))
+  assert.ok(focusButtons.every(button => button.props.children[0].props.width === 16 && button.props.children[0].props.height === 16))
+  assert.ok(focusButtons.every(button => button.props.title === button.props['aria-label'] && /^聚焦事件时间：/.test(button.props.title)))
+  assert.match(result.css, /\.dst-explorer-axis>span\.first\.current\{transform:none\}/)
   assert.ok(bars[2].props.className.includes('end-unrecorded'))
   assert.ok(!bars[2].props.className.includes('point'))
   assert.equal(document.rows[2].storyTime.end, null, 'display extension does not synthesize a persisted end')
@@ -173,12 +179,16 @@ test('open intervals use later starts as current without inventing time beyond t
   const singleOpen = fixture()
   const singleResult = render({ ...singleOpen, rows: [singleOpen.rows[2]], eventEdges: [] })
   const onlyBar = singleResult.byClass('dst-explorer-bar')[0]
-  assert.equal(onlyBar.props.style.left, '100%')
+  assert.equal(onlyBar.props.style.left, '0%')
   assert.equal(onlyBar.props.style.width, '8px')
-  assert.equal(onlyBar.props.style.transform, 'translateX(-100%)')
+  assert.equal(onlyBar.props.style.transform, 'none')
   assert.ok(onlyBar.props.className.includes('end-unrecorded'))
   assert.match(onlyBar.props.title, /只有一个已知坐标/)
   assert.match(onlyBar.props.title, /未推断事件时长/)
+  const singleTick = singleResult.elements.find(element => element.props.className?.includes('first') && element.props.className?.includes('current'))
+  assert.equal(singleTick.props.style.left, '0%')
+  assert.equal(singleTick.props.className.includes('first'), true)
+  assert.equal(singleTick.props.className.includes('current'), true)
   assert.match(singleResult.text, /最新 500/)
 })
 
@@ -313,7 +323,7 @@ test('a tiny interval on a billion-year axis stays clickable and focuses directl
   assert.match(overview.content(axes[0].children), /最新 0\.006/)
   assert.match(overview.content(axes[1].children), /最新 42/)
   const single = overview.byClass('dst-explorer-bar').find(bar => /单点开放事件/.test(bar.props.title))
-  assert.deepEqual(single.props.style, { left: '100%', width: '8px', transform: 'translateX(-100%)' })
+  assert.deepEqual(single.props.style, { left: '0%', width: '8px', transform: 'none' })
 
   const focus = overview.byClass('dst-explorer-focus-time').find(button => /毫秒信号/.test(button.props['aria-label']))
   focus.props.onClick()
